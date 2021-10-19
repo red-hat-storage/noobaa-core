@@ -53,7 +53,7 @@
 //------------------------------------------------------------------------------
 // Platform/Architecture
 
-#if defined(ANDROID) || defined(IOS) || defined(LINUX_ARM) || defined(__powerpc__) || defined(__s390__)
+#if defined(ANDROID) || defined(IOS) || defined(LINUX_ARM) || defined(__powerpc__) || defined(__s390__) || defined(__aarch64__)
     #define GF256_TARGET_MOBILE
 #endif // ANDROID
 
@@ -181,20 +181,20 @@ extern gf256_ctx GF256Ctx;
 
 /**
     Initialize a context, filling in the tables.
-    
+
     Thread-safety / Usage Notes:
-    
+
     It is perfectly safe and encouraged to use a gf256_ctx object from multiple
     threads.  The gf256_init() is relatively expensive and should only be done
     once, though it will take less than a millisecond.
-    
+
     The gf256_ctx object must be aligned to 16 byte boundary.
     Simply tag the object with GF256_ALIGNED to achieve this.
-    
+
     Example:
        static GF256_ALIGNED gf256_ctx TheGF256Context;
        gf256_init(&TheGF256Context, 0);
-    
+
     Returns 0 on success and other values on failure.
 */
 extern int gf256_init_(int version);

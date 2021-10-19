@@ -44,6 +44,12 @@ DOCKER_BUILDKIT?=DOCKER_BUILDKIT=1
 ifeq ($(CONTAINER_ENGINE), podman)
 	DOCKER_BUILDKIT=
 endif
+# increase ulimit open-files on aarch64
+ARCH=$(shell uname -m)
+ULIMIT_NOFILES=
+ifeq ($(ARCH), aarch64)
+	ULIMIT_NOFILES=--ulimit nofile=10000:10000
+endif
 
 export
 
@@ -59,28 +65,28 @@ all: tester noobaa
 
 builder: assert-container-engine
 	@echo "\033[1;34mStarting Builder $(CONTAINER_ENGINE) build.\033[0m"
-	$(DOCKER_BUILDKIT) $(CONTAINER_ENGINE) build $(CPUSET) -f src/deploy/NVA_build/builder.Dockerfile $(CACHE_FLAG) $(NETWORK_FLAG) -t noobaa-builder .
+	$(DOCKER_BUILDKIT) $(CONTAINER_ENGINE) build $(CPUSET) $(ULIMIT_NOFILES) -f src/deploy/NVA_build/builder.Dockerfile $(CACHE_FLAG) $(NETWORK_FLAG) -t noobaa-builder .
 	$(CONTAINER_ENGINE) tag noobaa-builder $(BUILDER_TAG)
 	@echo "\033[1;32mBuilder done.\033[0m"
 .PHONY: builder
 
 base: builder
 	@echo "\033[1;34mStarting Base $(CONTAINER_ENGINE) build.\033[0m"
-	$(DOCKER_BUILDKIT) $(CONTAINER_ENGINE) build $(CPUSET) -f src/deploy/NVA_build/Base.Dockerfile $(CACHE_FLAG) $(NETWORK_FLAG) -t noobaa-base . $(REDIRECT_STDOUT)
+	$(DOCKER_BUILDKIT) $(CONTAINER_ENGINE) build $(CPUSET) $(ULIMIT_NOFILES) -f src/deploy/NVA_build/Base.Dockerfile $(CACHE_FLAG) $(NETWORK_FLAG) -t noobaa-base . $(REDIRECT_STDOUT)
 	$(CONTAINER_ENGINE) tag noobaa-base $(NOOBAA_BASE_TAG)
 	@echo "\033[1;32mBase done.\033[0m"
 .PHONY: base
 
 tester: noobaa
 	@echo "\033[1;34mStarting Tester $(CONTAINER_ENGINE) build.\033[0m"
-	$(DOCKER_BUILDKIT) $(CONTAINER_ENGINE) build $(CPUSET) -f src/deploy/NVA_build/Tests.Dockerfile $(CACHE_FLAG) $(NETWORK_FLAG) -t noobaa-tester . $(REDIRECT_STDOUT)
+	$(DOCKER_BUILDKIT) $(CONTAINER_ENGINE) build $(CPUSET) $(ULIMIT_NOFILES) -f src/deploy/NVA_build/Tests.Dockerfile $(CACHE_FLAG) $(NETWORK_FLAG) -t noobaa-tester . $(REDIRECT_STDOUT)
 	$(CONTAINER_ENGINE) tag noobaa-tester $(TESTER_TAG)
 	@echo "\033[1;32mTester done.\033[0m"
 .PHONY: tester
 
 test: tester
 	@echo "\033[1;34mRunning tests.\033[0m"
-	$(CONTAINER_ENGINE) run $(CPUSET) --name noobaa_$(GIT_COMMIT)_$(NAME_POSTFIX) --env "SUPPRESS_LOGS=$(SUPPRESS_LOGS)" $(TESTER_TAG) 
+	$(CONTAINER_ENGINE) run $(CPUSET) --name noobaa_$(GIT_COMMIT)_$(NAME_POSTFIX) --env "SUPPRESS_LOGS=$(SUPPRESS_LOGS)" $(TESTER_TAG)
 .PHONY: test
 
 test-postgres: tester
