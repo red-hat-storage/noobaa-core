@@ -73,6 +73,15 @@ Find instruction at - https://github.com/noobaa/noobaa-core/blob/master/docs/nsf
 **Note** - All required paths on the configuration files (bucket - path, account - new_buckets_path) must be absolute paths.
 
 
+**3. Create env file under the configuration directory -**
+
+nsfs_env.env is the default .env file, link it to /etc/noobaa.conf.d/.env and edit it as you wish before starting the service - 
+
+```sh
+ln /usr/local/noobaa-core/nsfs_env.env  /etc/noobaa.conf.d/.env
+```
+**Note** - If another /usr/local/noobaa-core/.env exists it should be merged into /etc/noobaa.conf.d/.env carefully.
+
 ## Create FS -
 If it's not already existing, create the fs root path in which buckets (directories) and objects (files) will be created.
 
@@ -254,3 +263,27 @@ Users can also pass account and bucket/account values in JSON file instead of pa
 node src/cmd/manage_nsfs bucket add --config_root ../standalon/config_root --from_file /json_file/path
 ```
 NSFS management CLI command will create both account and bucket dir if it's missing in the config_root path.
+
+## NSFS Certificate
+
+Non containerized NSFS certificate location is configured in system.json file under the property `nsfs_ssl_cert_dir` and the path should contain SSL files tls.key and tls.crt. System will use a cert from this dir to create a valid HTTPS connection. If cert is missing in this dir a self-signed SSL certificate will be generated. Make sure the path mentioned in `nsfs_ssl_cert_dir` is valid before running nsfs command, If the path is invalid then cert flow will fail.
+
+Non containerized NSFS allow nonsecure HTTP connection only when `allow_http` in system.json is true.
+
+## Log and Logrotate
+Noobaa logs are configured using rsyslog and logrotate. RPM will configure rsyslog and logrotate if both are already running. 
+
+Rsyslog status check
+```
+systemctl status rsyslog
+```
+
+Noobaa logs are pushed to `var/log/noobaa.log` and the log is rotated and compressed daily.
+
+Verify the rsyslog and logrotate rpm configuration is complete by checking the files `etc/rsyslog.d/noobaa_syslog.conf` and `etc/rsyslog.d/noobaa_rsyslog.conf` for rsyslog and `etc/logrotate.d/noobaa/logrotate_noobaa.conf` for logrotate.These files contain the noobaa specific configuration for rsyslog and logrotate.
+
+Rotate the logs manually.
+
+```
+logrotate /etc/logrotate.d/noobaa/logrotate_noobaa.conf 
+```

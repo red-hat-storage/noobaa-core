@@ -55,7 +55,8 @@ const account_user1 = {
         gid: 0,
         new_buckets_path: new_buckets_path_user1,
         nsfs_only: 'true'
-    }
+    },
+    creation_date: '2023-10-30T04:46:33.815Z',
 };
 
 const bucketspace_fs = new BucketSpaceFS({ config_root });
@@ -79,10 +80,11 @@ function make_dummy_object_sdk() {
     return {
         requesting_account: {
             force_md5_etag: false,
+            email: 'user2@noobaa.io',
             nsfs_account_config: {
                 uid: 0,
                 gid: 0,
-                new_buckets_path: new_buckets_path
+                new_buckets_path: new_buckets_path,
             }
         },
         abort_controller: new AbortController(),
@@ -216,7 +218,7 @@ mocha.describe('bucketspace_fs', function() {
                 const param = { name: test_bucket_invalid};
                 await bucketspace_fs.delete_bucket(param, dummy_object_sdk);
             } catch (err) {
-                assert.ok(err.code === 'NoSuchBucket');
+                assert.ok(err.code === 'ENOENT');
             }
         });
     });
@@ -308,6 +310,48 @@ mocha.describe('bucketspace_fs', function() {
             await bucketspace_fs.delete_bucket_policy(param);
             const output_web = await bucketspace_fs.get_bucket_policy(param);
             assert.ok(output_web.policy === undefined);
+        });
+
+        mocha.it('put_bucket_policy other account object', async function() {
+            const policy = {
+                    Version: '2012-10-17',
+                    Statement: [{
+                        Sid: 'id-22',
+                        Effect: 'Allow',
+                        Principal: { AWS: 'noobaa@noobaa.io' },
+                        Action: ['s3:*'],
+                        Resource: ['arn:aws:s3:::*']
+                        }
+                    ]
+                };
+            const param = {name: test_bucket, policy: policy};
+            await bucketspace_fs.put_bucket_policy(param);
+            const bucket_policy = await bucketspace_fs.get_bucket_policy(param);
+            assert.deepEqual(bucket_policy.policy, policy);
+        });
+
+        mocha.it('put_bucket_policy other account array', async function() {
+            const policy = {
+                    Version: '2012-10-17',
+                    Statement: [{
+                        Sid: 'id-22',
+                        Effect: 'Allow',
+                        Principal: { AWS: ['noobaa@noobaa.io', 'noobaa1@noobaa.io'] },
+                        Action: ['s3:*'],
+                        Resource: ['arn:aws:s3:::*']
+                        }
+                    ]
+                };
+            const param = {name: test_bucket, policy: policy};
+            await bucketspace_fs.put_bucket_policy(param);
+            const bucket_policy = await bucketspace_fs.get_bucket_policy(param);
+            assert.deepEqual(bucket_policy.policy, policy);
+        });
+        mocha.it('delete_bucket_policy ', async function() {
+            const param = {name: test_bucket};
+            await bucketspace_fs.delete_bucket_policy(param);
+            const bucket_policy = await bucketspace_fs.get_bucket_policy(param);
+            assert.ok(bucket_policy.policy === undefined);
         });
     });
 });

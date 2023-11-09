@@ -33,7 +33,7 @@ const azure_storage = require('../../util/azure_storage_wrap');
 const usage_aggregator = require('../bg_services/usage_aggregator');
 const chunk_config_utils = require('../utils/chunk_config_utils');
 const NetStorage = require('../../util/NetStorageKit-Node-master/lib/netstorage');
-const { OP_NAME_TO_ACTION, SUPPORTED_BUCKET_POLICY_CONDITIONS } = require('../../endpoint/s3/s3_bucket_policy_utils');
+const bucket_policy_utils = require('../../endpoint/s3/s3_bucket_policy_utils');
 const path = require('path');
 const KeysSemaphore = require('../../util/keys_semaphore');
 const bucket_semaphore = new KeysSemaphore(1);
@@ -47,8 +47,6 @@ const VALID_BUCKET_NAME_REGEXP =
 const EXTERNAL_BUCKET_LIST_TO = 30 * 1000; //30s
 
 const trigger_properties = ['event_name', 'object_prefix', 'object_suffix'];
-const qm_regex = /\?/g;
-const ar_regex = /\*/g;
 
 function new_bucket_defaults(name, system_id, tiering_policy_id, owner_account_id, tag, lock_enabled) {
     const now = Date.now();
@@ -487,7 +485,7 @@ async function get_bucket_policy(req) {
 async function put_bucket_policy(req) {
     dbg.log0('put_bucket_policy:', req.rpc_params);
     const bucket = find_bucket(req, req.rpc_params.name);
-    _validate_s3_policy(req.rpc_params.policy, bucket.name);
+    bucket_policy_utils.validate_s3_policy(req.rpc_params.policy, bucket.name, principal => system_store.get_account_by_email(principal));
     await system_store.make_changes({
         update: {
             buckets: [{
@@ -498,50 +496,6 @@ async function put_bucket_policy(req) {
     });
 }
 
-function _validate_s3_policy(policy, bucket_name) {
-    const all_op_names = _.compact(_.flatMap(OP_NAME_TO_ACTION, action => [action.regular, action.versioned]));
-    for (const statement of policy.Statement) {
-
-        const statement_principal = statement.Principal || statement.NotPrincipal;
-        if (statement_principal.AWS) {
-            for (const principal of _.flatten([statement_principal.AWS])) {
-                if (principal.unwrap() !== '*') {
-                    const account = system_store.get_account_by_email(principal);
-                    if (!account) {
-                        throw new RpcError('MALFORMED_POLICY', 'Invalid principal in policy', { detail: principal });
-                    }
-                }
-            }
-        } else if (statement_principal.unwrap() !== '*') {
-            throw new RpcError('MALFORMED_POLICY', 'Invalid principal in policy', { detail: statement.Principal });
-        }
-        for (const resource of _.flatten([statement.Resource || statement.NotResource])) {
-            const resource_bucket_part = resource.split('/')[0];
-            const resource_regex = RegExp(`^${resource_bucket_part.replace(qm_regex, '.?').replace(ar_regex, '.*')}$`);
-            if (!resource_regex.test('arn:aws:s3:::' + bucket_name)) {
-                throw new RpcError('MALFORMED_POLICY', 'Policy has invalid resource', { detail: resource });
-            }
-        }
-        for (const action of _.flatten([statement.Action || statement.NotAction])) {
-            if (action !== 's3:*' && !all_op_names.includes(action)) {
-                throw new RpcError('MALFORMED_POLICY', 'Policy has invalid action', { detail: action });
-            }
-        }
-        if (statement.Condition) {
-            for (const condition of Object.values(statement.Condition)) {
-                for (const condition_key of Object.keys(condition)) {
-                    // some condition keys have arguments in their names.(e.g. s3:ExistingObjectTag/<key>)
-                    // parse to get only the condition key itself
-                    const key_parts = condition_key.split("/");
-                    if (!SUPPORTED_BUCKET_POLICY_CONDITIONS.includes(key_parts[0])) {
-                        throw new RpcError('MALFORMED_POLICY', 'Policy has invalid condition key or unsupported condition key', { detail: condition_key });
-                    }
-                }
-            }
-        }
-        // TODO: Need to validate that the resource comply with the action
-    }
-}
 
 
 async function delete_bucket_policy(req) {
@@ -1899,7 +1853,10 @@ async function put_bucket_replication(req) {
     dbg.log0('put_bucket_replication:', req.rpc_params);
     const bucket = find_bucket(req);
 
-    validate_replication(req);
+    // fetching all the replication rules already present in the DB
+    const db_repl_rules = await replication_store.instance().get_replication_rules();
+
+    validate_replication(req, db_repl_rules);
     const replication_rules = normalize_replication(req);
 
     const bucket_replication_id = bucket.replication_policy_id;
@@ -1956,7 +1913,7 @@ async function delete_bucket_replication(req) {
     await replication_store.instance().delete_replication_by_id(replication_id);
 }
 
-function validate_replication(req) {
+function validate_replication(req, db_repl_rules) {
     const replication_rules = req.rpc_params.replication_policy.rules;
     // num of rules in configuration must be in defined limits
     if (replication_rules.length > config.BUCKET_REPLICATION_MAX_RULES ||
@@ -1964,13 +1921,36 @@ function validate_replication(req) {
 
     const rule_ids = [];
     const pref_by_dst_bucket = {};
+    const src_bucket = req.system.buckets_by_name && req.system.buckets_by_name[req.rpc_params.name.unwrap()];
 
     for (const rule of replication_rules) {
         const { destination_bucket, filter, rule_id } = rule;
+
         const dst_bucket = req.system.buckets_by_name && req.system.buckets_by_name[destination_bucket.unwrap()];
         // rule's destination bucket must exist and not equal to the replicated bucket
         if (req.rpc_params.name.unwrap() === destination_bucket.unwrap() || !dst_bucket) {
             throw new RpcError('INVALID_REPLICATION_POLICY', `Rule ${rule_id} destination bucket is invalid`);
+        }
+
+        // validation for bidirectional replication - blocking bidirectional replication only for matching prefixes
+        if (destination_bucket.unwrap() !== req.rpc_params.name.unwrap()) {
+            const prefix = filter?.prefix || '';
+            // checking if there already a rule consisting of src_bucket as destination_bucket for matching prefix
+            for (const db_rules of db_repl_rules) {
+                // checking if db_rules belongs to dst_bucket as source_bucket
+                if (_.isEqual(db_rules._id, dst_bucket.replication_policy_id)) {
+                    const matching_rule = db_rules.rules.find(
+                        db_rule =>
+                            _.isEqual(src_bucket._id, db_rule.destination_bucket) &&
+                            (!db_rule.filter || db_rule.filter.prefix.toString().startsWith(prefix) ||
+                             prefix.toString().startsWith(db_rule.filter.prefix.toString()))
+                    );
+                    if (matching_rule) {
+                        throw new RpcError('INVALID_REPLICATION_POLICY',
+                            `Bidirectional replication found for bucket "${destination_bucket.unwrap()}" and prefix is "${prefix}"`);
+                    }
+                }
+            }
         }
 
         rule_ids.push(rule_id);

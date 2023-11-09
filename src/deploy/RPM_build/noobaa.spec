@@ -49,15 +49,30 @@ ln -s /usr/local/noobaa-core/node/bin/npm $RPM_BUILD_ROOT/usr/local/noobaa-core/
 ln -s /usr/local/noobaa-core/node/bin/npx $RPM_BUILD_ROOT/usr/local/noobaa-core/bin/npx
 
 mkdir -p $RPM_BUILD_ROOT/etc/systemd/system/
-ln %{_builddir}/%{name}-%{version}-%{revision}/noobaa/src/deploy/nsfs.service $RPM_BUILD_ROOT/etc/systemd/system/nsfs.service
+ln -s /usr/local/noobaa-core/src/deploy/nsfs.service $RPM_BUILD_ROOT/etc/systemd/system/nsfs.service
+ln -s /usr/local/noobaa-core/src/deploy/nsfs_env.env $RPM_BUILD_ROOT/usr/local/noobaa-core/nsfs_env.env
 
+mkdir -p $RPM_BUILD_ROOT/etc/rsyslog.d/
+ln -s /usr/local/noobaa-core/src/deploy/standalone/noobaa_syslog.conf $RPM_BUILD_ROOT/etc/rsyslog.d/noobaa_syslog.conf
+ln -s /usr/local/noobaa-core/src/deploy/standalone/noobaa_rsyslog.conf $RPM_BUILD_ROOT/etc/rsyslog.d/noobaa_rsyslog.conf
+
+mkdir -p $RPM_BUILD_ROOT/etc/logrotate.d/noobaa
+ln -s /usr/local/noobaa-core/src/deploy/standalone/logrotate_noobaa.conf $RPM_BUILD_ROOT/etc/logrotate.d/noobaa/logrotate_noobaa.conf
 
 %files
 /usr/local/noobaa-core
 /etc/systemd/system/nsfs.service
+/etc/logrotate.d/noobaa/logrotate_noobaa.conf
+/etc/rsyslog.d/noobaa_rsyslog.conf
+/etc/rsyslog.d/noobaa_syslog.conf
 %doc
 
 %post
+state=$(systemctl show -p ActiveState --value rsyslog)
+if [ "${state}" == "active" ]; then
+  service rsyslog restart
+fi
+
 if [ $1 -gt 1 ]; then
   UPGRADE_SCRIPTS_DIR=/root/node_modules/noobaa-core/src/upgrade/upgrade_scripts
   NSFS_UPGRADE_SCRIPTS_DIR=/root/node_modules/noobaa-core/src/upgrade/nsfs_upgrade_scripts

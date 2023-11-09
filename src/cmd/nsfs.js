@@ -14,8 +14,9 @@ const fs = require('fs');
 const util = require('util');
 const minimist = require('minimist');
 
-require('../server/system_services/system_store').get_instance({ standalone: true });
-
+if (process.env.LOCAL_MD_SERVER === 'true') {
+    require('../server/system_services/system_store').get_instance({ standalone: true });
+}
 //const js_utils = require('../util/js_utils');
 const nb_native = require('../util/nb_native');
 //const schema_utils = require('../util/schema_utils');
@@ -105,6 +106,7 @@ function print_usage() {
 }
 
 const IAM_JSON_SCHEMA = get_schema('account_api#/definitions/account_info');
+let nsfs_config_root;
 
 class NsfsObjectSDK extends ObjectSDK {
     constructor(fs_root, fs_config, account, versioning, config_root) {
@@ -241,15 +243,14 @@ async function main(argv = minimist(process.argv.slice(2))) {
         const https_port = Number(argv.https_port) || Number(process.env.ENDPOINT_SSL_PORT) || 6443;
         const https_port_sts = Number(argv.https_port_sts) || -1;
         const metrics_port = Number(argv.metrics_port) || -1;
-        const forks = Number(argv.forks) || 0;
+        const forks = Number(argv.forks);
         const uid = Number(argv.uid) || process.getuid();
         const gid = Number(argv.gid) || process.getgid();
         const access_key = argv.access_key && new SensitiveString(String(argv.access_key));
         const secret_key = argv.secret_key && new SensitiveString(String(argv.secret_key));
         const simple_mode = Boolean(argv.simple);
-        let config_root = '';
         if (!simple_mode) {
-            config_root = argv.config_root ? String(argv.config_root) : config.NSFS_NC_DEFAULT_CONF_DIR;
+            nsfs_config_root = argv.config_root ? String(argv.config_root) : config.NSFS_NC_DEFAULT_CONF_DIR;
         }
         const iam_ttl = Number(argv.iam_ttl ?? 60);
         const backend = argv.backend || (process.env.GPFS_DL_PATH ? 'GPFS' : '');
@@ -273,7 +274,7 @@ async function main(argv = minimist(process.argv.slice(2))) {
             console.error('Error: Root path not found', fs_root);
             return print_usage();
         }
-        if (config_root && access_key) {
+        if (nsfs_config_root && access_key) {
             console.error('Error: Access key and IAM dir cannot be used together');
             return print_usage();
         }
@@ -281,7 +282,7 @@ async function main(argv = minimist(process.argv.slice(2))) {
             console.error('Error: Access and secret keys should be either both set or else both unset');
             return print_usage();
         }
-        if (!access_key && !config_root) {
+        if (!access_key && !nsfs_config_root) {
             console.log(ANONYMOUS_AUTH_WARNING);
         }
 
@@ -297,11 +298,11 @@ async function main(argv = minimist(process.argv.slice(2))) {
             secret_key,
             uid,
             gid,
-            config_root,
+            nsfs_config_root,
             iam_ttl,
         });
 
-        if (!simple_mode) await init_nsfs_system(config_root);
+        if (!simple_mode) await init_nsfs_system(nsfs_config_root);
 
         const endpoint = require('../endpoint/endpoint');
         await endpoint.main({
@@ -310,12 +311,14 @@ async function main(argv = minimist(process.argv.slice(2))) {
             https_port_sts,
             metrics_port,
             forks,
+            nsfs_config_root,
             init_request_sdk: (req, res) => {
-                req.object_sdk = new NsfsObjectSDK(fs_root, fs_config, account, versioning, config_root);
+                req.object_sdk = new NsfsObjectSDK(fs_root, fs_config, account, versioning, nsfs_config_root);
             }
         });
-
-        console.log('nsfs: listening on', util.inspect(`http://localhost:${http_port}`));
+        if (await endpoint.is_http_allowed(nsfs_config_root)) {
+            console.log('nsfs: listening on', util.inspect(`http://localhost:${http_port}`));
+        }
         console.log('nsfs: listening on', util.inspect(`https://localhost:${https_port}`));
 
     } catch (err) {
