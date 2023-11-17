@@ -13,8 +13,8 @@ ENV TEST_CONTAINER true
 ##############################################################
 
 RUN dnf group install -y -q "Development Tools" && \
-    dnf install -y -q --nogpgcheck vim \
-    which python3-virtualenv python36-devel libevent-devel libffi-devel libxml2-devel libxslt-devel zlib-devel \ 
+    dnf install -y -q --nogpgcheck --enablerepo=crb vim \
+    which python3-virtualenv python3-devel libevent-devel libffi-devel libxml2-devel libxslt-devel zlib-devel \
     git  \
     tox && \
     dnf clean all
@@ -49,6 +49,9 @@ RUN npm install
 ##############################################################
 COPY ./src/deploy/NVA_build/standalone_deploy.sh ./src/deploy/NVA_build/standalone_deploy.sh
 COPY ./src/test/system_tests/ceph_s3_tests/run_ceph_test_on_test_container.sh ./src/test/system_tests/ceph_s3_tests/run_ceph_test_on_test_container.sh
+COPY ./src/deploy/NVA_build/standalone_deploy_nsfs.sh ./src/deploy/NVA_build/standalone_deploy_nsfs.sh
+COPY ./src/test/system_tests/ceph_s3_tests/run_ceph_nsfs_test_on_test_container.sh ./src/test/system_tests/ceph_s3_tests/run_ceph_nsfs_test_on_test_container.sh
+RUN chmod +x ./src/test/system_tests/ceph_s3_tests/run_ceph_nsfs_test_on_test_container.sh
 COPY ./src/test/system_tests/run_sanity_test_on_test_container.sh ./src/test/system_tests/run_sanity_test_on_test_container.sh
 
 COPY .eslintrc.js /root/node_modules/noobaa-core

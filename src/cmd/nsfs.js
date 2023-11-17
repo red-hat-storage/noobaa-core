@@ -1,5 +1,6 @@
 /* Copyright (C) 2020 NooBaa */
 'use strict';
+/* eslint-disable complexity */
 
 require('../util/dotenv').load();
 require('aws-sdk/lib/maintenance_mode_message').suppress = true;
@@ -243,7 +244,7 @@ async function main(argv = minimist(process.argv.slice(2))) {
         const https_port = Number(argv.https_port) || Number(process.env.ENDPOINT_SSL_PORT) || 6443;
         const https_port_sts = Number(argv.https_port_sts) || -1;
         const metrics_port = Number(argv.metrics_port) || -1;
-        const forks = Number(argv.forks);
+        const forks = Number(argv.forks) || config.ENDPOINT_FORKS;
         const uid = Number(argv.uid) || process.getuid();
         const gid = Number(argv.gid) || process.getgid();
         const access_key = argv.access_key && new SensitiveString(String(argv.access_key));
@@ -264,6 +265,7 @@ async function main(argv = minimist(process.argv.slice(2))) {
             backend,
             warn_threshold_ms: config.NSFS_WARN_THRESHOLD_MS,
         };
+        verify_gpfslib(backend, fs_config);
         const account = {
             email: new SensitiveString('nsfs@noobaa.io'),
             nsfs_account_config: fs_config,
@@ -323,7 +325,35 @@ async function main(argv = minimist(process.argv.slice(2))) {
 
     } catch (err) {
         console.error('nsfs: exit on error', err.stack || err);
+        //noobaa crashed
+        dbg.event({
+            code: "noobaa_nsfs_crashed",
+            entity_type: "NODE",
+            event_type: "STATE_CHANGE",
+            message: "Noobaa NSFS crashed with error : " + err,
+            scope: "NODE",
+            severity: "ERROR",
+            state: "STOPPED"
+        });
         process.exit(2);
+    }
+}
+
+async function verify_gpfslib(backend, fs_config) {
+    if (nb_native().fs.gpfs) {
+        const stat = await nb_native().fs.stat(fs_config, process.env.GPFS_DL_PATH);
+        if (!stat) {
+            dbg.event({
+                code: "noobaa_gpfslib_missing",
+                entity_type: "NODE",
+                event_type: "STATE_CHANGE",
+                message: "Noobaa GPFS library file is missing",
+                scope: "NODE",
+                severity: "ERROR",
+                state: "DEGRADED",
+                arguments: {gpfs_dl_path: process.env.GPFS_DL_PATH},
+            });
+        }
     }
 }
 

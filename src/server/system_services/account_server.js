@@ -355,7 +355,8 @@ function update_account_s3_access(req) {
         }
 
         if (req.rpc_params.nsfs_account_config) {
-            if (_.isUndefined(req.rpc_params.nsfs_account_config.uid) &&
+            if (_.isUndefined(req.rpc_params.nsfs_account_config.distinguished_name) &&
+                _.isUndefined(req.rpc_params.nsfs_account_config.uid) &&
                 _.isUndefined(req.rpc_params.nsfs_account_config.gid) && !req.rpc_params.nsfs_account_config.new_buckets_path &&
                 _.isUndefined(req.rpc_params.nsfs_account_config.nsfs_only)) {
                 throw new RpcError('FORBIDDEN', 'Invalid nsfs_account_config');
@@ -463,7 +464,8 @@ function update_account(req) {
 
     const removals = {
         next_password_change: params.must_change_password === false ? true : undefined,
-        allowed_ips: params.ips === null ? true : undefined
+        allowed_ips: params.ips === null ? true : undefined,
+        role_config: params.remove_role_config,
     };
 
     //Create the event description according to the changes performed
@@ -674,6 +676,8 @@ function list_accounts(req) {
         .filter(account => !req.rpc_params.filter ||
             (req.rpc_params.filter &&
                 req.rpc_params.filter.fs_identity &&
+                _.isEqual(req.rpc_params.filter.fs_identity.distinguished_name,
+                    account.nsfs_account_config && account.nsfs_account_config.distinguished_name) &&
                 req.rpc_params.filter.fs_identity.uid === (account.nsfs_account_config && account.nsfs_account_config.uid) &&
                 req.rpc_params.filter.fs_identity.gid === (account.nsfs_account_config && account.nsfs_account_config.gid))
         )

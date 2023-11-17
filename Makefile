@@ -170,7 +170,7 @@ rpm: base
 	$(CONTAINER_ENGINE) build $(CONTAINER_PLATFORM_FLAG) $(CPUSET) -f src/deploy/RPM_build/RPM.Dockerfile $(CACHE_FLAG) -t $(NOOBAA_RPM_TAG) --build-arg GIT_COMMIT=$(GIT_COMMIT) . $(REDIRECT_STDOUT)
 	echo "\033[1;32mImage \"$(NOOBAA_RPM_TAG)\" is ready.\033[0m"
 	echo "Generating RPM..."
-	$(CONTAINER_ENGINE) run --rm -v $(PWD)/build/rpm:/export:z -it $(NOOBAA_RPM_TAG)
+	$(CONTAINER_ENGINE) run --rm -v $(PWD)/build/rpm:/export:z -t $(NOOBAA_RPM_TAG)
 	echo "\033[1;32mRPM for platform \"$(NOOBAA_RPM_TAG)\" is ready in build/rpm.\033[0m";
 .PHONY: rpm
 
@@ -290,6 +290,11 @@ test-cephs3: tester
 	@$(call stop_postgres)
 	@$(call remove_docker_network)
 .PHONY: test-cephs3
+
+test-nsfs-cephs3: tester
+	@echo "\033[1;34mRunning Ceph S3 tests on NSFS Standalone platform\033[0m"
+	$(CONTAINER_ENGINE) run $(CPUSET) --name noobaa_$(GIT_COMMIT)_$(NAME_POSTFIX) --env "SUPPRESS_LOGS=$(SUPPRESS_LOGS)" -v $(PWD)/logs:/logs $(TESTER_TAG) "./src/test/system_tests/ceph_s3_tests/run_ceph_nsfs_test_on_test_container.sh"
+.PHONY: test-nsfs-cephs3
 
 test-sanity: tester
 	@echo "\033[1;34mRunning tests with Postgres.\033[0m"
