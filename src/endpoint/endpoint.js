@@ -41,6 +41,9 @@ const background_scheduler = require('../util/background_scheduler').get_instanc
 const endpoint_stats_collector = require('../sdk/endpoint_stats_collector');
 const { NamespaceMonitor } = require('../server/bg_services/namespace_monitor');
 const { SemaphoreMonitor } = require('../server/bg_services/semaphore_monitor');
+const cluster = /** @type {import('node:cluster').Cluster} */ (
+    /** @type {unknown} */ (require('node:cluster'))
+);
 
 if (process.env.NOOBAA_LOG_LEVEL) {
     const dbg_conf = debug_config.get_debug_config(process.env.NOOBAA_LOG_LEVEL);
@@ -49,6 +52,7 @@ if (process.env.NOOBAA_LOG_LEVEL) {
 
 const new_umask = process.env.NOOBAA_ENDPOINT_UMASK || 0o000;
 const old_umask = process.umask(new_umask);
+let fork_count;
 dbg.log0('endpoint: replacing old umask: ', old_umask.toString(8), 'with new umask: ', new_umask.toString(8));
 
 /**
@@ -86,11 +90,12 @@ dbg.log0('endpoint: replacing old umask: ', old_umask.toString(8), 'with new uma
 async function main(options = {}) {
     try {
         // the primary just forks and returns, workers will continue to serve
-        if (fork_utils.start_workers((options.forks ?? config.ENDPOINT_FORKS))) return;
+        fork_count = options.forks ?? config.ENDPOINT_FORKS;
+        if (fork_utils.start_workers(fork_count)) return;
 
         const http_port = options.http_port || Number(process.env.ENDPOINT_PORT) || 6001;
         const https_port = options.https_port || Number(process.env.ENDPOINT_SSL_PORT) || 6443;
-        const https_port_sts = options.https_port_sts || Number(process.env.ENDPOINT_SSL_PORT_STS) || 7443;
+        const https_port_sts = options.https_port_sts || Number(process.env.ENDPOINT_SSL_STS_PORT) || 7443;
         const metrics_port = options.metrics_port || config.EP_METRICS_SERVER_PORT;
         const endpoint_group_id = process.env.ENDPOINT_GROUP_ID || 'default-endpoint-group';
 
@@ -147,8 +152,7 @@ async function main(options = {}) {
         const endpoint_request_handler = create_endpoint_handler(init_request_sdk, virtual_hosts);
         const endpoint_request_handler_sts = create_endpoint_handler(init_request_sdk, virtual_hosts, true);
 
-        const nsfs_ssl_cert_dir = await endpoint_utils.get_nsfs_system_property('nsfs_ssl_cert_dir', options.nsfs_config_root);
-        const ssl_cert_info = await ssl_utils.get_ssl_cert_info('S3', nsfs_ssl_cert_dir);
+        const ssl_cert_info = await ssl_utils.get_ssl_cert_info('S3', options.nsfs_config_root);
         const ssl_options = { ...ssl_cert_info.cert, honorCipherOrder: true };
         const https_server = https.createServer(ssl_options, endpoint_request_handler);
         const https_server_sts = https.createServer(ssl_options, endpoint_request_handler_sts);
@@ -158,15 +162,15 @@ async function main(options = {}) {
             https_server.setSecureContext(updated_ssl_options);
             https_server_sts.setSecureContext(updated_ssl_options);
         });
-        if (await is_http_allowed(options.nsfs_config_root)) {
+        if (options.nsfs_config_root && !config.NSFS_NC_ALLOW_HTTP) {
+            dbg.log0('HTTP is not allowed for NC NSFS.');
+        } else {
             const http_server = http.createServer(endpoint_request_handler);
             if (http_port > 0) {
                 dbg.log0('Starting S3 HTTP', http_port);
                 await listen_http(http_port, http_server);
                 dbg.log0('Started S3 HTTP successfully');
             }
-        } else {
-            dbg.log0('HTTP is not allowed for NSFS.');
         }
         if (https_port > 0) {
             dbg.log0('Starting S3 HTTPS', https_port);
@@ -228,17 +232,6 @@ async function main(options = {}) {
     }
 }
 
-async function is_http_allowed(nsfs_config_root) {
-    if (!nsfs_config_root) {
-        return true;
-    }
-    const allow_http = await endpoint_utils.get_nsfs_system_property('allow_http', nsfs_config_root);
-    if (allow_http === undefined || allow_http) {
-        return true;
-    }
-    return false;
-}
-
 /**
  * @param {EndpointHandler} init_request_sdk
  * @param {readonly string[]} virtual_hosts
@@ -257,6 +250,10 @@ function create_endpoint_handler(init_request_sdk, virtual_hosts, sts) {
             return lambda_rest_handler(req, res);
         } else if (req.headers['x-ms-version']) {
             return blob_rest_handler(req, res);
+        } else if (req.url.startsWith('/total_fork_count')) {
+            return fork_count_handler(req, res);
+        } else if (req.url.startsWith('/endpoint_fork_id')) {
+            return endpoint_fork_id_handler(req, res);
         } else {
             return s3_rest.handler(req, res);
         }
@@ -269,6 +266,30 @@ function create_endpoint_handler(init_request_sdk, virtual_hosts, sts) {
     };
 
     return sts ? endpoint_sts_request_handler : endpoint_request_handler;
+}
+
+function endpoint_fork_id_handler(req, res) {
+    let reply = {};
+    if (cluster.isWorker) {
+        reply = {
+            worker_id: cluster.worker.id,
+        };
+    }
+    P.delay(500);
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Length', Buffer.byteLength(JSON.stringify(reply)));
+    res.end(JSON.stringify(reply));
+}
+
+function fork_count_handler(req, res) {
+    const reply = {
+        fork_count: fork_count,
+    };
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Length', Buffer.byteLength(JSON.stringify(reply)));
+    res.end(JSON.stringify(reply));
 }
 
 /**
@@ -472,6 +493,5 @@ function setup_http_server(server) {
 exports.main = main;
 exports.create_endpoint_handler = create_endpoint_handler;
 exports.create_init_request_sdk = create_init_request_sdk;
-exports.is_http_allowed = is_http_allowed;
 
 if (require.main === module) main();

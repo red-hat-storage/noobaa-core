@@ -11,6 +11,7 @@ dbg.original_console();
 
 const config = require('../../config');
 
+const os = require('os');
 const fs = require('fs');
 const util = require('util');
 const minimist = require('minimist');
@@ -204,17 +205,20 @@ async function init_nsfs_system(config_root) {
     const system_data = new json_utils.JsonFileWrapper(system_data_path);
 
     const data = await system_data.read();
-
+    const hostname = os.hostname();
     // If the system data already exists, we should not create it again
-    if (data.current_version) return;
+    if (data?.[hostname]?.current_version) return;
 
     try {
         await system_data.update({
-            current_version: pkg.version,
-            upgrade_history: {
-                successful_upgrades: [],
-                last_failure: undefined
-            },
+            ...data,
+            [hostname]: {
+                current_version: pkg.version,
+                upgrade_history: {
+                    successful_upgrades: [],
+                    last_failure: undefined
+                }
+            }
         });
         console.log('created NSFS system data with version: ', pkg.version);
     } catch (err) {
@@ -239,24 +243,28 @@ async function main(argv = minimist(process.argv.slice(2))) {
             console.log(JSON.stringify(IAM_JSON_SCHEMA.schema, null, 2));
             return;
         }
-
-        const http_port = Number(argv.http_port) || Number(process.env.ENDPOINT_PORT) || 6001;
-        const https_port = Number(argv.https_port) || Number(process.env.ENDPOINT_SSL_PORT) || 6443;
-        const https_port_sts = Number(argv.https_port_sts) || -1;
-        const metrics_port = Number(argv.metrics_port) || -1;
+        const simple_mode = Boolean(argv.simple);
+        if (!simple_mode) {
+            nsfs_config_root = config.NSFS_NC_CONF_DIR;
+            if (argv.config_root) {
+                nsfs_config_root = String(argv.config_root);
+                config.NSFS_NC_CONF_DIR = nsfs_config_root;
+                require('../../config').load_nsfs_nc_config();
+                require('../../config').reload_nsfs_nc_config();
+            }
+        }
+        const http_port = Number(argv.http_port) || config.ENDPOINT_PORT;
+        const https_port = Number(argv.https_port) || config.ENDPOINT_SSL_PORT;
+        const https_port_sts = Number(argv.https_port_sts) || config.ENDPOINT_SSL_STS_PORT;
+        const metrics_port = Number(argv.metrics_port) || config.EP_METRICS_SERVER_PORT;
         const forks = Number(argv.forks) || config.ENDPOINT_FORKS;
         const uid = Number(argv.uid) || process.getuid();
         const gid = Number(argv.gid) || process.getgid();
         const access_key = argv.access_key && new SensitiveString(String(argv.access_key));
         const secret_key = argv.secret_key && new SensitiveString(String(argv.secret_key));
-        const simple_mode = Boolean(argv.simple);
-        if (!simple_mode) {
-            nsfs_config_root = argv.config_root ? String(argv.config_root) : config.NSFS_NC_DEFAULT_CONF_DIR;
-        }
         const iam_ttl = Number(argv.iam_ttl ?? 60);
         const backend = argv.backend || (process.env.GPFS_DL_PATH ? 'GPFS' : '');
         const versioning = argv.versioning || 'DISABLED';
-
         const fs_root = argv._[0] || '';
 
         const fs_config = {
@@ -265,7 +273,7 @@ async function main(argv = minimist(process.argv.slice(2))) {
             backend,
             warn_threshold_ms: config.NSFS_WARN_THRESHOLD_MS,
         };
-        verify_gpfslib(backend, fs_config);
+        verify_gpfslib();
         const account = {
             email: new SensitiveString('nsfs@noobaa.io'),
             nsfs_account_config: fs_config,
@@ -318,7 +326,7 @@ async function main(argv = minimist(process.argv.slice(2))) {
                 req.object_sdk = new NsfsObjectSDK(fs_root, fs_config, account, versioning, nsfs_config_root);
             }
         });
-        if (await endpoint.is_http_allowed(nsfs_config_root)) {
+        if (config.NSFS_NC_ALLOW_HTTP) {
             console.log('nsfs: listening on', util.inspect(`http://localhost:${http_port}`));
         }
         console.log('nsfs: listening on', util.inspect(`https://localhost:${https_port}`));
@@ -339,21 +347,18 @@ async function main(argv = minimist(process.argv.slice(2))) {
     }
 }
 
-async function verify_gpfslib(backend, fs_config) {
-    if (nb_native().fs.gpfs) {
-        const stat = await nb_native().fs.stat(fs_config, process.env.GPFS_DL_PATH);
-        if (!stat) {
-            dbg.event({
-                code: "noobaa_gpfslib_missing",
-                entity_type: "NODE",
-                event_type: "STATE_CHANGE",
-                message: "Noobaa GPFS library file is missing",
-                scope: "NODE",
-                severity: "ERROR",
-                state: "DEGRADED",
-                arguments: {gpfs_dl_path: process.env.GPFS_DL_PATH},
-            });
-        }
+function verify_gpfslib() {
+    if (!nb_native().fs.gpfs) {
+        dbg.event({
+            code: "noobaa_gpfslib_missing",
+            entity_type: "NODE",
+            event_type: "STATE_CHANGE",
+            message: "Noobaa GPFS library file is missing",
+            scope: "NODE",
+            severity: "ERROR",
+            state: "DEGRADED",
+            arguments: { gpfs_dl_path: process.env.GPFS_DL_PATH },
+        });
     }
 }
 

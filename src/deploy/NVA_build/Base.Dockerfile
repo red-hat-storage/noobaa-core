@@ -19,7 +19,7 @@ RUN npm install --production && \
 ##############################################################
 COPY ./binding.gyp .
 COPY ./src/native ./src/native/
-COPY ./src/deploy/nsfs.service ./src/deploy/
+COPY ./src/deploy/noobaa_nsfs.service ./src/deploy/
 COPY ./src/deploy/nsfs_env.env ./src/deploy/
 COPY ./src/deploy/NVA_build/clone_submodule.sh ./src/deploy/NVA_build/
 COPY ./src/deploy/NVA_build/clone_s3select_submodules.sh ./src/deploy/NVA_build/
@@ -27,6 +27,7 @@ ARG BUILD_S3SELECT=1
 ARG BUILD_S3SELECT_PARQUET=0
 #Clone S3Select and its two submodules, but only if BUILD_S3SELECT=1.
 RUN ./src/deploy/NVA_build/clone_s3select_submodules.sh
+RUN ln -s /lib64/libboost_thread.so.1.66.0 /lib64/libboost_thread.so.1.75.0 || true
 #Pass BUILD_S3SELECT down to GYP native build.
 #S3Select will be built only if this parameter is equal to "1".
 RUN GYP_DEFINES="BUILD_S3SELECT=$BUILD_S3SELECT BUILD_S3SELECT_PARQUET=$BUILD_S3SELECT_PARQUET" npm run build

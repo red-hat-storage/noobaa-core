@@ -7,7 +7,6 @@ const nb_native = require('../util/nb_native');
 const SensitiveString = require('../util/sensitive_string');
 const { S3Error } = require('../endpoint/s3/s3_errors');
 const RpcError = require('../rpc/rpc_error');
-const net = require('net');
 const js_utils = require('../util/js_utils');
 const P = require('../util/promise');
 const BucketSpaceSimpleFS = require('./bucketspace_simple_fs');
@@ -23,10 +22,9 @@ const native_fs_utils = require('../util/native_fs_utils');
 
 const dbg = require('../util/debug_module')(__filename);
 
-const VALID_BUCKET_NAME_REGEXP =
-    /^(([a-z0-9]|[a-z0-9][a-z0-9-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9-]*[a-z0-9])$/;
-const ACCOUNT_PATH = 'accounts';
 const BUCKET_PATH = 'buckets';
+const ACCOUNT_PATH = 'accounts';
+const ACCESS_KEYS_PATH = 'access_keys';
 const ajv = new Ajv({ verbose: true, allErrors: true });
 
 const bucket_semaphore = new KeysSemaphore(1);
@@ -47,25 +45,13 @@ function prepare_fs_context(object_sdk) {
     return fs_context;
 }
 
-function isDirectory(ent) {
-    if (!ent) throw new Error('isDirectory: ent is empty');
-    if (ent.mode) {
-        // eslint-disable-next-line no-bitwise
-        return (((ent.mode) & nb_native().fs.S_IFMT) === nb_native().fs.S_IFDIR);
-    } else if (ent.type) {
-        return ent.type === nb_native().fs.DT_DIR;
-    } else {
-        throw new Error(`isDirectory: ent ${ent} is not supported`);
-    }
-}
-
-
 
 class BucketSpaceFS extends BucketSpaceSimpleFS {
     constructor({config_root}) {
         super({ fs_root: ''});
         this.fs_root = '';
-        this.iam_dir = path.join(config_root, ACCOUNT_PATH);
+        this.accounts_dir = path.join(config_root, ACCOUNT_PATH);
+        this.access_keys_dir = path.join(config_root, ACCESS_KEYS_PATH);
         this.bucket_schema_dir = path.join(config_root, BUCKET_PATH);
         this.config_root = config_root;
         this.fs_context = {
@@ -79,8 +65,22 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
        return path.join(this.bucket_schema_dir, bucket_name + '.json');
     }
 
-    _get_account_config_path(access_key) {
-        return path.join(this.iam_dir, access_key + '.json');
+    _get_account_config_path(name) {
+        return path.join(this.accounts_dir, name + '.json');
+    }
+
+    _get_access_keys_config_path(access_key) {
+        return path.join(this.access_keys_dir, access_key + '.symlink');
+    }
+
+    async _get_account_by_name(name) {
+        const access_key_config_path = this._get_account_config_path(name);
+        try {
+            await nb_native().fs.stat(this.fs_context, access_key_config_path);
+            return true;
+        } catch (err) {
+            return false;
+        }
     }
 
     _translate_bucket_error_codes(err) {
@@ -96,7 +96,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
     async read_account_by_access_key({ access_key }) {
         try {
             if (!access_key) throw new Error('no access key');
-            const iam_path = this._get_account_config_path(access_key);
+            const iam_path = this._get_access_keys_config_path(access_key);
             const { data } = await nb_native().fs.readFile(this.fs_context, iam_path);
             const account = JSON.parse(data.toString());
             this.validate_account_schema(account);
@@ -213,7 +213,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
     async list_buckets(object_sdk) {
         try {
             const entries = await nb_native().fs.readdir(this.fs_context, this.bucket_schema_dir);
-            const bucket_config_files = entries.filter(entree => !isDirectory(entree) && entree.name.endsWith('.json'));
+            const bucket_config_files = entries.filter(entree => !native_fs_utils.isDirectory(entree) && entree.name.endsWith('.json'));
             //TODO : we need to add pagination support to list buckets for more than 1000 buckets.
             let buckets = await P.map(bucket_config_files, bucket_config_file => this.get_bucket_name(bucket_config_file.name));
             buckets = buckets.filter(bucket => bucket.name.unwrap());
@@ -265,8 +265,8 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
     }
 
     async get_bucket_name(bucket_config_file_name) {
-        const bucket_path = path.join(this.bucket_schema_dir, bucket_config_file_name);
-        const { data } = await nb_native().fs.readFile(this.fs_context, bucket_path);
+        const bucket_config_path = path.join(this.bucket_schema_dir, bucket_config_file_name);
+        const { data } = await nb_native().fs.readFile(this.fs_context, bucket_config_path);
         const bucket = JSON.parse(data.toString());
         return { name: new SensitiveString(bucket.name) };
     }
@@ -282,7 +282,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
                 throw new RpcError('MISSING_NSFS_ACCOUNT_CONFIGURATION');
             }
             const fs_context = prepare_fs_context(sdk);
-            this.validate_bucket_creation(params);
+            native_fs_utils.validate_bucket_creation(params);
 
             const { name } = params;
             const bucket_config_path = this._get_bucket_config_path(name);
@@ -397,14 +397,6 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
         });
     }
 
-    validate_bucket_creation(params) {
-        if (params.name.length < 3 ||
-            params.name.length > 63 ||
-            net.isIP(params.name) ||
-            !VALID_BUCKET_NAME_REGEXP.test(params.name)) {
-            throw new RpcError('INVALID_BUCKET_NAME');
-        }
-    }
 
     //////////////////////
     // BUCKET LIFECYCLE //
@@ -431,17 +423,18 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             const ns = await object_sdk._get_bucket_namespace(params.name);
             await ns.set_bucket_versioning(params.versioning, object_sdk);
             const { name, versioning } = params;
-            dbg.log0('BucketSpaceFS.put_bucket_policy: Bucket name, policy', name);
+            dbg.log0('BucketSpaceFS.set_bucket_versioning: Bucket name, versioning', name, versioning);
             const bucket_config_path = this._get_bucket_config_path(name);
-            const { data } = await nb_native().fs.readFile(this.fs_context, bucket_config_path);
+            const fs_context = prepare_fs_context(object_sdk);
+            const { data } = await nb_native().fs.readFile(fs_context, bucket_config_path);
             const bucket = JSON.parse(data.toString());
             bucket.versioning = versioning;
             const update_bucket = JSON.stringify(bucket);
             await nb_native().fs.writeFile(
-                this.fs_context,
+                fs_context,
                 bucket_config_path,
                 Buffer.from(update_bucket), {
-                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_FILE)
+                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_CONFIG_FILE)
                 }
             );
         } catch (err) {
@@ -482,7 +475,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
                 this.fs_context,
                 bucket_config_path,
                 Buffer.from(update_bucket), {
-                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_FILE)
+                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_CONFIG_FILE)
                 }
             );
         } catch (err) {
@@ -516,7 +509,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
                 this.fs_context,
                 bucket_config_path,
                 Buffer.from(update_bucket), {
-                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_FILE)
+                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_CONFIG_FILE)
                 }
             );
         } catch (err) {
@@ -541,7 +534,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
                 this.fs_context,
                 bucket_config_path,
                 Buffer.from(update_bucket), {
-                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_FILE)
+                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_CONFIG_FILE)
                 }
             );
         } catch (err) {
@@ -562,7 +555,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
                 this.fs_context,
                 bucket_config_path,
                 Buffer.from(update_bucket), {
-                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_FILE)
+                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_CONFIG_FILE)
                 }
             );
         } catch (err) {
@@ -587,6 +580,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
     // BUCKET POLICY  //
     ////////////////////
 
+
     async put_bucket_policy(params) {
         try {
             const { name, policy } = params;
@@ -594,14 +588,14 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             const bucket_config_path = this._get_bucket_config_path(name);
             const { data } = await nb_native().fs.readFile(this.fs_context, bucket_config_path);
             const bucket = JSON.parse(data.toString());
-            bucket_policy_utils.validate_s3_policy(policy, bucket.name, () => true);
+            await bucket_policy_utils.validate_s3_policy(policy, bucket.name, async principal => this._get_account_by_name(principal));
             bucket.s3_policy = policy;
             const update_bucket = JSON.stringify(bucket);
             await nb_native().fs.writeFile(
                 this.fs_context,
                 bucket_config_path,
                 Buffer.from(update_bucket), {
-                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_FILE)
+                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_CONFIG_FILE)
                 }
             );
         } catch (err) {
@@ -622,7 +616,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
                 this.fs_context,
                 bucket_config_path,
                 Buffer.from(update_bucket), {
-                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_FILE)
+                    mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_CONFIG_FILE)
                 }
             );
         } catch (err) {

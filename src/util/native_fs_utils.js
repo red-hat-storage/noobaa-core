@@ -8,11 +8,13 @@ const nb_native = require('../util/nb_native');
 const { v4: uuidv4 } = require('uuid');
 const config = require('../../config');
 const RpcError = require('../rpc/rpc_error');
+const net = require('net');
 
 const gpfs_link_unlink_retry_err = 'EEXIST';
 const gpfs_unlink_retry_catch = 'GPFS_UNLINK_RETRY';
 const posix_link_retry_err = 'FS::SafeLink ERROR link target doesn\'t match expected inode and mtime';
 const posix_unlink_retry_err = 'FS::SafeUnlink ERROR unlink target doesn\'t match expected inode and mtime';
+const VALID_BUCKET_NAME_REGEXP = /^(([a-z0-9]|[a-z0-9][a-z0-9-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9-]*[a-z0-9])$/;
 
 /** @typedef {import('../util/buffer_utils').BuffersPool} BuffersPool */
 
@@ -26,12 +28,12 @@ async function _make_path_dirs(file_path, fs_context) {
     if (last_dir_pos > 0) return _create_path(file_path.slice(0, last_dir_pos), fs_context);
 }
 
-async function _create_path(dir, fs_context) {
+async function _create_path(dir, fs_context, dir_permissions = config.BASE_MODE_DIR) {
     let dir_path = path.isAbsolute(dir) ? path.sep : '';
     for (const item of dir.split(path.sep)) {
         dir_path = path.join(dir_path, item);
         try {
-            await nb_native().fs.mkdir(fs_context, dir_path, get_umasked_mode(config.BASE_MODE_DIR));
+            await nb_native().fs.mkdir(fs_context, dir_path, get_umasked_mode(dir_permissions));
         } catch (err) {
             const ERR_CODES = ['EISDIR', 'EEXIST'];
             if (!ERR_CODES.includes(err.code)) throw err;
@@ -55,7 +57,8 @@ async function _generate_unique_path(fs_context, tmp_dir_path) {
  * @param {string} open_mode 
  */
 // opens open_path on POSIX, and on GPFS it will open open_path parent folder
-async function open_file(fs_context, bucket_path, open_path, open_mode = config.NSFS_OPEN_READ_MODE) {
+async function open_file(fs_context, bucket_path, open_path, open_mode = config.NSFS_OPEN_READ_MODE,
+        file_permissions = config.BASE_MODE_FILE) {
     const dir_path = path.dirname(open_path);
     if ((open_mode === 'wt' || open_mode === 'w') && dir_path !== bucket_path) {
         dbg.log1(`NamespaceFS._open_file: mode=${open_mode} creating dirs`, open_path, bucket_path);
@@ -64,7 +67,7 @@ async function open_file(fs_context, bucket_path, open_path, open_mode = config.
     dbg.log1(`NamespaceFS._open_file: mode=${open_mode}`, open_path);
     // for 'wt' open the tmpfile with the parent dir path
     const actual_open_path = open_mode === 'wt' ? dir_path : open_path;
-    return nb_native().fs.open(fs_context, actual_open_path, open_mode, get_umasked_mode(config.BASE_MODE_FILE));
+    return nb_native().fs.open(fs_context, actual_open_path, open_mode, get_umasked_mode(file_permissions));
 }
 
 /**
@@ -238,7 +241,13 @@ function get_config_files_tmpdir() {
     return config.NSFS_TEMP_CONF_DIR_NAME;
 }
 
-
+/**
+ * create_config_file created the config file at config_path under schema_dir containig config_data
+ * @param {nb.NativeFSContext} fs_context 
+ * @param {string} schema_dir
+ * @param {string} config_path 
+ * @param {string} config_data 
+ */
 async function create_config_file(fs_context, schema_dir, config_path, config_data) {
     const is_gpfs = _is_gpfs(fs_context);
     const open_mode = is_gpfs ? 'wt' : 'w';
@@ -254,14 +263,16 @@ async function create_config_file(fs_context, schema_dir, config_path, config_da
         } catch (err) {
             if (err.code !== 'ENOENT') throw err;
         }
-        dbg.log0('native_fs_utils: create_config_file config_path:', config_path, 'config_data:', config_data, 'is_gpfs:', open_mode);
+        dbg.log1('native_fs_utils: create_config_file config_path:', config_path, 'config_data:', config_data, 'is_gpfs:', open_mode);
+        // create config dir if it does not exist
+        await _create_path(schema_dir, fs_context, config.BASE_MODE_CONFIG_DIR);
         // when using GPFS open dst file as soon as possible for later linkat validation
-        if (is_gpfs) gpfs_dst_file = await open_file(fs_context, schema_dir, config_path, 'w*');
+        if (is_gpfs) gpfs_dst_file = await open_file(fs_context, schema_dir, config_path, 'w*', config.BASE_MODE_CONFIG_FILE);
 
         // open tmp file (in GPFS we open the parent dir using wt open mode)
         const tmp_dir_path = path.join(schema_dir, get_config_files_tmpdir());
         let open_path = is_gpfs ? config_path : await _generate_unique_path(fs_context, tmp_dir_path);
-        upload_tmp_file = await open_file(fs_context, schema_dir, open_path, open_mode);
+        upload_tmp_file = await open_file(fs_context, schema_dir, open_path, open_mode, config.BASE_MODE_CONFIG_FILE);
 
         // write tmp file data
         await upload_tmp_file.writev(fs_context, [Buffer.from(config_data)], 0);
@@ -276,11 +287,11 @@ async function create_config_file(fs_context, schema_dir, config_path, config_da
         } else {
             src_stat = await nb_native().fs.stat(fs_context, open_path);
         }
-        dbg.log0('native_fs_utils: create_config_file moving from:', open_path, 'to:', config_path, 'is_gpfs=', is_gpfs);
+        dbg.log1('native_fs_utils: create_config_file moving from:', open_path, 'to:', config_path, 'is_gpfs=', is_gpfs);
 
         await safe_move(fs_context, open_path, config_path, src_stat, gpfs_options, tmp_dir_path);
 
-        dbg.log0('native_fs_utils: create_config_file done', config_path);
+        dbg.log1('native_fs_utils: create_config_file done', config_path);
     } catch (err) {
         dbg.error('native_fs_utils: create_config_file error', err);
         throw err;
@@ -289,6 +300,12 @@ async function create_config_file(fs_context, schema_dir, config_path, config_da
     }
 }
 
+/**
+ * delete_config_file deletes the config file at config_path under schema_dir
+ * @param {nb.NativeFSContext} fs_context 
+ * @param {string} schema_dir
+ * @param {string} config_path 
+ */
 async function delete_config_file(fs_context, schema_dir, config_path) {
     const is_gpfs = _is_gpfs(fs_context);
     let gpfs_dir_file;
@@ -304,23 +321,30 @@ async function delete_config_file(fs_context, schema_dir, config_path) {
         } else {
             stat = await nb_native().fs.stat(fs_context, config_path);
         }
-        dbg.log0('native_fs_utils: delete_config_file config_path:', config_path, 'is_gpfs:', is_gpfs);
+        dbg.log1('native_fs_utils: delete_config_file config_path:', config_path, 'is_gpfs:', is_gpfs);
 
         // moving tmp file to config path atomically
-        dbg.log0('native_fs_utils: delete_config_file unlinking:', config_path, 'is_gpfs=', is_gpfs);
+        dbg.log1('native_fs_utils: delete_config_file unlinking:', config_path, 'is_gpfs=', is_gpfs);
         const tmp_dir_path = path.join(schema_dir, get_config_files_tmpdir());
         // TODO: add retry? should we fail deletion if the config file was updated at the same time?
         await safe_unlink(fs_context, config_path, stat, gpfs_options, tmp_dir_path);
 
-        dbg.log0('native_fs_utils: delete_config_file done', config_path);
+        dbg.log1('native_fs_utils: delete_config_file done', config_path);
     } catch (err) {
-        dbg.error('native_fs_utils: delete_config_file error', err);
+        dbg.log1('native_fs_utils: delete_config_file error', err);
         throw err;
     } finally {
         await finally_close_files(fs_context, [gpfs_dir_file, gpfs_src_file]);
     }
 }
 
+/**
+ * update_config_file updated the config file at config_path under schema_dir with the new config_data
+ * @param {nb.NativeFSContext} fs_context 
+ * @param {string} schema_dir
+ * @param {string} config_path 
+ * @param {string} config_data 
+ */
 async function update_config_file(fs_context, schema_dir, config_path, config_data) {
     const is_gpfs = _is_gpfs(fs_context);
     let upload_tmp_file;
@@ -343,21 +367,21 @@ async function update_config_file(fs_context, schema_dir, config_path, config_da
             stat = await nb_native().fs.stat(fs_context, config_path);
             await safe_unlink(fs_context, config_path, stat, undefined, tmp_dir_path);
             open_path = await _generate_unique_path(fs_context, tmp_dir_path);
-            upload_tmp_file = await open_file(fs_context, schema_dir, open_path, 'w');
+            upload_tmp_file = await open_file(fs_context, schema_dir, open_path, 'w', config.BASE_MODE_CONFIG_FILE);
         }
-        dbg.log0('native_fs_utils: update_config_file config_path:', config_path, 'config_data:', config_data);
+        dbg.log1('native_fs_utils: update_config_file config_path:', config_path, 'config_data:', config_data);
 
         // write tmp file data
         await upload_tmp_file.writev(fs_context, [Buffer.from(config_data)], 0);
 
         // moving tmp file to config path atomically
-        dbg.log0('native_fs_utils: update_config_file moving from:', open_path, 'to:', config_path, 'is_gpfs=', is_gpfs);
+        dbg.log1('native_fs_utils: update_config_file moving from:', open_path, 'to:', config_path, 'is_gpfs=', is_gpfs);
         let retries = config.NSFS_RENAME_RETRIES;
         for (;;) {
             try {
                 const src_stat = is_gpfs ? undefined : await nb_native().fs.stat(fs_context, open_path);
                 await safe_move(fs_context, open_path, config_path, src_stat, gpfs_options, tmp_dir_path);
-                dbg.log0('native_fs_utils: update_config_file done', config_path);
+                dbg.log1('native_fs_utils: update_config_file done', config_path);
                 break;
             } catch (err) {
                 retries -= 1;
@@ -394,6 +418,40 @@ async function get_user_by_distinguished_name({ distinguished_name }) {
     }
 }
 
+function isDirectory(ent) {
+    if (!ent) throw new Error('isDirectory: ent is empty');
+    if (ent.mode) {
+        // eslint-disable-next-line no-bitwise
+        return (((ent.mode) & nb_native().fs.S_IFMT) === nb_native().fs.S_IFDIR);
+    } else if (ent.type) {
+        return ent.type === nb_native().fs.DT_DIR;
+    } else {
+        throw new Error(`isDirectory: ent ${ent} is not supported`);
+    }
+}
+
+/**
+ * @param {string} [config_root_backend]
+ * @returns {nb.NativeFSContext}
+ */
+function get_process_fs_context(config_root_backend) {
+    return {
+        uid: process.getuid(),
+        gid: process.getgid(),
+        warn_threshold_ms: config.NSFS_WARN_THRESHOLD_MS,
+        backend: config_root_backend
+    };
+}
+
+function validate_bucket_creation(params) {
+    if (params.name.length < 3 ||
+        params.name.length > 63 ||
+        net.isIP(params.name) ||
+        !VALID_BUCKET_NAME_REGEXP.test(params.name)) {
+        throw new RpcError('INVALID_BUCKET_NAME');
+    }
+}
+
 exports.get_umasked_mode = get_umasked_mode;
 exports._make_path_dirs = _make_path_dirs;
 exports._create_path = _create_path;
@@ -419,3 +477,6 @@ exports.gpfs_unlink_retry_catch = gpfs_unlink_retry_catch;
 exports.create_config_file = create_config_file;
 exports.delete_config_file = delete_config_file;
 exports.update_config_file = update_config_file;
+exports.isDirectory = isDirectory;
+exports.get_process_fs_context = get_process_fs_context;
+exports.validate_bucket_creation = validate_bucket_creation;

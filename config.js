@@ -10,6 +10,11 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
+const _ = require('lodash');
+const util = require('util');
+const { default: Ajv } = require('ajv');
+const nsfs_config_schema = require('./src/server/object_services/schemas/nsfs_config_schema');
+const ajv = new Ajv({ verbose: true, allErrors: true });
 
 /////////////////////////
 // CONTAINER RESOURCES //
@@ -165,10 +170,11 @@ config.STS_CORS_EXPOSE_HEADERS = 'ETag';
 /////////////////////
 // SECRETS CONFIG  //
 /////////////////////
-
-config.JWT_SECRET = process.env.JWT_SECRET || _get_data_from_file(`/etc/noobaa-server/jwt`);
-config.SERVER_SECRET = process.env.SERVER_SECRET || _get_data_from_file(`/etc/noobaa-server/server_secret`);
-config.NOOBAA_AUTH_TOKEN = process.env.NOOBAA_AUTH_TOKEN || _get_data_from_file(`/etc/noobaa-auth-token/auth_token`);
+if (process.env.CONTAINER_PLATFORM || process.env.LOCAL_MD_SERVER) {
+    config.JWT_SECRET = process.env.JWT_SECRET || _get_data_from_file(`/etc/noobaa-server/jwt`);
+    config.SERVER_SECRET = process.env.SERVER_SECRET || _get_data_from_file(`/etc/noobaa-server/server_secret`);
+    config.NOOBAA_AUTH_TOKEN = process.env.NOOBAA_AUTH_TOKEN || _get_data_from_file(`/etc/noobaa-auth-token/auth_token`);
+}
 
 config.ROOT_KEY_MOUNT = '/etc/noobaa-server/root_keys';
 
@@ -684,8 +690,17 @@ config.NSFS_VERSIONING_ENABLED = true;
 // NSFS NON CONTAINERIZED //
 ////////////////////////////
 
+config.NSFS_NC_CONF_DIR_REDIRECT_FILE = 'config_dir_redirect';
 config.NSFS_NC_DEFAULT_CONF_DIR = '/etc/noobaa.conf.d';
+config.NSFS_NC_CONF_DIR = process.env.NSFS_NC_CONF_DIR || '';
 config.NSFS_TEMP_CONF_DIR_NAME = '.noobaa-config-nsfs';
+config.ENDPOINT_PORT = Number(process.env.ENDPOINT_PORT) || 6001;
+config.ENDPOINT_SSL_PORT = Number(process.env.ENDPOINT_SSL_PORT) || 6443;
+config.ENDPOINT_SSL_STS_PORT = Number(process.env.ENDPOINT_SSL_STS_PORT) || -1;
+config.NSFS_NC_ALLOW_HTTP = false;
+// config files should allow access to the owner of the files 
+config.BASE_MODE_CONFIG_FILE = 0o600;
+config.BASE_MODE_CONFIG_DIR = 0o700;
 
 // NSFS_RESTORE_ENABLED can override internal autodetection and will force
 // the use of restore for all objects.
@@ -821,5 +836,88 @@ function _get_data_from_file(file_name) {
     return data;
 }
 
+/**
+ * @returns {string}
+ */
+function _get_config_root() {
+    let config_root = config.NSFS_NC_DEFAULT_CONF_DIR;
+    try {
+        const redirect_path = path.join(config.NSFS_NC_DEFAULT_CONF_DIR, config.NSFS_NC_CONF_DIR_REDIRECT_FILE);
+        const data = _get_data_from_file(redirect_path);
+        config_root = data.toString().trim();
+    } catch (err) {
+        console.warn('config.get_config_root - could not find custom config_root, will use the default config_root ', config_root);
+    }
+    return config_root;
+}
+
+
+/**
+ * load_nsfs_nc_config loads on non containerized env the config.json file and sets the configurations
+ */
+function load_nsfs_nc_config() {
+    if (process.env.CONTAINER_PLATFORM) return;
+    try {
+        if (!config.NSFS_NC_CONF_DIR) {
+            config.NSFS_NC_CONF_DIR = _get_config_root();
+            console.warn('load_nsfs_nc_config.setting config.NSFS_NC_CONF_DIR', config.NSFS_NC_CONF_DIR);
+        }
+        const config_path = path.join(config.NSFS_NC_CONF_DIR, 'config.json');
+        const config_data = require(config_path);
+        const valid = ajv.validate(nsfs_config_schema, config_data);
+        if (!valid) throw new Error('INVALID_SCHEMA' + ajv.errors[0]?.message);
+
+        const shared_config = _.omit(config_data, 'host_customization');
+        const node_name = os.hostname();
+        const node_config = config_data.host_customization?.[node_name];
+        const merged_config = _.merge(shared_config, node_config || {});
+
+        Object.keys(merged_config).forEach(function(key) {
+            if (key === 'NOOBAA_LOG_LEVEL' || key === 'UV_THREADPOOL_SIZE' || key === 'GPFS_DL_PATH') {
+                process.env[key] = merged_config[key];
+                return;
+            }
+            config[key] = merged_config[key];
+        });
+
+        console.warn(`nsfs: config_dir_path=${config.NSFS_NC_CONF_DIR} config.json= ${util.inspect(merged_config)}`);
+
+    } catch (err) {
+        if (err.code !== 'MODULE_NOT_FOUND' && err.code !== 'ENOENT') throw err;
+        console.warn('config.load_nsfs_nc_config could not find config.json... skipping');
+    }
+}
+/**
+ * reload_nsfs_nc_config reloads on non containerized env the config.json file every 10 seconfs
+ */
+function reload_nsfs_nc_config() {
+    if (process.env.CONTAINER_PLATFORM) return;
+    try {
+        const config_path = path.join(config.NSFS_NC_CONF_DIR, 'config.json');
+        fs.watchFile(config_path, {
+            interval: 10 * 1000
+        }, () => {
+            delete require.cache[config_path];
+            try {
+                load_nsfs_nc_config();
+            } catch (err) {
+                // we cannot rethrow, next watch event will try to load again
+            }
+        }).unref();
+    } catch (e) {
+        if (e.code === 'ENOENT') {
+            console.warn('config.load_nsfs_nc_config could not find config.json... skipping');
+            return;
+        }
+        console.warn('config.load_nsfs_nc_config failed to set config.json to config.js ', e);
+        throw e;
+    }
+}
+
+module.exports.load_nsfs_nc_config = load_nsfs_nc_config;
+module.exports.reload_nsfs_nc_config = reload_nsfs_nc_config;
+
+load_nsfs_nc_config();
+reload_nsfs_nc_config();
 load_config_local();
 load_config_env_overrides();

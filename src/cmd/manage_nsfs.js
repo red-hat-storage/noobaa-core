@@ -1,15 +1,15 @@
 /* Copyright (C) 2020 NooBaa */
 'use strict';
 
-const fs_utils = require('../util/fs_utils');
+const dbg = require('../util/debug_module')(__filename);
 const SensitiveString = require('../util/sensitive_string');
 const minimist = require('minimist');
 const path = require('path');
-const fs = require('fs');
-const P = require('../util/promise');
 const _ = require('lodash');
 const config = require('../../config');
 const native_fs_utils = require('../util/native_fs_utils');
+const nb_native = require('../util/nb_native');
+
 
 const HELP = `
 Help:
@@ -44,14 +44,15 @@ Account Options:
     # required for add, update 
     --name <name>               (default none)                              Set the name for the account.
     --email <email>             (default none)                              Set the email for the account.
+    --new_name <name>           (default none)                              Set a new name for the account (update).
     --uid <uid>                 (default as process)                        Send requests to the Filesystem with uid.
     --gid <gid>                 (default as process)                        Send requests to the Filesystem with gid.
-    --user <distinguished_name> (default none)                              Send requests to the Filesystem with distinguished_name (overrides uid/gid).
     --secret_key <key>          (default none)                              The secret key pair for the access key.
     --new_buckets_path <dir>    (default none)                              Set the filesystem's root where each subdir is a bucket.
     
     # required for add, update, and delete
     --access_key <key>          (default none)                              Authenticate incoming requests for this access key only (default is no auth).
+    --new_access_key <key>      (default none)                              Set a new access key for the account.
     --config_root <dir>         (default config.NSFS_NC_DEFAULT_CONF_DIR)   Configuration files path for Noobaa standalon NSFS.
 
     # Used for list
@@ -72,43 +73,61 @@ Bucket Options:
 
     # required for add, update, and delete
     --name <name>               (default none)                              Set the name for the bucket.
+    --new_name <name>           (default none)                              Set a new name for the bucket.
     --config_root <dir>         (default config.NSFS_NC_DEFAULT_CONF_DIR)   Configuration files path for Noobaa standalon NSFS.
-`;
+    --wide                      (default none)                              Will print the list with details (same as status but for all buckets)
+    `;
 
 function print_usage() {
-    console.warn(HELP);
-    console.warn(USAGE.trimStart());
-    console.warn(ARGUMENTS.trimStart());
-    console.warn(ACCOUNT_OPTIONS.trimStart());
-    console.warn(BUCKET_OPTIONS.trimStart());
+    process.stdout.write(HELP);
+    process.stdout.write(USAGE.trimStart());
+    process.stdout.write(ARGUMENTS.trimStart());
+    process.stdout.write(ACCOUNT_OPTIONS.trimStart());
+    process.stdout.write(BUCKET_OPTIONS.trimStart());
     process.exit(1);
 }
 
 function print_account_usage() {
-    console.warn(HELP);
-    console.warn(USAGE.trimStart());
-    console.warn(ARGUMENTS.trimStart());
-    console.warn(ACCOUNT_OPTIONS.trimStart());
+    process.stdout.write(HELP);
+    process.stdout.write(USAGE.trimStart());
+    process.stdout.write(ARGUMENTS.trimStart());
+    process.stdout.write(ACCOUNT_OPTIONS.trimStart());
     process.exit(1);
 }
 
 function print_bucket_usage() {
-    console.warn(HELP);
-    console.warn(USAGE.trimStart());
-    console.warn(ARGUMENTS.trimStart());
-    console.warn(BUCKET_OPTIONS.trimStart());
+    process.stdout.write(HELP);
+    process.stdout.write(USAGE.trimStart());
+    process.stdout.write(ARGUMENTS.trimStart());
+    process.stdout.write(BUCKET_OPTIONS.trimStart());
     process.exit(1);
 }
 
+const buckets_dir_name = '/buckets';
+const accounts_dir_name = '/accounts';
+const access_keys_dir_name = '/access_keys';
+
 async function check_and_create_config_dirs(config_root) {
-    const bucket_dir_stat = await fs_utils.file_exists(config_root);
-    if (!bucket_dir_stat) {
-        await fs_utils.create_path(config_root);
-        await fs_utils.create_path(config_root + '/buckets');
-        await fs_utils.create_path(config_root + '/accounts');
-        return true;
+    const pre_req_dirs = [
+        config_root,
+        path.join(config_root, buckets_dir_name),
+        path.join(config_root, accounts_dir_name),
+        path.join(config_root, access_keys_dir_name)
+    ];
+    for (const dir_path of pre_req_dirs) {
+        try {
+            const fs_context = native_fs_utils.get_process_fs_context();
+            const dir_exists = await config_file_exists(fs_context, dir_path);
+            if (dir_exists) {
+                dbg.log1('nsfs.check_and_create_config_dirs: config dir exists:', dir_path);
+            } else {
+                await native_fs_utils._create_path(dir_path, fs_context, config.BASE_MODE_CONFIG_DIR);
+                dbg.log1('nsfs.check_and_create_config_dirs: config dir was created:', dir_path);
+            }
+        } catch (err) {
+            dbg.log1('nsfs.check_and_create_config_dirs: could not create pre requisite path', dir_path);
+        }
     }
-    return false;
 }
 
 async function main(argv = minimist(process.argv.slice(2))) {
@@ -124,44 +143,34 @@ async function main(argv = minimist(process.argv.slice(2))) {
         }
         if (resources_type === 'account') {
             if (argv.uid && typeof argv.uid !== 'number') {
-                console.error('Error: UID  must be a number');
+                process.stdout.write('Error: UID  must be a number \n');
                 return;
             }
             if (argv.gid && typeof argv.gid !== 'number') {
-                console.error('Error: GIT must be a number');
+                process.stdout.write('Error: GIT must be a number \n');
                 return;
             }
         }
-        const config_root = argv.config_root ? String(argv.config_root) : config.NSFS_NC_DEFAULT_CONF_DIR;
+        const config_root = argv.config_root ? String(argv.config_root) : config.NSFS_NC_CONF_DIR;
         if (!config_root) {
-            console.error('Error: Config dir should not be empty');
+            process.stdout.write('Error: Config dir should not be empty');
             print_account_usage();
             return;
         }
-        const state = await check_and_create_config_dirs(config_root);
-        if (state) {
-            console.log('NSFS config root dirs are created in :' + config_root);
-        }
+        await check_and_create_config_dirs(config_root);
         const from_file = argv.from_file ? String(argv.from_file) : '';
         if (resources_type === 'account') {
             await account_management(argv, config_root, from_file);
-        }
-        if (resources_type === 'bucket') {
+        } else if (resources_type === 'bucket') {
             await bucket_management(argv, config_root, from_file);
+        } else {
+            process.stdout.write('Error: Invalid config type, available config types are account/bucket');
+            print_account_usage();
         }
     } catch (err) {
-        console.error('NSFS Manage command: exit on error', err.stack || err);
+        dbg.log1('NSFS Manage command: exit on error', err.stack || err);
         process.exit(2);
     }
-}
-
-function get_root_fs_context(config_root_backend) {
-    return {
-        uid: process.getuid(),
-        gid: process.getgid(),
-        warn_threshold_ms: config.NSFS_WARN_THRESHOLD_MS,
-        backend: config_root_backend
-    };
 }
 
 async function bucket_management(argv, config_root, from_file) {
@@ -173,42 +182,51 @@ async function bucket_management(argv, config_root, from_file) {
 
 async function fetch_bucket_data(argv, config_root, from_file) {
     const action = argv._[1] || '';
-    const name = argv.name && new SensitiveString(String(argv.name));
-    const email = argv.email && new SensitiveString(String(argv.email));
     let data;
     if (from_file) {
-        const raw_data = await fs.promises.readFile(from_file);
+        const fs_context = native_fs_utils.get_process_fs_context();
+        const raw_data = (await nb_native().fs.readFile(fs_context, from_file)).data;
         data = JSON.parse(raw_data.toString());
-        data.name = new SensitiveString(data.name);
     }
     if (!data) {
-        const bucket_path = argv.path ? String(argv.path) : '';
         data = {
-            name: name,
-            system_owner: email,
-            bucket_owner: email,
+            name: argv.name,
+            system_owner: argv.email,
+            bucket_owner: argv.email,
+            wide: argv.wide,
+            creation_date: new Date().toISOString(),
             tag: '',
             versioning: 'DISABLED',
-            path: bucket_path,
+            path: argv.path,
             should_create_underlying_storage: false,
+            new_name: argv.new_name
         };
     }
-    data.creation_date = new Date().toISOString();
     if (action === 'update') {
         data = _.omitBy(data, _.isUndefined);
-        data = await update_bucket_object(config_root, data);
+        data = await fetch_existing_bucket_data(config_root, data);
     }
+
+    data = {
+        ...data,
+        name: new SensitiveString(String(data.name)),
+        system_owner: new SensitiveString(String(data.system_owner)),
+        bucket_owner: new SensitiveString(String(data.bucket_owner)),
+        // update bucket identifier
+        new_name: data.new_name && new SensitiveString(String(data.new_name))
+    };
     return data;
 }
 
-async function update_bucket_object(config_root, target) {
-    const account_path = config_root + '/buckets';
+async function fetch_existing_bucket_data(config_root, target) {
+    const bucket_path = path.join(config_root, buckets_dir_name);
     let source;
     try {
-        source = await get_config_data(account_path, target.name);
+        const full_bucket_config_path = get_config_file_path(bucket_path, target.name);
+        source = await get_config_data(full_bucket_config_path);
     } catch (err) {
-        console.error('NSFS Manage command: Could not find bucket ' + target.name + ' to update');
-        print_bucket_usage();
+        process.stdout.write('ERROR: Bucket do not exists with name : ' + target.name + '\n');
+        process.exit(1);
     }
     const data = _.merge({}, source, target);
     return data;
@@ -218,17 +236,34 @@ function get_config_file_path(config_type_path, file_name) {
     return path.join(config_type_path, file_name + '.json');
 }
 
+function get_symlink_config_file_path(config_type_path, file_name) {
+    return path.join(config_type_path, file_name + '.symlink');
+}
+
 async function add_bucket_config_file(data, buckets_config_path, config_root_backend) {
     const is_valid = await validate_bucket_add_args(data);
     if (!is_valid) {
         print_bucket_usage();
         return;
     }
-    // TODO: support non root fs context
-    const fs_context = get_root_fs_context(config_root_backend);
+    try {
+        native_fs_utils.validate_bucket_creation({ name: data.name.unwrap()});
+    } catch (err) {
+        process.stdout.write('Error: Invalid bucket name');
+        print_bucket_usage();
+        return;
+    }
+
+    const fs_context = native_fs_utils.get_process_fs_context(config_root_backend);
     const full_bucket_config_path = get_config_file_path(buckets_config_path, data.name);
-    data = JSON.stringify(data);
-    await native_fs_utils.create_config_file(fs_context, buckets_config_path, full_bucket_config_path, data);
+    const exists = await config_file_exists(fs_context, full_bucket_config_path);
+    if (exists) {
+        process.stdout.write('Error: Bucket already exists with name : ' + data.name + '\n');
+        process.exit(1);
+    }
+    const data_json = JSON.stringify(data);
+    await native_fs_utils.create_config_file(fs_context, buckets_config_path, full_bucket_config_path, data_json);
+    process.stdout.write('Bucket created with name: ' + data.name + '\n');
 }
 
 async function get_bucket_config_file_status(data, bucket_config_path, config_root_backend) {
@@ -238,24 +273,63 @@ async function get_bucket_config_file_status(data, bucket_config_path, config_ro
         return;
     }
     try {
-        const config_data = await get_config_data(bucket_config_path, data.name);
-        console.log(config_data);
+        const bucket_path = get_config_file_path(bucket_config_path, data.name);
+        const config_data = await get_view_config_data(bucket_path);
+        process.stdout.write(JSON.stringify(config_data) + '\n');
     } catch (err) {
-        console.log('Bucket do not exists with name: ' + data.name);
+        if (err.code === 'EACCES') {
+            process.stdout.write('User dont have access to bucket : ' + data.name + '\n');
+            return;
+        }
+        process.stdout.write('Bucket does not exist with name: ' + data.name + '\n');
     }
 }
 
 async function update_bucket_config_file(data, bucket_config_path, config_root_backend) {
-    const is_valid = await validate_bucket_add_args(data);
+    const is_valid = await validate_bucket_add_args(data, true);
     if (!is_valid) {
         print_bucket_usage();
         return;
     }
-    // TODO: support non root fs context
-    const fs_context = get_root_fs_context(config_root_backend);
-    const full_bucket_config_path = get_config_file_path(bucket_config_path, data.name);
-    data = JSON.stringify(data);
-    await native_fs_utils.update_config_file(fs_context, bucket_config_path, full_bucket_config_path, data);
+
+    const fs_context = native_fs_utils.get_process_fs_context(config_root_backend);
+
+    const cur_name = data.name;
+    const new_name = data.new_name;
+    const update_name = data.new_name && cur_name && data.new_name.unwrap() !== cur_name.unwrap();
+
+    if (!update_name) {
+        const full_bucket_config_path = get_config_file_path(bucket_config_path, data.name);
+        data = JSON.stringify(data);
+        await native_fs_utils.update_config_file(fs_context, bucket_config_path, full_bucket_config_path, data);
+        process.stdout.write('Bucket details updated : ' + cur_name + '\n');
+        return;
+    }
+
+    try {
+        native_fs_utils.validate_bucket_creation({ name: data.new_name.unwrap()});
+    } catch (err) {
+        process.stdout.write('Error: Invalid bucket name');
+        print_bucket_usage();
+        return;
+    }
+
+    data.name = data.new_name;
+
+    const cur_bucket_config_path = get_config_file_path(bucket_config_path, cur_name.unwrap());
+    const new_bucket_config_path = get_config_file_path(bucket_config_path, data.name.unwrap());
+
+    const exists = await config_file_exists(fs_context, new_bucket_config_path);
+    if (exists) {
+        process.stdout.write('Error: Bucket already exists with name : ' + data.name.unwrap() + '\n');
+        process.exit(1);
+    }
+
+    data = JSON.stringify(_.omit(data, ['new_name']));
+
+    await native_fs_utils.create_config_file(fs_context, bucket_config_path, new_bucket_config_path, data);
+    await native_fs_utils.delete_config_file(fs_context, bucket_config_path, cur_bucket_config_path);
+    process.stdout.write('Bucket details updated : ' + new_name + '\n');
 }
 
 
@@ -265,14 +339,22 @@ async function delete_bucket_config_file(data, buckets_config_path, config_root_
         print_bucket_usage();
         return;
     }
-    // TODO: support non root fs context
-    const fs_context = get_root_fs_context(config_root_backend);
+
+    const fs_context = native_fs_utils.get_process_fs_context(config_root_backend);
     const full_bucket_config_path = get_config_file_path(buckets_config_path, data.name);
-    await native_fs_utils.delete_config_file(fs_context, buckets_config_path, full_bucket_config_path);
+    try {
+        await native_fs_utils.delete_config_file(fs_context, buckets_config_path, full_bucket_config_path);
+    } catch (err) {
+        if (err.code === 'ENOENT') {
+            process.stdout.write('ERROR: Bucket do not exists with name : ' + data.name + '\n');
+            process.exit(1);
+        }
+    }
+    process.stdout.write('Bucket deleted : ' + data.name + '\n');
 }
 
 async function manage_bucket_operations(action, data, config_root, config_root_backend) {
-    const bucket_config_path = config_root + '/buckets';
+    const bucket_config_path = path.join(config_root, buckets_dir_name);
     if (action === 'add') {
         await add_bucket_config_file(data, bucket_config_path, config_root_backend);
     } else if (action === 'status') {
@@ -282,10 +364,12 @@ async function manage_bucket_operations(action, data, config_root, config_root_b
     } else if (action === 'delete') {
         await delete_bucket_config_file(data, bucket_config_path, config_root_backend);
     } else if (action === 'list') {
-        const buckets = await list_config_file(bucket_config_path);
-        const bucket_names = buckets.map(item => (item.name));
-        console.log('Bucket list', bucket_names);
+        let buckets = await list_config_files(bucket_config_path);
+        if (!data.wide) buckets = buckets.map(item => (item.name));
+        const bucket_list_obj = {bucket_list: buckets};
+        process.stdout.write(JSON.stringify(bucket_list_obj, null, 2) + '\n');
     } else {
+        process.stdout.write('Error: Invalid action, available actions are add, status, update, delete, list');
         print_bucket_usage();
     }
 }
@@ -301,154 +385,260 @@ async function fetch_account_data(argv, config_root, from_file) {
     let data;
     const action = argv._[1] || '';
     if (from_file) {
-        const raw_data = await fs.promises.readFile(from_file);
+        const fs_context = native_fs_utils.get_process_fs_context();
+        const raw_data = (await nb_native().fs.readFile(fs_context, from_file)).data;
         data = JSON.parse(raw_data.toString());
-        data.name = new SensitiveString(data.name);
-        data.email = new SensitiveString(data.email);
-        data.access_keys[0].access_key = new SensitiveString(data.access_keys[0].access_key);
-        data.access_keys[0].secret_key = new SensitiveString(data.access_keys[0].secret_key);
     }
     if (!data) {
-        const name = argv.name && new SensitiveString(String(argv.name));
-        const email = argv.email && new SensitiveString(String(argv.email));
-        const distinguished_name = argv.user && new SensitiveString(String(argv.user));
-        const uid = argv.user ? undefined : Number(argv.uid) || process.getuid();
-        const gid = argv.user ? undefined : Number(argv.gid) || process.getgid();
-        const access_key = argv.access_key && new SensitiveString(String(argv.access_key));
-        const secret_key = argv.secret_key && new SensitiveString(String(argv.secret_key));
-        const new_buckets_path = argv.new_buckets_path ? String(argv.new_buckets_path) : '';
-        const wide = argv.wide;
         data = _.omitBy({
-            name: name,
-            email: email,
-            wide,
+            name: argv.name,
+            email: argv.email,
+            creation_date: new Date().toISOString(),
+            wide: argv.wide,
+            new_name: argv.new_name,
+            new_access_key: argv.new_access_key,
             access_keys: [{
-                access_key: access_key,
-                secret_key: secret_key
+                access_key: argv.access_key,
+                secret_key: argv.secret_key
             }],
             nsfs_account_config: {
-                distinguished_name,
-                uid: uid,
-                gid: gid,
-                new_buckets_path: new_buckets_path
+                distinguished_name: argv.user,
+                uid: !argv.user && argv.uid,
+                gid: !argv.user && argv.gid,
+                new_buckets_path: argv.new_buckets_path
             }
         }, _.isUndefined);
     }
-    data.creation_date = new Date().toISOString();
-    if (action === 'update') {
+    if (action === 'update' || action === 'delete') {
         data = _.omitBy(data, _.isUndefined);
-        data = update_account_object(config_root, data);
+        data = await fetch_existing_account_data(config_root, data);
     }
+
+    data = {
+        ...data,
+        name: new SensitiveString(String(data.name)),
+        email: new SensitiveString(String(data.email)),
+        access_keys: [{
+            access_key: new SensitiveString(String(data.access_keys[0].access_key)),
+            secret_key: new SensitiveString(String(data.access_keys[0].secret_key)),
+        }],
+        nsfs_account_config: data.nsfs_account_config && {
+            distinguished_name: data.nsfs_account_config.distinguished_name &&
+                new SensitiveString(String(data.nsfs_account_config.distinguished_name)),
+            uid: data.nsfs_account_config.uid && Number(data.nsfs_account_config.uid),
+            gid: data.nsfs_account_config.gid && Number(data.nsfs_account_config.gid),
+            new_buckets_path: data.nsfs_account_config.new_buckets_path
+        },
+        // updates of account identifiers
+        new_name: data.new_name && new SensitiveString(String(data.new_name)),
+        new_access_key: data.new_access_key && new SensitiveString(String(data.new_access_key))
+    };
     return data;
 }
 
-async function update_account_object(config_root, target) {
-    const account_path = config_root + '/accounts';
+async function fetch_existing_account_data(config_root, target) {
     let source;
     try {
-        source = await get_config_data(account_path, target.access_keys[0].access_key);
-        target.nsfs_account_config.new_buckets_path = target.nsfs_account_config.new_buckets_path ||
-            source.nsfs_account_config.new_buckets_path;
+        const account_path = target.name ?
+            get_config_file_path(path.join(config_root, accounts_dir_name), target.name) :
+            get_symlink_config_file_path(path.join(config_root, access_keys_dir_name), target.access_keys[0].access_key);
+        source = await get_config_data(account_path);
     } catch (err) {
-        console.error('NSFS Manage command: Could not find account to update');
-        print_account_usage();
+        dbg.log1('NSFS Manage command: Could not find account', target, err);
+        const error_message = target.name === undefined ? 'ERROR : Account do not exists with access key : ' + target.access_keys[0].access_key :
+                             'ERROR : Account do not exists with name : ' + target.name;
+        process.stdout.write(error_message + '\n');
+        process.exit(1);
     }
     const data = _.merge({}, source, target);
     return data;
 }
 
-async function add_account_config_file(data, accounts_config_path, config_root_backend) {
+async function config_file_exists(fs_context, config_path) {
+    try {
+        await nb_native().fs.stat(fs_context, config_path);
+    } catch (err) {
+        if (err.code === 'ENOENT') return false;
+    }
+    return true;
+}
+
+async function add_account_config_file(data, accounts_path, access_keys_path, config_root_backend) {
     const is_valid = await validate_account_add_args(data);
     if (!is_valid) {
         print_account_usage();
         return;
     }
-    // TODO: support non root fs context
-    const fs_context = get_root_fs_context(config_root_backend);
-    const full_account_config_path = get_config_file_path(accounts_config_path, data.access_keys[0].access_key);
+
+    const fs_context = native_fs_utils.get_process_fs_context(config_root_backend);
+    const access_key = data.access_keys[0].access_key;
+    const full_account_config_path = get_config_file_path(accounts_path, data.name);
+    const full_account_config_access_key_path = get_symlink_config_file_path(access_keys_path, access_key);
+
+    const name_exists = await config_file_exists(fs_context, full_account_config_path);
+    const access_key_exists = await config_file_exists(fs_context, full_account_config_access_key_path);
+
+    if (name_exists || access_key_exists) {
+        if (name_exists) process.stdout.write('Error: Account having the same name already exists \n');
+        if (access_key_exists) process.stdout.write('Error: Account having the same access key already exists \n');
+        process.exit(1);
+    }
+
     data = JSON.stringify(data);
-    await native_fs_utils.create_config_file(fs_context, accounts_config_path, full_account_config_path, data);
+    await native_fs_utils.create_config_file(fs_context, accounts_path, full_account_config_path, data);
+    await native_fs_utils._create_path(access_keys_path, fs_context, config.BASE_MODE_CONFIG_DIR);
+    await nb_native().fs.symlink(fs_context, full_account_config_path, full_account_config_access_key_path);
 }
 
-async function update_account_config_file(data, accounts_config_path, config_root_backend) {
-    const is_valid = await validate_account_add_args(data);
+async function update_account_config_file(data, accounts_path, access_keys_path, config_root_backend) {
+    const is_valid = await validate_account_add_args(data, true);
     if (!is_valid) {
         print_account_usage();
         return;
     }
-    // TODO: support non root fs context
-    const fs_context = get_root_fs_context(config_root_backend);
-    const full_account_config_path = get_config_file_path(accounts_config_path, data.access_keys[0].access_key);
-    data = JSON.stringify(data);
-    await native_fs_utils.update_config_file(fs_context, accounts_config_path, full_account_config_path, data);
+
+    const fs_context = native_fs_utils.get_process_fs_context(config_root_backend);
+    const cur_name = data.name;
+    const cur_access_key = data.access_keys[0].access_key;
+    const update_name = data.new_name && cur_name && data.new_name.unwrap() !== cur_name.unwrap();
+    const update_access_key = data.new_access_key && cur_access_key && data.new_access_key.unwrap() !== cur_access_key.unwrap();
+
+    if (!update_name && !update_access_key) {
+        const full_account_config_path = get_config_file_path(accounts_path, data.name);
+        data = JSON.stringify(data);
+        await native_fs_utils.update_config_file(fs_context, accounts_path, full_account_config_path, data);
+        process.stdout.write('Account updated for the user : ' + cur_name + '\n');
+        return;
+    }
+    const data_name = data.new_name || cur_name;
+    data.name = data_name;
+    data.access_keys[0].access_key = data.new_access_key || cur_access_key;
+    const cur_account_config_path = get_config_file_path(accounts_path, cur_name.unwrap());
+    const new_account_config_path = get_config_file_path(accounts_path, data.name.unwrap());
+    const cur_access_key_config_path = get_symlink_config_file_path(access_keys_path, cur_access_key.unwrap());
+    const new_access_key_config_path = get_symlink_config_file_path(access_keys_path, data.access_keys[0].access_key.unwrap());
+    const name_exists = update_name && await config_file_exists(fs_context, new_account_config_path);
+    const access_key_exists = update_access_key && await config_file_exists(fs_context, new_access_key_config_path);
+    if (name_exists || access_key_exists) {
+        if (name_exists) process.stdout.write('Error: Account having the same name already exists \n');
+        if (access_key_exists) process.stdout.write('Error: Account having the same access key already exists \n');
+        process.exit(1);
+    }
+    data = JSON.stringify(_.omit(data, ['new_name', 'new_access_key']));
+    if (update_name) {
+        await native_fs_utils.create_config_file(fs_context, accounts_path, new_account_config_path, data);
+        await native_fs_utils.delete_config_file(fs_context, accounts_path, cur_account_config_path);
+    } else if (update_access_key) {
+        await native_fs_utils.update_config_file(fs_context, accounts_path, cur_account_config_path, data);
+    }
+    // TODO: safe_unlink can be better but the current impl causing ELOOP - Too many levels of symbolic links
+    // need to find a better way for atomic unlinking of symbolic links
+    // handle atomicity for symlinks
+    await nb_native().fs.unlink(fs_context, cur_access_key_config_path);
+    await nb_native().fs.symlink(fs_context, new_account_config_path, new_access_key_config_path);
+    process.stdout.write('Account updated for the user : ' + data_name.unwrap() + '\n');
 }
 
-async function delete_account_config_file(data, accounts_config_path, config_root_backend) {
+async function delete_account_config_file(data, accounts_path, access_keys_path, config_root_backend) {
     const is_valid = await validate_minimum_account_args(data);
     if (!is_valid) {
         print_account_usage();
         return;
     }
-    // TODO: support non root fs context
-    const fs_context = get_root_fs_context(config_root_backend);
-    const full_account_config_path = get_config_file_path(accounts_config_path, data.access_keys[0].access_key);
-    await native_fs_utils.delete_config_file(fs_context, accounts_config_path, full_account_config_path);
+
+    const fs_context = native_fs_utils.get_process_fs_context(config_root_backend);
+    const account_config_path = get_config_file_path(accounts_path, data.name);
+    const access_key_config_path = get_symlink_config_file_path(access_keys_path, data.access_keys[0].access_key.unwrap());
+    await native_fs_utils.delete_config_file(fs_context, accounts_path, account_config_path);
+    await nb_native().fs.unlink(fs_context, access_key_config_path);
+    const error_message = is_undefined(data.name.unwrap()) ? 'Account deleted with access key : ' + data.access_keys[0].access_key.unwrap() :
+                             'Account deleted with name : ' + data.name.unwrap();
+    process.stdout.write(error_message + '\n');
+
 }
 
-async function get_account_config_file_status(data, account_path, config_root_backend) {
+async function get_account_config_file_status(data, accounts_path, access_keys_path) {
     const is_valid = await validate_minimum_account_args(data);
     if (!is_valid) {
         print_account_usage();
         return;
     }
     try {
-        const config_data = await get_config_data(account_path, data.access_keys[0].access_key);
-        console.log(config_data);
+        const account_path = is_undefined(data.name.unwrap()) ?
+            get_symlink_config_file_path(access_keys_path, data.access_keys[0].access_key) :
+            get_config_file_path(accounts_path, data.name);
+        const config_data = await get_view_config_data(account_path);
+        process.stdout.write(JSON.stringify(config_data, null, 2) + '\n');
     } catch (err) {
-        console.log('Account do not exists with access key : ' + data.access_keys[0].access_key);
+        const error_message = is_undefined(data.name.unwrap()) ? 'Account do not exists with access key : ' + data.access_keys[0].access_key.unwrap() :
+                             'Account do not exists with name : ' + data.name.unwrap();
+        process.stdout.write(error_message + '\n');
     }
 }
 
+
 async function manage_account_operations(action, data, config_root, config_root_backend) {
-    const account_path = config_root + '/accounts';
+    const accounts_path = path.join(config_root, accounts_dir_name);
+    const access_keys_path = path.join(config_root, access_keys_dir_name);
     if (action === 'add') {
-        await add_account_config_file(data, account_path, config_root_backend);
+        await add_account_config_file(data, accounts_path, access_keys_path, config_root_backend);
+        process.stdout.write('Account created for the user : ' + data.name + '\n');
     } else if (action === 'status') {
-        await get_account_config_file_status(data, account_path, config_root_backend);
+        await get_account_config_file_status(data, accounts_path, access_keys_path);
     } else if (action === 'update') {
-        await update_account_config_file(data, account_path, config_root_backend);
+        await update_account_config_file(data, accounts_path, access_keys_path, config_root_backend);
     } else if (action === 'delete') {
-        await delete_account_config_file(data, account_path, config_root_backend);
+        await delete_account_config_file(data, accounts_path, access_keys_path, config_root_backend);
     } else if (action === 'list') {
-        let accounts = await list_config_file(account_path);
+        let accounts = await list_config_files(accounts_path);
         if (!data.wide) accounts = accounts.map(item => (item.name));
-        console.log('Account list:', accounts);
+        const account_list_obj = {account_list: accounts};
+        process.stdout.write(JSON.stringify(account_list_obj, null, 2) + '\n');
     } else {
-        console.error('Account action not found.');
-        console.warn(ARGUMENTS.trimStart());
+        process.stdout.write('Error: Invalid action, available actions are add, status, update, delete, list');
+        print_account_usage();
     }
 }
 
 
 /**
- * list_config_file will list all the config files (json) in a given path
- * @param {fs.PathLike} full_path
+ * list_config_files will list all the config files (json) in a given config directory
+ * @param {string} config_path
  */
-async function list_config_file(full_path) {
-    const entries = await fs.promises.readdir(full_path);
-    const config_files = entries.filter(entree => entree.endsWith('.json'));
-    const resources = await P.map(config_files, config_file => get_config_data(full_path, config_file));
+async function list_config_files(config_path) {
+    const fs_context = native_fs_utils.get_process_fs_context();
+    const entries = await nb_native().fs.readdir(fs_context, config_path);
+
+    const config_files_list = [];
+    for (const entry of entries) {
+        if (entry.name.endsWith('.json')) {
+            const full_path = path.join(config_path, entry.name);
+            const data = await get_view_config_data(full_path);
+            config_files_list.push(data);
+        }
+    }
+    return config_files_list;
+}
+
+
+/**
+ * get_config_data will read a config file and return its content from it
+ * @param {string} config_file_path
+ */
+async function get_config_data(config_file_path) {
+    const fs_context = native_fs_utils.get_process_fs_context();
+    const { data } = await nb_native().fs.readFile(fs_context, config_file_path);
+    const resources = JSON.parse(data.toString());
     return resources;
 }
 
 /**
- * get_config_data will get a json file and get the resource data from it
- * @param {fs.PathLike} config_file_path
- * @param {string} config_file_name
+ * get_view_config_data will read a config file and return its content ready to be printed
+ * @param {string} config_file_path
  */
-async function get_config_data(config_file_path, config_file_name) {
-    const full_path = get_config_file_path(config_file_path.toString(), config_file_name);
-    const data = await fs.promises.readFile(full_path);
+async function get_view_config_data(config_file_path) {
+    const fs_context = native_fs_utils.get_process_fs_context();
+    const { data } = await nb_native().fs.readFile(fs_context, config_file_path);
     const resources = _.omit(JSON.parse(data.toString()), ['access_keys']);
     if (resources.nsfs_account_config) {
         resources.new_buckets_path = resources.nsfs_account_config.new_buckets_path;
@@ -458,70 +648,91 @@ async function get_config_data(config_file_path, config_file_name) {
 }
 
 async function validate_minimum_bucket_args(data) {
-    if (!data.name) {
-        console.error('Error: bucket name should not be empty');
+    if (!data.name || is_undefined(data.name.unwrap())) {
+        process.stdout.write('Error: bucket name should not be empty');
         return false;
     }
     return true;
 }
 
-async function validate_bucket_add_args(data) {
-    if (!data.name) {
-        console.error('Error: bucket name is mandatory, please use the --name flag');
+async function validate_bucket_add_args(data, update) {
+    if (!data.name || is_undefined(data.name.unwrap())) {
+        process.stdout.write('Error: bucket name is mandatory, please use the --name flag');
         return false;
-    } else if (!data.system_owner) {
-        console.error('Error: The email for the bucket is mandatory, please use the --email flag');
+    } else if (!data.system_owner || is_undefined(data.system_owner.unwrap())) {
+        process.stdout.write('Error: The email for the bucket is mandatory, please use the --email flag');
         return false;
     } else if (!data.path) {
-        console.error('Error: bucket path is mandatory, please use the --path flag');
+        process.stdout.write('Error: bucket path is mandatory, please use the --path flag');
         return false;
     }
-    const bucket_dir_stat = await fs_utils.file_exists(data.path);
-    if (!bucket_dir_stat) {
-        console.error('Error: Path should be a valid dir path', data.path);
+    if (!update && data.new_name) {
+        process.stdout.write('Error: Bucket new_name can not be used on add command, please remove the --new_name flag');
         return false;
+    }
+    const fs_context = native_fs_utils.get_process_fs_context();
+    const bucket_dir_stat = await config_file_exists(fs_context, data.path);
+    if (!bucket_dir_stat) {
+        process.stdout.write('Error: Path should be a valid dir path : ' + data.path + '\n');
+        process.exit(1);
     }
     return true;
 
 }
 
-async function validate_account_add_args(data) {
-    if (!data.access_keys[0].secret_key) {
-        console.error('Error: Secret key is mandatory, please use the --secret_key flag');
+async function validate_account_add_args(data, update) {
+    if (!data.access_keys[0].secret_key || is_undefined(data.access_keys[0].secret_key.unwrap())) {
+        process.stdout.write('Error: Secret key is mandatory, please use the --secret_key flag');
         return false;
-    } else if (!data.access_keys[0].access_key) {
-        console.error('Error: Access key is mandatory, please use the --access_key flag');
+    } else if (!data.access_keys[0].access_key || is_undefined(data.access_keys[0].access_key.unwrap())) {
+        process.stdout.write('Error: Access key is mandatory, please use the --access_key flag');
         return false;
     }
     if ((data.nsfs_account_config.distinguished_name === undefined &&
             (data.nsfs_account_config.uid === undefined ||
                 data.nsfs_account_config.gid === undefined)) ||
         !data.nsfs_account_config.new_buckets_path) {
-        console.error('Error: Account config should not be empty');
+            process.stdout.write('Error: Account config should not be empty');
         return false;
     }
-    if (!data.name) {
-        console.error('Error: Account name is mandatory, please use the --name flag');
+    if (!data.name || is_undefined(data.name.unwrap())) {
+        process.stdout.write('Error: Account name is mandatory, please use the --name flag');
         return false;
-    } else if (!data.email) {
-        console.error('Error: The email for the account  is mandatory, please use the --email flag');
+    } else if (!data.email || is_undefined(data.email.unwrap())) {
+        process.stdout.write('Error: The email for the account  is mandatory, please use the --email flag');
         return false;
     }
-    const bucket_dir_stat = await fs_utils.file_exists(data.nsfs_account_config.new_buckets_path);
+    if (!update && data.new_name) {
+        process.stdout.write('Error: Account new_name can not be used on add command, please remove the --new_name flag');
+        return false;
+    }
+    if (!update && data.new_access_key) {
+        process.stdout.write('Error: Account new_access_key can not be used on add command, please remove the --new_access_key flag');
+        return false;
+    }
+    const fs_context = native_fs_utils.get_process_fs_context();
+    const bucket_dir_stat = await config_file_exists(fs_context, data.nsfs_account_config.new_buckets_path);
     if (!bucket_dir_stat) {
-        console.error('Error: new_buckets_path should be a valid dir path');
-        return false;
+        process.stdout.write('Error: new_buckets_path should be a valid dir path : ' + data.nsfs_account_config.new_buckets_path + '\n');
+        process.exit(1);
     }
     return true;
 }
 
 async function validate_minimum_account_args(data) {
-    if (!data.access_keys[0].access_key) {
-        console.error('Error: Access key should not be empty');
+    if ((!data.access_keys[0].access_key || is_undefined(data.access_keys[0].access_key.unwrap())) &&
+        (!data.name || is_undefined(data.name.unwrap()))) {
+        process.stdout.write('Error: Access key or account name should not be empty');
         return false;
     }
     return true;
 }
+
+function is_undefined(value) {
+    if (value === 'undefined') return true;
+    return false;
+}
+
 
 exports.main = main;
 if (require.main === module) main();
