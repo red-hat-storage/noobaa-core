@@ -1,6 +1,8 @@
 /* Copyright (C) 2016 NooBaa */
 'use strict';
 
+const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
+
 /**
  * @typedef {{
  *      code?: string, 
@@ -191,12 +193,6 @@ ManageCLIError.MissingAccountNameFlag = Object.freeze({
     http_code: 400,
 });
 
-ManageCLIError.MissingAccountEmailFlag = Object.freeze({
-    code: 'MissingAccountEmailFlag',
-    message: 'Account email is mandatory, please use the --email flag',
-    http_code: 400,
-});
-
 ManageCLIError.MissingIdentifier = Object.freeze({
     code: 'MissingIdentifier',
     message: 'Account identifier is mandatory, please use the --access_key or --name flag',
@@ -236,6 +232,23 @@ ManageCLIError.InvalidNewNameAccountIdentifier = Object.freeze({
 ManageCLIError.InvalidNewAccessKeyIdentifier = Object.freeze({
     code: 'InvalidNewAccessKeyIdentifier',
     message: 'Account new_access_key can not be used on add command, please remove the --new_access_key flag',
+    http_code: 400,
+});
+
+ManageCLIError.InaccessibleAccountNewBucketsPath = Object.freeze({
+    code: 'InaccessibleAccountNewBucketsPath',
+    message: 'Account should have read & write access to the specified new_buckets_path',
+    http_code: 400,
+});
+
+ManageCLIError.InvalidAccountDistinguishedName = Object.freeze({
+    code: 'InvalidAccountDistinguishedName',
+    message: 'Account distinguished name was not found',
+    http_code: 400,
+});
+ManageCLIError.InvalidGlacierOperation = Object.freeze({
+    code: 'InvalidGlacierOperation',
+    message: 'only "migrate", "restore" and "expiry" subcommands are supported',
     http_code: 400,
 });
 
@@ -292,9 +305,9 @@ ManageCLIError.MissingBucketNameFlag = Object.freeze({
     http_code: 400,
 });
 
-ManageCLIError.MissingBucketEmailFlag = Object.freeze({
-    code: 'MissingBucketEmailFlag',
-    message: 'Bucket email is mandatory, please use the --email flag',
+ManageCLIError.MissingBucketOwnerFlag = Object.freeze({
+    code: 'MissingBucketOwnerFlag',
+    message: 'Bucket owner (account name) is mandatory, please use the --owner flag',
     http_code: 400,
 });
 
@@ -343,6 +356,18 @@ ManageCLIError.FS_ERRORS_TO_MANAGE = Object.freeze({
 
 ManageCLIError.RPC_ERROR_TO_MANAGE = Object.freeze({
     INVALID_SCHEMA: ManageCLIError.InvalidSchema,
+    NO_SUCH_USER: ManageCLIError.InvalidAccountDistinguishedName
 });
 
+const NSFS_CLI_ERROR_EVENT_MAP = {
+    WhiteListIPUpdateFailed: NoobaaEvent.WHITELIST_UPDATED_FAILED,
+    AccessDenied: NoobaaEvent.UNAUTHORIZED,
+    AccountAccessKeyAlreadyExists: NoobaaEvent.ACCOUNT_ALREADY_EXISTS,
+    AccountNameAlreadyExists: NoobaaEvent.ACCOUNT_ALREADY_EXISTS,
+    AccountDeleteForbiddenHasBuckets: NoobaaEvent.ACCOUNT_DELETE_FORBIDDEN,
+    BucketAlreadyExists: NoobaaEvent.BUCKET_ALREADY_EXISTS,
+    BucketSetForbiddenNoBucketOwner: NoobaaEvent.UNAUTHORIZED,
+};
+
 exports.ManageCLIError = ManageCLIError;
+exports.NSFS_CLI_ERROR_EVENT_MAP = NSFS_CLI_ERROR_EVENT_MAP;

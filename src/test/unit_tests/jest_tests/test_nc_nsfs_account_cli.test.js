@@ -5,12 +5,14 @@
 // disabling init_rand_seed as it takes longer than the actual test execution
 process.env.DISABLE_INIT_RANDOM_SEED = "true";
 
+const fs = require('fs');
 const _ = require('lodash');
 const path = require('path');
 const P = require('../../../util/promise');
 const fs_utils = require('../../../util/fs_utils');
 const os_util = require('../../../util/os_utils');
 const nb_native = require('../../../util/nb_native');
+const { set_path_permissions_and_owner, create_fs_user_by_platform, delete_fs_user_by_platform } = require('../../system_tests/test_utils');
 const ManageCLIError = require('../../../manage_nsfs/manage_nsfs_cli_errors').ManageCLIError;
 const ManageCLIResponse = require('../../../manage_nsfs/manage_nsfs_cli_responses').ManageCLIResponse;
 const { TYPES, ACTIONS } = require('../../../manage_nsfs/manage_nsfs_constants');
@@ -28,6 +30,7 @@ const DEFAULT_FS_CONFIG = {
     warn_threshold_ms: 100,
 };
 
+const timeout = 10000;
 
 // eslint-disable-next-line max-lines-per-function
 describe('manage nsfs cli account flow', () => {
@@ -42,7 +45,6 @@ describe('manage nsfs cli account flow', () => {
             _id: 'account1',
             type: TYPES.ACCOUNT,
             name: 'account1',
-            email: 'account1@noobaa.io',
             new_buckets_path: `${root_path}new_buckets_path_user1/`,
             uid: 999,
             gid: 999,
@@ -63,10 +65,11 @@ describe('manage nsfs cli account flow', () => {
 
         it('cli create account without access_keys', async () => {
             const action = ACTIONS.ADD;
-            const { type, name, email, new_buckets_path, uid, gid } = defaults;
-            const account_options = { config_root, name, email, new_buckets_path, uid, gid };
+            const { type, name, new_buckets_path, uid, gid } = defaults;
+            const account_options = { config_root, name, new_buckets_path, uid, gid };
             await fs_utils.create_fresh_path(new_buckets_path);
             await fs_utils.file_must_exist(new_buckets_path);
+            await set_path_permissions_and_owner(new_buckets_path, account_options, 0o700);
             await exec_manage_cli(type, action, account_options);
             const account = await read_config_file(config_root, accounts_schema_dir, name);
             assert_account(account, account_options, false);
@@ -80,30 +83,33 @@ describe('manage nsfs cli account flow', () => {
 
         it('cli create account with access_key and without secret_key', async () => {
             const action = ACTIONS.ADD;
-            const { type, access_key, name, email, new_buckets_path, uid, gid } = defaults;
-            const account_options = { config_root, access_key, name, email, new_buckets_path, uid, gid };
+            const { type, access_key, name, new_buckets_path, uid, gid } = defaults;
+            const account_options = { config_root, access_key, name, new_buckets_path, uid, gid };
             await fs_utils.create_fresh_path(new_buckets_path);
             await fs_utils.file_must_exist(new_buckets_path);
+            await set_path_permissions_and_owner(new_buckets_path, account_options, 0o700);
             const res = await exec_manage_cli(type, action, account_options);
             expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.MissingAccountSecretKeyFlag.message);
         });
 
         it('cli create account without access_key and with secret_key', async () => {
             const action = ACTIONS.ADD;
-            const { type, secret_key, name, email, new_buckets_path, uid, gid } = defaults;
-            const account_options = { config_root, secret_key, name, email, new_buckets_path, uid, gid };
+            const { type, secret_key, name, new_buckets_path, uid, gid } = defaults;
+            const account_options = { config_root, secret_key, name, new_buckets_path, uid, gid };
             await fs_utils.create_fresh_path(new_buckets_path);
             await fs_utils.file_must_exist(new_buckets_path);
+            await set_path_permissions_and_owner(new_buckets_path, account_options, 0o700);
             const res = await exec_manage_cli(type, action, account_options);
             expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.MissingAccountAccessKeyFlag.message);
         });
 
         it('cli create account with access_keys', async () => {
             const action = ACTIONS.ADD;
-            const { type, access_key, secret_key, name, email, new_buckets_path, uid, gid } = defaults;
-            const account_options = { config_root, access_key, secret_key, name, email, new_buckets_path, uid, gid };
+            const { type, access_key, secret_key, name, new_buckets_path, uid, gid } = defaults;
+            const account_options = { config_root, access_key, secret_key, name, new_buckets_path, uid, gid };
             await fs_utils.create_fresh_path(new_buckets_path);
             await fs_utils.file_must_exist(new_buckets_path);
+            await set_path_permissions_and_owner(new_buckets_path, account_options, 0o700);
             await exec_manage_cli(type, action, account_options);
             const account = await read_config_file(config_root, accounts_schema_dir, name);
             assert_account(account, account_options, true);
@@ -112,16 +118,16 @@ describe('manage nsfs cli account flow', () => {
         });
 
         it('should fail - cli update account access_key wrong complexity', async () => {
-            const { type, secret_key, name, email, new_buckets_path, uid, gid } = defaults;
-            const account_options = { config_root, access_key: 'abc', secret_key, name, email, new_buckets_path, uid, gid };
+            const { type, secret_key, name, new_buckets_path, uid, gid } = defaults;
+            const account_options = { config_root, access_key: 'abc', secret_key, name, new_buckets_path, uid, gid };
             const action = ACTIONS.UPDATE;
             const res = await exec_manage_cli(type, action, account_options);
             expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.AccountAccessKeyFlagComplexity.message);
         });
 
         it('should fail - cli update account secret_key wrong complexity', async () => {
-            const { type, access_key, name, email, new_buckets_path, uid, gid } = defaults;
-            const account_options = { config_root, access_key, secret_key: 'abc', name, email, new_buckets_path, uid, gid };
+            const { type, access_key, name, new_buckets_path, uid, gid } = defaults;
+            const account_options = { config_root, access_key, secret_key: 'abc', name, new_buckets_path, uid, gid };
             const action = ACTIONS.UPDATE;
             const res = await exec_manage_cli(type, action, account_options);
             expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.AccountSecretKeyFlagComplexity.message);
@@ -129,10 +135,11 @@ describe('manage nsfs cli account flow', () => {
 
         it('should fail - cli create account integer uid and gid', async () => {
             const action = ACTIONS.ADD;
-            const { type, access_key, secret_key, name, email, new_buckets_path, uid, gid } = defaults;
-            const account_options = { config_root, access_key, secret_key, name, email, new_buckets_path, uid, gid };
+            const { type, access_key, secret_key, name, new_buckets_path, uid, gid } = defaults;
+            const account_options = { config_root, access_key, secret_key, name, new_buckets_path, uid, gid };
             await fs_utils.create_fresh_path(new_buckets_path);
             await fs_utils.file_must_exist(new_buckets_path);
+            await set_path_permissions_and_owner(new_buckets_path, account_options, 0o700);
             await exec_manage_cli(type, action, account_options);
             const account = await read_config_file(config_root, accounts_schema_dir, name);
             assert_account(account, account_options, false);
@@ -141,16 +148,16 @@ describe('manage nsfs cli account flow', () => {
         });
 
         it('should fail - cli create account invalid option', async () => {
-            const { type, name, email, new_buckets_path, uid, gid } = defaults;
-            const account_options = { config_root, name, email, new_buckets_path, uid, gid, lala: 'lala'}; // lala invalid option
+            const { type, name, new_buckets_path, uid, gid } = defaults;
+            const account_options = { config_root, name, new_buckets_path, uid, gid, lala: 'lala'}; // lala invalid option
             const action = ACTIONS.ADD;
             const res = await exec_manage_cli(type, action, account_options);
             expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.InvalidArgument.message);
         });
 
         it('should fail - cli create account invalid option type (user as boolean)', async () => {
-            const { type, name, email, new_buckets_path } = defaults;
-            const account_options = { config_root, name, email, new_buckets_path};
+            const { type, name, new_buckets_path } = defaults;
+            const account_options = { config_root, name, new_buckets_path};
             const action = ACTIONS.ADD;
             const command = create_command(type, action, account_options);
             const flag = 'user'; // we will add user flag without value
@@ -158,27 +165,68 @@ describe('manage nsfs cli account flow', () => {
             expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.InvalidArgumentType.message);
         });
 
+        it('should fail - cli create account invalid option type (user as number)', async () => {
+            const { type, name, new_buckets_path } = defaults;
+            const account_options = { config_root, name, new_buckets_path, user: 0};
+            const action = ACTIONS.ADD;
+            const res = await exec_manage_cli(type, action, account_options);
+            expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.InvalidArgumentType.message);
+        });
+
+        it('should fail - cli create account invalid option type (path as boolean) use = in command as a flag separator', async () => {
+            const { type, name } = defaults;
+            const action = ACTIONS.ADD;
+            const command = `node src/cmd/manage_nsfs ${type} ${action} --config_root=${config_root} --name=${name} --new_buckets_path`;
+            let res;
+            try {
+                res = await os_util.exec(command, { return_stdout: true });
+            } catch (e) {
+                res = e;
+            }
+            expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.InvalidArgumentType.message);
+        });
+
+        it('should fail - cli create account invalid option type (name as boolean)', async () => {
+            const { type, new_buckets_path } = defaults;
+            const account_options = { config_root, new_buckets_path};
+            const action = ACTIONS.ADD;
+            const command = create_command(type, action, account_options);
+            const flag = 'name'; // we will add name flag without value
+            const res = await exec_manage_cli_add_empty_option(command, flag);
+            expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.InvalidArgumentType.message);
+        });
+
         it('should fail - cli create account invalid option type (new_buckets_path as number)', async () => {
             const action = ACTIONS.ADD;
-            const { type, name, email, uid, gid } = defaults;
+            const { type, name, uid, gid } = defaults;
             const new_buckets_path_invalid = 4e34; // invalid should be string represents a path
-            const account_options = { config_root, name, email, new_buckets_path: new_buckets_path_invalid, uid, gid };
+            const account_options = { config_root, name, new_buckets_path: new_buckets_path_invalid, uid, gid };
             const res = await exec_manage_cli(type, action, account_options);
             expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.InvalidArgumentType.message);
         });
 
         it('should fail - cli create account invalid option type (new_buckets_path as string)', async () => {
             const action = ACTIONS.ADD;
-            const { type, name, email, uid, gid } = defaults;
+            const { type, name, uid, gid } = defaults;
             const new_buckets_path_invalid = 'aaa'; // invalid should be string represents a path
-            const account_options = { config_root, name, email, new_buckets_path: new_buckets_path_invalid, uid, gid };
+            const account_options = { config_root, name, new_buckets_path: new_buckets_path_invalid, uid, gid };
             const res = await exec_manage_cli(type, action, account_options);
             expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.InvalidAccountNewBucketsPath.message);
         });
 
+        it('cli account add - name is a number', async function() {
+            const account_name = '0';
+            const options = { name: account_name, uid: 2001, gid: 2001 };
+            const res = await exec_manage_cli(TYPES.ACCOUNT, ACTIONS.ADD, { config_root, ...options });
+            const account = JSON.parse(res).response.reply;
+            assert_account(account, options, false);
+            await exec_manage_cli(TYPES.ACCOUNT, ACTIONS.DELETE, { config_root, name: account_name });
+        });
+
+
         it('cli account add - uid is 0, gid is not 0', async function() {
             const account_name = 'uid_is_0';
-            const options = { name: account_name, email: `${account_name}@noobaa.com`, uid: 0, gid: 1001 };
+            const options = { name: account_name, uid: 0, gid: 1001 };
             const res = await exec_manage_cli(TYPES.ACCOUNT, ACTIONS.ADD, { config_root, ...options });
             const account = JSON.parse(res).response.reply;
             assert_account(account, options, false);
@@ -187,7 +235,7 @@ describe('manage nsfs cli account flow', () => {
 
         it('cli account add - uid is not 0, gid is 0', async function() {
             const account_name = 'gid_is_0';
-            const options = { name: account_name, email: `${account_name}@noobaa.com`, uid: 1001, gid: 0 };
+            const options = { name: account_name, uid: 1001, gid: 0 };
             const res = await exec_manage_cli(TYPES.ACCOUNT, ACTIONS.ADD, { config_root, ...options });
             const account = JSON.parse(res).response.reply;
             assert_account(account, options, false);
@@ -196,7 +244,7 @@ describe('manage nsfs cli account flow', () => {
 
         it('cli account add - uid is 0, gid is 0', async function() {
             const account_name = 'uid_gid_are_0';
-            const options = { name: account_name, email: `${account_name}@noobaa.com`, uid: 0, gid: 0 };
+            const options = { name: account_name, uid: 0, gid: 0 };
             const res = await exec_manage_cli(TYPES.ACCOUNT, ACTIONS.ADD, { config_root, ...options });
             const account = JSON.parse(res).response.reply;
             assert_account(account, options, false);
@@ -211,7 +259,6 @@ describe('manage nsfs cli account flow', () => {
         const type = TYPES.ACCOUNT;
         const defaults = {
             name: 'account1',
-            email: 'account1@noobaa.io',
             new_buckets_path: `${root_path}new_buckets_path_user1/`,
             uid: 999,
             gid: 999,
@@ -228,6 +275,7 @@ describe('manage nsfs cli account flow', () => {
             const account_options = { config_root, ...defaults };
             await fs_utils.create_fresh_path(new_buckets_path);
             await fs_utils.file_must_exist(new_buckets_path);
+            await set_path_permissions_and_owner(new_buckets_path, account_options, 0o700);
             await exec_manage_cli(type, action, account_options);
         });
 
@@ -265,6 +313,43 @@ describe('manage nsfs cli account flow', () => {
             //fixing the new_account_details for compare. 
             new_account_details = { ...new_account_details, ...new_account_details.nsfs_account_config };
             assert_account(account_symlink, new_account_details);
+        });
+
+        it('cli account update name undefined (and back to original name)', async function() {
+            // set the name as undefined
+            let name = defaults.name;
+            let new_name = 'undefined'; // it is string on purpose
+            let account_options = { config_root, name, new_name };
+            const action = ACTIONS.UPDATE;
+            await exec_manage_cli(type, action, account_options);
+            let new_account_details = await read_config_file(config_root, accounts_schema_dir, new_name);
+            expect(new_account_details.name).toBe(new_name);
+
+            // set the name as back as it was
+            let temp = name; // we swap between name and new_name
+            name = new_name;
+            new_name = temp;
+            account_options = { config_root, name, new_name };
+            await exec_manage_cli(type, action, account_options);
+            new_account_details = await read_config_file(config_root, accounts_schema_dir, new_name);
+            expect(new_account_details.name).toBe(new_name);
+
+            // set the name as undefined (not string)
+            name = defaults.name;
+            new_name = undefined;
+            account_options = { config_root, name, new_name };
+            await exec_manage_cli(type, action, account_options);
+            new_account_details = await read_config_file(config_root, accounts_schema_dir, new_name);
+            expect(new_account_details.name).toBe(String(new_name));
+
+            // set the name as back as it was
+            temp = name; // we swap between name and new_name
+            name = String(new_name);
+            new_name = temp;
+            account_options = { config_root, name, new_name };
+            await exec_manage_cli(type, action, account_options);
+            new_account_details = await read_config_file(config_root, accounts_schema_dir, new_name);
+            expect(new_account_details.name).toBe(new_name);
         });
 
         it('cli account update access key, secret_key & new_name by name', async function() {
@@ -314,7 +399,7 @@ describe('manage nsfs cli account flow', () => {
             expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.InvalidArgument.message);
         });
 
-        it('should fail - cli update account invalid option type', async () => {
+        it('should fail - cli update account invalid option type (user as boolean)', async () => {
             const { name } = defaults;
             const account_options = { config_root, name};
             const action = ACTIONS.UPDATE;
@@ -332,7 +417,6 @@ describe('manage nsfs cli account flow', () => {
         const type = TYPES.ACCOUNT;
         const defaults = [{
             name: 'account1',
-            email: 'account1@noobaa.io',
             new_buckets_path: `${root_path}new_buckets_path_user1/`,
             uid: 999,
             gid: 999,
@@ -340,7 +424,6 @@ describe('manage nsfs cli account flow', () => {
             secret_key: 'U2AYaMpU3zRDcRFWmvzgQr9MoHIAsD+3oEXAMPLE',
         }, {
             name: 'account2',
-            email: 'account2@noobaa.io',
             new_buckets_path: `${root_path}new_buckets_path_user2/`,
             uid: 888,
             gid: 888,
@@ -348,7 +431,6 @@ describe('manage nsfs cli account flow', () => {
             secret_key: 'BIBYaMpU3zRDcRFWmvzgQr9MoHIAsD+3oEXAMPLE',
         }, {
             name: 'account3',
-            email: 'account3@noobaa.io',
             new_buckets_path: `${root_path}new_buckets_path_user2/`,
             uid: 999,
             gid: 888,
@@ -357,7 +439,6 @@ describe('manage nsfs cli account flow', () => {
             },
         {
             name: 'account4',
-            email: 'account4@noobaa.io',
             new_buckets_path: `${root_path}new_buckets_path_user2/`,
             user: 'root',
             access_key: 'DIBiFAnjaaE7OKD5N7hA',
@@ -375,6 +456,7 @@ describe('manage nsfs cli account flow', () => {
                 account_options = { ...account_options, ...account_defaults };
                 await fs_utils.create_fresh_path(account_options.new_buckets_path);
                 await fs_utils.file_must_exist(account_options.new_buckets_path);
+                await set_path_permissions_and_owner(account_options.new_buckets_path, account_options, 0o700);
                 await exec_manage_cli(type, action, account_options);
             }
         });
@@ -396,6 +478,19 @@ describe('manage nsfs cli account flow', () => {
             const account_options = { config_root, wide: true };
             const action = ACTIONS.LIST;
             const res = await exec_manage_cli(type, action, account_options);
+            expect(JSON.parse(res).response.reply.map(item => item.name))
+                .toEqual(expect.arrayContaining(['account3', 'account2', 'account1']));
+        });
+
+        it('cli list wide (use = as flags separator)', async () => {
+            const action = ACTIONS.LIST;
+            const command = `node src/cmd/manage_nsfs ${type} ${action} --config_root=${config_root} --wide`;
+            let res;
+            try {
+                res = await os_util.exec(command, { return_stdout: true });
+            } catch (e) {
+                res = e;
+            }
             expect(JSON.parse(res).response.reply.map(item => item.name))
                 .toEqual(expect.arrayContaining(['account3', 'account2', 'account1']));
         });
@@ -481,8 +576,8 @@ describe('manage nsfs cli account flow', () => {
 
         it('cli account status without name and access_key', async function() {
             const action = ACTIONS.STATUS;
-                const res = await exec_manage_cli(TYPES.ACCOUNT, action, { config_root });
-                expect(JSON.parse(res.stdout).error.code).toBe(ManageCLIError.MissingIdentifier.code);
+            const res = await exec_manage_cli(TYPES.ACCOUNT, action, { config_root });
+            expect(JSON.parse(res.stdout).error.code).toBe(ManageCLIError.MissingIdentifier.code);
         });
 
     });
@@ -493,7 +588,6 @@ describe('manage nsfs cli account flow', () => {
         const defaults = {
             type: TYPES.ACCOUNT,
             name: 'account11',
-            email: 'account11@noobaa.io',
             new_buckets_path: `${root_path}new_buckets_path_user11/`,
             uid: 1011,
             gid: 1011,
@@ -510,10 +604,11 @@ describe('manage nsfs cli account flow', () => {
         beforeEach(async () => {
             // cli create account
             const action = ACTIONS.ADD;
-            const { type, name, email, new_buckets_path, uid, gid } = defaults;
-            const account_options = { config_root, name, email, new_buckets_path, uid, gid };
+            const { type, name, new_buckets_path, uid, gid } = defaults;
+            const account_options = { config_root, name, new_buckets_path, uid, gid };
             await fs_utils.create_fresh_path(new_buckets_path);
             await fs_utils.file_must_exist(new_buckets_path);
+            await set_path_permissions_and_owner(account_options.new_buckets_path, account_options, 0o700);
             await exec_manage_cli(type, action, account_options);
             const config_path = path.join(config_root, accounts_schema_dir, name + '.json');
             await fs_utils.file_must_exist(config_path);
@@ -545,8 +640,9 @@ describe('manage nsfs cli account flow', () => {
             let type = TYPES.BUCKET;
             const bucket_name = 'bucket111';
             let action = ACTIONS.ADD;
-            const { email, new_buckets_path } = defaults;
-            const bucket_options = { config_root, path: new_buckets_path, name: bucket_name, email: email};
+            const { new_buckets_path } = defaults;
+            const account_name = defaults.name;
+            const bucket_options = { config_root, path: new_buckets_path, name: bucket_name, owner: account_name};
             await exec_manage_cli(type, action, bucket_options);
             let config_path = path.join(config_root, buckets_schema_dir, bucket_name + '.json');
             await fs_utils.file_must_exist(config_path);
@@ -562,10 +658,19 @@ describe('manage nsfs cli account flow', () => {
             await fs_utils.file_must_exist(config_path);
         });
 
-        it('should fail - cli delete account invalid option', async () => {
+        it('should fail - cli delete account invalid option (lala)', async () => {
             const action = ACTIONS.DELETE;
             const { type, name } = defaults;
-            const account_options = { config_root, name, lala: 'lala'}; // lala invalid option };
+            const account_options = { config_root, name, lala: 'lala'}; // lala invalid option
+            const res = await exec_manage_cli(type, action, account_options);
+            expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.InvalidArgument.message);
+        });
+
+        it('should fail - cli delete account invalid option (access_key)', async () => {
+            // access_key was identifier of account delete in the past, but not anymore
+            const action = ACTIONS.DELETE;
+            const { type, access_key } = defaults;
+            const account_options = { config_root, access_key};
             const res = await exec_manage_cli(type, action, account_options);
             expect(JSON.parse(res.stdout).error.message).toBe(ManageCLIError.InvalidArgument.message);
         });
@@ -578,7 +683,6 @@ describe('manage nsfs cli account flow', () => {
         const type = TYPES.ACCOUNT;
         const defaults = {
             name: 'account22',
-            email: 'account22@noobaa.io',
             new_buckets_path: `${root_path}new_buckets_path_user22/`,
             uid: 1022,
             gid: 1022,
@@ -595,6 +699,7 @@ describe('manage nsfs cli account flow', () => {
             const account_options = { config_root, ...defaults };
             await fs_utils.create_fresh_path(new_buckets_path);
             await fs_utils.file_must_exist(new_buckets_path);
+            await set_path_permissions_and_owner(new_buckets_path, account_options, 0o700);
             await exec_manage_cli(type, action, account_options);
         });
 
@@ -619,6 +724,182 @@ describe('manage nsfs cli account flow', () => {
 
     });
 
+});
+
+
+describe('cli account flow distinguished_name - permissions', function() {
+    const type = TYPES.ACCOUNT;
+    const config_root = path.join(tmp_fs_path, 'config_root_manage_dn');
+    const new_buckets_path = path.join(tmp_fs_path, 'new_buckets_path_user_dn_test/');
+    const accounts = {
+        root: {
+            cli_options: {
+                config_root,
+                name: 'rooti',
+                new_buckets_path,
+                user: 'root',
+            }
+        },
+        non_existing_dn: {
+            cli_options: {
+                config_root,
+                name: 'account_dn1',
+                new_buckets_path,
+                user: 'moti1003'
+            }
+        },
+        accessible_user: {
+            cli_options: {
+                config_root,
+                new_buckets_path,
+                name: 'accessible_user',
+                user: 'accessible_user',
+            },
+            fs_options: {
+                distinguished_name: 'accessible_user',
+                pass: 'newpass',
+                uid: 555,
+                gid: 555
+            }
+        },
+        inaccessible_user: {
+            cli_options: {
+                config_root,
+                new_buckets_path,
+                name: 'inaccessible_user',
+                user: 'inaccessible_user',
+            },
+            fs_options: {
+                distinguished_name: 'inaccessible_user',
+                pass: 'newpass',
+                uid: 1111,
+                gid: 1111
+            }
+        }
+    };
+
+    beforeAll(async () => {
+        await fs_utils.create_fresh_path(config_root);
+        await fs_utils.file_must_exist(config_root);
+        for (const account of Object.values(accounts)) {
+            if (!account.fs_options) continue;
+            const { distinguished_name, pass, uid, gid } = account.fs_options;
+            await create_fs_user_by_platform(distinguished_name, pass, uid, gid);
+        }
+        await fs_utils.create_fresh_path(new_buckets_path);
+        await fs_utils.file_must_exist(new_buckets_path);
+        await set_path_permissions_and_owner(new_buckets_path, { uid: 0, gid: 0 }, 0o700);
+        const res = await exec_manage_cli(type, ACTIONS.ADD, accounts.root.cli_options);
+        assert_account(JSON.parse(res).response.reply, accounts.root.cli_options, false);
+    }, timeout);
+
+    afterAll(async () => {
+        await exec_manage_cli(type, ACTIONS.DELETE, { name: accounts.accessible_user.cli_options.name, config_root });
+        await exec_manage_cli(type, ACTIONS.DELETE, { name: accounts.root.cli_options.name, config_root });
+        for (const account of Object.values(accounts)) {
+            if (!account.fs_options) continue;
+            const { distinguished_name } = account.fs_options;
+            await delete_fs_user_by_platform(distinguished_name);
+        }
+        await fs_utils.folder_delete(config_root);
+    }, timeout);
+
+    it('cli account create - should fail - user does not exist', async function() {
+        const action = ACTIONS.ADD;
+        const res = await exec_manage_cli(type, action, accounts.non_existing_dn.cli_options);
+        expect(JSON.parse(res.stdout).error.code).toBe(ManageCLIError.InvalidAccountDistinguishedName.code);
+    }, timeout);
+
+    it('cli account update distinguished_name - should fail - user does not exist', async function() {
+        const action = ACTIONS.UPDATE;
+        const update_options = {
+            config_root,
+            name: accounts.root.cli_options.name,
+            user: 'moti1004',
+        };
+        const res = await exec_manage_cli(type, action, update_options);
+        expect(JSON.parse(res.stdout).error.code).toBe(ManageCLIError.InvalidAccountDistinguishedName.code);
+    }, timeout);
+
+    it('cli account create - should fail - account cant access new_bucket_path', async function() {
+        const action = ACTIONS.ADD;
+        const res = await exec_manage_cli(type, action, accounts.inaccessible_user.cli_options);
+        expect(JSON.parse(res.stdout).error.code).toBe(ManageCLIError.InaccessibleAccountNewBucketsPath.code);
+    }, timeout);
+
+    it('cli account update distinguished_name - should fail - not owner - account cant access new_bucket_path', async function() {
+        const action = ACTIONS.UPDATE;
+        const update_options = {
+            config_root,
+            name: accounts.root.cli_options.name,
+            user: accounts.inaccessible_user.fs_options.distinguished_name,
+        };
+        const res = await exec_manage_cli(type, action, update_options);
+        expect(JSON.parse(res.stdout).error.code).toBe(ManageCLIError.InaccessibleAccountNewBucketsPath.code);
+    }, timeout);
+
+    it('cli account create - valid and accessible distinguished name', async function() {
+        await fs.promises.chown(new_buckets_path, accounts.accessible_user.fs_options.uid, accounts.accessible_user.fs_options.gid);
+        const action = ACTIONS.ADD;
+        const res = await exec_manage_cli(type, action, accounts.accessible_user.cli_options);
+        assert_account(JSON.parse(res).response.reply, accounts.accessible_user.cli_options, false);
+    }, timeout);
+
+    it('cli account update root - other valid and accessible distinguished_name', async function() {
+        const action = ACTIONS.UPDATE;
+        const update_options = {
+            config_root,
+            name: accounts.root.cli_options.name,
+            user: accounts.accessible_user.fs_options.distinguished_name,
+        };
+        const res = await exec_manage_cli(type, action, update_options);
+        assert_account(JSON.parse(res).response.reply, { ...accounts.root.cli_options, ...update_options }, false);
+    }, timeout);
+
+    it('cli account update - should fail - no permissions to new_buckets_path', async function() {
+        const no_permissions_new_buckets_path = `${tmp_fs_path}/new_buckets_path_no_perm_to_owner/`;
+        await fs_utils.create_fresh_path(no_permissions_new_buckets_path);
+        await fs_utils.file_must_exist(no_permissions_new_buckets_path);
+        await set_path_permissions_and_owner(new_buckets_path, accounts.accessible_user.fs_options, 0o077);
+        const action = ACTIONS.UPDATE;
+        const update_options = {
+            config_root,
+            name: accounts.root.cli_options.name,
+            new_buckets_path: no_permissions_new_buckets_path,
+        };
+        const res = await exec_manage_cli(type, action, update_options);
+        expect(JSON.parse(res.stdout).error.code).toBe(ManageCLIError.InaccessibleAccountNewBucketsPath.code);
+    }, timeout);
+
+    it('cli account update - should fail - no write permissions of new_buckets_path', async function() {
+        const no_permissions_new_buckets_path = `${tmp_fs_path}/new_buckets_path_no_r_perm_to_owner/`;
+        await fs_utils.create_fresh_path(no_permissions_new_buckets_path);
+        await fs_utils.file_must_exist(no_permissions_new_buckets_path);
+        await set_path_permissions_and_owner(new_buckets_path, accounts.accessible_user.fs_options, 0o477);
+        const action = ACTIONS.UPDATE;
+        const update_options = {
+            config_root,
+            name: accounts.root.cli_options.name,
+            new_buckets_path: no_permissions_new_buckets_path,
+        };
+        const res = await exec_manage_cli(type, action, update_options);
+        expect(JSON.parse(res.stdout).error.code).toBe(ManageCLIError.InaccessibleAccountNewBucketsPath.code);
+    }, timeout);
+
+    it('cli account update - should fail - no read permissions of new_buckets_path', async function() {
+        const no_permissions_new_buckets_path = `${tmp_fs_path}/new_buckets_path_no_w_perm_to_owner/`;
+        await fs_utils.create_fresh_path(no_permissions_new_buckets_path);
+        await fs_utils.file_must_exist(no_permissions_new_buckets_path);
+        await set_path_permissions_and_owner(new_buckets_path, accounts.accessible_user.fs_options, 0o277);
+        const action = ACTIONS.UPDATE;
+        const update_options = {
+            config_root,
+            name: accounts.root.cli_options.name,
+            new_buckets_path: no_permissions_new_buckets_path,
+        };
+        const res = await exec_manage_cli(type, action, update_options);
+        expect(JSON.parse(res.stdout).error.code).toBe(ManageCLIError.InaccessibleAccountNewBucketsPath.code);
+    });
 });
 
 /**
@@ -646,7 +927,6 @@ function assert_account(account, account_options, verify_access_keys) {
         expect(account.access_keys[0].access_key).toEqual(account_options.access_key);
         expect(account.access_keys[0].secret_key).toEqual(account_options.secret_key);
     }
-    expect(account.email).toEqual(account_options.email);
     expect(account.name).toEqual(account_options.name);
 
     if (account_options.distinguished_name) {

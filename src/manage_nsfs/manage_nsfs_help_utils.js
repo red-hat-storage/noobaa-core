@@ -1,7 +1,7 @@
 /* Copyright (C) 2024 NooBaa */
 'use strict';
 
-const { TYPES, ACTIONS } = require('./manage_nsfs_constants');
+const { TYPES, ACTIONS, GLACIER_ACTIONS } = require('./manage_nsfs_constants');
 
 const HELP = `
 Help:
@@ -74,12 +74,11 @@ Usage:
 account add [flags]
 
 Flags:
---name <string or number>                                                                   Set the name for the account
---email <string>                                                                            Set the email for the account (used as the identifier for buckets owner)
+--name <string>                                                                             Set the name for the account
 --uid <number>                                                                              Set the User Identifier (UID) (UID and GID can be replaced by --user option)
 --gid <number>                                                                              Set the Group Identifier (GID) (UID and GID can be replaced by --user option)
 --new_buckets_path <string>                                                                 Set the filesystem's root path where each subdirectory is a bucket
---user <string or number>                                 (optional)                        Set the OS user name (instead of UID and GID)
+--user <string>                                           (optional)                        Set the OS user name (instead of UID and GID)
 --access_key <string>                                     (optional)                        Set the access key for the account (default is generated)
 --secret_key <string>                                     (optional)                        Set the secret key for the account (default is generated)
 --fs_backend <none | GPFS | CEPH_FS | NFSv4>              (optional)                        Set the filesystem type of new_buckets_path (default config.NSFS_NC_STORAGE_BACKEND)
@@ -90,15 +89,14 @@ Usage:
 account update [flags]
 
 Flags:
---name <string or number>                                                                   The name of the account
---new_name <string or number>                             (optional)                        Update the account name
---email <string>                                          (optional)                        Update the email (used as the identifier for buckets owner)
+--name <string>                                                                             The name of the account
+--new_name <string>                                       (optional)                        Update the account name
 --uid <number>                                            (optional)                        Update the User Identifier (UID)
 --gid <number>                                            (optional)                        Update the Group Identifier (GID)
 --new_buckets_path <string>                               (optional)                        Update the filesystem's root path where each subdirectory is a bucket
---user <string or number>                                 (optional)                        Update the OS user name (instead of uid and gid)
+--user <string>                                           (optional)                        Update the OS user name (instead of uid and gid)
 --regenerate                                              (optional)                        Update automatically generated access key and secret key
---access_key <string>                                     (optional)                        Update the access key. Can be used as identifier instead of --name
+--access_key <string>                                     (optional)                        Update the access key
 --secret_key <string>                                     (optional)                        Update the secret key
 --fs_backend <none | GPFS | CEPH_FS | NFSv4>              (optional)                        Update the filesystem type of new_buckets_path (default config.NSFS_NC_STORAGE_BACKEND)
 `;
@@ -108,8 +106,7 @@ Usage:
 account delete [flags]
 
 Flags:
---name <string or number>                                                                   The name of the account
---access_key <string>                                     (optional)                        The access key of the account (identify the account instead of name)
+--name <string>                                                                             The name of the account
 `;
 
 const ACCOUNT_FLAGS_STATUS = `
@@ -117,7 +114,7 @@ Usage:
 account status [flags]
 
 Flags:
---name <string or number>                                                                   The name of the account
+--name <string>                                                                             The name of the account
 --access_key <string>                                     (optional)                        The access key of the account (identify the account instead of name)
 --show_secrets                                            (optional)                        Print the access key and secret key of the account
 `;
@@ -131,8 +128,8 @@ Flags:
 --show_secrets                                            (optional)                        Print the access key and secret key of each account (only when using flag --wide)
 --uid <number>                                            (optional)                        Filter the list based on the provided account UID
 --gid <number>                                            (optional)                        Filter the list based on the provided account GID
---user <string or number>                                 (optional)                        Filter the list based on the provided account user
---name <string or number>                                 (optional)                        Filter the list based on the provided account name
+--user <string>                                           (optional)                        Filter the list based on the provided account user
+--name <string>                                           (optional)                        Filter the list based on the provided account name
 --access_key <string>                                     (optional)                        Filter the list based on the provided account access key
 `;
 
@@ -141,8 +138,8 @@ Usage:
 bucket add [flags]
 
 Flags:
---name <string or number>                                                                   Set the name for the bucket
---email <string>                                                                            Set the bucket owner email
+--name <string>                                                                             Set the name for the bucket
+--owner <string>                                                                            Set the bucket owner name
 --path <string>                                                                             Set the bucket path
 --bucket_policy <string>                                  (optional)                        Set the bucket policy, type is a string of valid JSON policy
 --fs_backend <none | GPFS | CEPH_FS | NFSv4>              (optional)                        Set the filesystem type (default config.NSFS_NC_STORAGE_BACKEND)
@@ -153,9 +150,9 @@ Usage:
 bucket update [flags]
 
 Flags:
---name <string or number>                                                                   The name of the bucket
---new_name <string or number>                             (optional)                        Update the bucket name
---email <string>                                          (optional)                        Update the bucket owner email
+--name <string>                                                                             The name of the bucket
+--new_name <string>                                       (optional)                        Update the bucket name
+--owner <string>                                          (optional)                        Update the bucket owner name
 --path <string>                                           (optional)                        Update the bucket path
 --bucket_policy <string>                                  (optional)                        Update the bucket policy, type is a string of valid JSON policy (unset with '')
 --fs_backend <none | GPFS | CEPH_FS | NFSv4>              (optional)                        Update the filesystem type (unset with '') (default config.NSFS_NC_STORAGE_BACKEND)
@@ -166,7 +163,7 @@ Usage:
 bucket delete [flags]
 
 Flags:
---name <string or number>                                                                   The name of the bucket
+--name <string>                                                                             The name of the bucket
 `;
 
 const BUCKET_FLAGS_STATUS = `
@@ -174,7 +171,7 @@ Usage:
 bucket status [flags]
 
 Flags:
---name <string or number>                                                                   The name of the bucket
+--name <string>                                                                             The name of the bucket
 `;
 
 const BUCKET_FLAGS_LIST = `
@@ -183,7 +180,27 @@ bucket list [flags]
 
 Flags:
 --wide                                                    (optional)                        Print the additional details for each bucket
---name                                                    (optional)                        Filter the list based on the provided bucket name
+--name <string>                                           (optional)                        Filter the list based on the provided bucket name
+`;
+
+const GLACIER_OPTIONS = `
+Usage:
+    manage_nsfs glacier <migrate | restore | expiry> [options]
+`;
+
+const GLACIER_MIGRATE_OPTIONS = `
+Glacier Migrate Options:
+    --interval <interval>                         (default none)            Run the operation if "interval" milliseconds have passed since last run
+`;
+
+const GLACIER_RESTORE_OPTIONS = `
+Glacier Restore Options:
+    --interval <interval>                         (default none)            Run the operation if "interval" milliseconds have passed since last run
+`;
+
+const GLACIER_EXPIRY_OPTIONS = `
+Glacier Expiry Options:
+    --interval <interval>                         (default none)            Run the operation if "interval" milliseconds have passed since last run
 `;
 
 /** 
@@ -201,6 +218,9 @@ function print_usage(type, action) {
             break;
         case TYPES.IP_WHITELIST:
             process.stdout.write(WHITELIST_FLAGS.trimStart());
+            break;
+        case TYPES.GLACIER:
+            print_help_glacier(action);
             break;
         default:
             process.stdout.write(HELP + '\n');
@@ -266,6 +286,22 @@ function print_help_bucket(action) {
             process.stdout.write(BUCKET_ACTIONS.trimStart());
     }
     process.exit(0);
+}
+
+function print_help_glacier(action) {
+    switch (action) {
+        case GLACIER_ACTIONS.MIGRATE:
+            process.stdout.write(GLACIER_MIGRATE_OPTIONS.trimStart());
+            break;
+        case GLACIER_ACTIONS.RESTORE:
+            process.stdout.write(GLACIER_RESTORE_OPTIONS.trimStart());
+            break;
+        case GLACIER_ACTIONS.EXPIRY:
+            process.stdout.write(GLACIER_EXPIRY_OPTIONS.trimStart());
+            break;
+        default:
+            process.stdout.write(GLACIER_OPTIONS.trimStart());
+    }
 }
 
 // EXPORTS

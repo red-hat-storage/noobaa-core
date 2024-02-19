@@ -2,14 +2,14 @@
 'use strict';
 
 const dbg = require('../util/debug_module')(__filename);
-const P = require('../util/promise');
+const fs = require('fs');
+const net = require('net');
 const path = require('path');
-const nb_native = require('../util/nb_native');
+const P = require('../util/promise');
 const { v4: uuidv4 } = require('uuid');
 const config = require('../../config');
 const RpcError = require('../rpc/rpc_error');
-const net = require('net');
-const fs = require('fs');
+const nb_native = require('../util/nb_native');
 
 const gpfs_link_unlink_retry_err = 'EEXIST';
 const gpfs_unlink_retry_catch = 'GPFS_UNLINK_RETRY';
@@ -452,10 +452,7 @@ function get_process_fs_context(config_root_backend) {
 async function get_fs_context(nsfs_account_config, config_root_backend) {
     let account_ids_by_dn;
     if (nsfs_account_config.distinguished_name) {
-        account_ids_by_dn = await get_user_by_distinguished_name(nsfs_account_config);
-        //{
-        //    distinguished_name: nsfs_account_config.distinguished_name // TODO add it for manage_nsfs .unwrap()
-        //});
+        account_ids_by_dn = await get_user_by_distinguished_name({ distinguished_name: nsfs_account_config.distinguished_name });
     }
     return {
         uid: (account_ids_by_dn && account_ids_by_dn.uid) ?? nsfs_account_config.uid,
@@ -550,6 +547,18 @@ async function folder_delete(dir, fs_context, is_temp = false) {
     await nb_native().fs.rmdir(fs_context, dir);
 }
 
+/**
+ * read_config_file reads and returns the parsed config file data
+ * @param {nb.NativeFSContext} fs_context
+ * @param {string} config_path 
+ * @return {Promise<object>} 
+ */
+async function read_config_file(fs_context, config_path) {
+    const { data } = await nb_native().fs.readFile(fs_context, config_path);
+    const config_data = JSON.parse(data.toString());
+    return config_data;
+}
+
 exports.get_umasked_mode = get_umasked_mode;
 exports._make_path_dirs = _make_path_dirs;
 exports._create_path = _create_path;
@@ -575,6 +584,7 @@ exports.gpfs_unlink_retry_catch = gpfs_unlink_retry_catch;
 exports.create_config_file = create_config_file;
 exports.delete_config_file = delete_config_file;
 exports.update_config_file = update_config_file;
+exports.read_config_file = read_config_file;
 exports.isDirectory = isDirectory;
 exports.get_process_fs_context = get_process_fs_context;
 exports.get_fs_context = get_fs_context;
