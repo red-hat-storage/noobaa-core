@@ -235,7 +235,6 @@ const static std::vector<std::string> USER_XATTRS{
     "user.noobaa.part_etag",
     "user.storage_class",
     "user.noobaa.restore.request",
-    "user.noobaa.restore.ongoing",
     "user.noobaa.restore.expiry",
 };
 
@@ -647,7 +646,7 @@ struct AutoCloser
         : _worker(worker), _fd(fd) {}
     ~AutoCloser()
     {
-        if (_fd) {
+        if (_fd >= 0) {
             int r = close(_fd);
             if (r) _worker->SetSyscallError();
         }
@@ -1341,16 +1340,16 @@ struct FileWrap : public Napi::ObjectWrap<FileWrap>
     }
     FileWrap(const Napi::CallbackInfo& info)
         : Napi::ObjectWrap<FileWrap>(info)
-        , _fd(0)
+        , _fd(-1)
     {
     }
     ~FileWrap()
     {
-        if (_fd) {
+        if (_fd >= 0) {
             LOG("FS::FileWrap::dtor: file not closed " << DVAL(_path) << DVAL(_fd));
             int r = ::close(_fd);
             if (r) LOG("FS::FileWrap::dtor: file close failed " << DVAL(_path) << DVAL(_fd) << DVAL(r));
-            _fd = 0;
+            _fd = -1;
         }
     }
     Napi::Value close(const Napi::CallbackInfo& info);
@@ -1376,7 +1375,7 @@ struct FileOpen : public FSWorker
     mode_t _mode;
     FileOpen(const Napi::CallbackInfo& info)
         : FSWorker(info)
-        , _fd(0)
+        , _fd(-1)
         , _flags(0)
         , _mode(0666)
     {
@@ -1417,10 +1416,12 @@ struct FileClose : public FSWrapWorker<FileWrap>
     virtual void Work()
     {
         int fd = _wrap->_fd;
-        std::string path = _wrap->_path;
-        int r = close(fd);
-        if (r) SetSyscallError();
-        _wrap->_fd = 0;
+        if (fd >= 0) {
+            std::string path = _wrap->_path;
+            int r = close(fd);
+            if (r) SetSyscallError();
+            _wrap->_fd = -1;
+        }
     }
 };
 
@@ -1570,6 +1571,7 @@ struct FileReplacexattr : public FSWrapWorker<FileWrap>
     virtual void Work()
     {
         int fd = _wrap->_fd;
+        CHECK_WRAP_FD(fd);
 
         if (_prefix != "") {
             SYSCALL_OR_RETURN(clear_xattr(fd, _prefix));
@@ -1587,7 +1589,7 @@ struct LinkFileAt : public FSWrapWorker<FileWrap>
     int _replace_fd;
     LinkFileAt(const Napi::CallbackInfo& info)
         : FSWrapWorker<FileWrap>(info)
-        , _replace_fd(0)
+        , _replace_fd(-1)
     {
         _filepath = info[1].As<Napi::String>();
         if (info.Length() > 2 && !info[2].IsUndefined()) {
@@ -1597,12 +1599,15 @@ struct LinkFileAt : public FSWrapWorker<FileWrap>
     }
     virtual void Work()
     {
+        int fd = _wrap->_fd;
+        CHECK_WRAP_FD(fd);
+
         // gpfs_linkat() is the same as Linux linkat() but we need a new function because
         // Linux will fail the linkat() if the file already exist and we want to replace it if it existed.
-        if (_replace_fd == 0) {
-            SYSCALL_OR_RETURN(dlsym_gpfs_linkat(_wrap->_fd, "", AT_FDCWD, _filepath.c_str(), AT_EMPTY_PATH));
+        if (_replace_fd >= 0) {
+            SYSCALL_OR_RETURN(dlsym_gpfs_linkatif(fd, "", AT_FDCWD, _filepath.c_str(), AT_EMPTY_PATH, _replace_fd));
         } else {
-            SYSCALL_OR_RETURN(dlsym_gpfs_linkatif(_wrap->_fd, "", AT_FDCWD, _filepath.c_str(), AT_EMPTY_PATH, _replace_fd));
+            SYSCALL_OR_RETURN(dlsym_gpfs_linkat(fd, "", AT_FDCWD, _filepath.c_str(), AT_EMPTY_PATH));
         }
     }
 };
@@ -1613,7 +1618,7 @@ struct UnlinkFileAt : public FSWrapWorker<FileWrap>
     int _delete_fd;
     UnlinkFileAt(const Napi::CallbackInfo& info)
         : FSWrapWorker<FileWrap>(info)
-        , _delete_fd(0)
+        , _delete_fd(-1)
     {
         _filepath = info[1].As<Napi::String>();
         if (info.Length() > 2 && !info[2].IsUndefined()) {
@@ -1623,7 +1628,9 @@ struct UnlinkFileAt : public FSWrapWorker<FileWrap>
     }
     virtual void Work()
     {
-        SYSCALL_OR_RETURN(dlsym_gpfs_unlinkat(_wrap->_fd, _filepath.c_str(), _delete_fd));
+        int fd = _wrap->_fd;
+        CHECK_WRAP_FD(fd);
+        SYSCALL_OR_RETURN(dlsym_gpfs_unlinkat(fd, _filepath.c_str(), _delete_fd));
     }
 };
 

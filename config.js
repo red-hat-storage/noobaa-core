@@ -96,6 +96,7 @@ config.AGENT_TEST_CONNECTION_TIMEOUT = 1 * 60 * 1000;
 config.STORE_PERF_TEST_INTERVAL = 60 * 60 * 1000; // perform test_store_perf every 1 hour
 config.CLOUD_MAX_ALLOWED_IO_TEST_ERRORS = 3;
 
+config.ENABLE_DEV_RANDOM_SEED = process.env.DISABLE_DEV_RANDOM_SEED === 'false' || false;
 
 ////////////////
 // RPC CONFIG //
@@ -624,6 +625,13 @@ config.BUCKET_LOG_REPLICATOR_DELAY = 5 * 60 * 1000;
 config.AZURE_QUERY_TRUNCATION_MAX_SIZE_IN_BITS = 10 * 1024 * 1024;
 config.BUCKET_DIFF_FOR_REPLICATION = true;
 
+////////////////////////////////
+//      BUCKET LOGGING        //
+////////////////////////////////
+
+config.BUCKET_LOG_UPLOAD_ENABLED = true;
+config.BUCKET_LOG_UPLOADER_DELAY = 5 * 60 * 1000;
+
 ///////////////////////////
 //      KEY ROTATOR      //
 ///////////////////////////
@@ -722,6 +730,9 @@ config.NSFS_RENAME_RETRIES = 3;
 config.NSFS_VERSIONING_ENABLED = true;
 config.NSFS_UPDATE_ISSUES_REPORT_ENABLED = true;
 
+config.NSFS_EXIT_EVENTS_TIME_FRAME_MIN = 24 * 60; // per day
+config.NSFS_MAX_EXIT_EVENTS_PER_TIME_FRAME = 10; // allow max 10 failed forks per day
+
 config.NSFS_GLACIER_LOGS_DIR = '/var/run/noobaa-nsfs/wal';
 config.NSFS_GLACIER_LOGS_MAX_INTERVAL = 15 * 60 * 1000;
 
@@ -745,6 +756,12 @@ config.NSFS_GLACIER_RESTORE_INTERVAL = 15 * 60 * 1000;
 // NSFS_GLACIER_EXPIRY_INTERVAL indicates the interval between runs
 // of `manage_nsfs glacier expiry`
 config.NSFS_GLACIER_EXPIRY_INTERVAL = 12 * 60 * 60 * 1000;
+
+/** @type {'UTC' | 'LOCAL'} */
+config.NSFS_GLACIER_EXPIRY_TZ = 'LOCAL';
+
+// Format must be HH:MM:SS
+config.NSFS_GLACIER_EXPIRY_TIME_OF_DAY = '00:00:00';
 
 ////////////////////////////
 // NSFS NON CONTAINERIZED //

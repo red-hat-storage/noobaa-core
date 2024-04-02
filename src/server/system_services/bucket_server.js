@@ -393,7 +393,6 @@ async function put_bucket_logging(req) {
     dbg.log0('put_bucket_logging:', req.rpc_params);
     const bucket = find_bucket(req);
     const logging = {
-                        "name": bucket.name,
                         "log_bucket": req.rpc_params.log_bucket,
                         "log_prefix": req.rpc_params.log_prefix
                     };
@@ -414,9 +413,8 @@ async function get_bucket_logging(req) {
     const bucket = find_bucket(req);
 
     const logging = {
-        "name": bucket.name,
-        "log_bucket": bucket.logging.log_bucket,
-        "log_prefix": bucket.logging.log_prefix
+        "log_bucket": bucket.logging?.log_bucket || "Not Configured",
+        "log_prefix": bucket.logging?.log_prefix || "Not Configured"
     };
     return logging;
 }
@@ -1208,6 +1206,7 @@ async function get_cloud_buckets(req) {
             return buckets.map(bucket => _inject_usage_to_cloud_bucket(bucket.Name, connection.endpoint, used_cloud_buckets));
         }
     } catch (err) {
+        noobaa_s3_client.fix_error_object(err); // only relevant when using AWS SDK v3
         if (err instanceof P.TimeoutError) {
             dbg.log0('failed reading (t/o) external buckets list', req.rpc_params);
         } else {

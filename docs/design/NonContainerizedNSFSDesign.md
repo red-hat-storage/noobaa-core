@@ -27,6 +27,7 @@ node src/cmd/nsfs ../standalon/nsfs_root --config_dir ../standalon/fs_config
 
 ```json
 {
+  "_id": "65cb1e7c9e6ae40d499c0ae3", // _id automatically generated
   "name": "user1",
   "email": "user1", // the email will be internally (the account name), email will not be set by user
   "creation_date": "2024-01-11T08:24:14.937Z",
@@ -41,8 +42,7 @@ node src/cmd/nsfs ../standalon/nsfs_root --config_dir ../standalon/fs_config
     "gid": 1001,   // 
     "new_buckets_path": "/",
   },
-  "allow_bucket_creation": true,
-  "_id": "65cb1e7c9e6ae40d499c0ae3" // _id automatically generated
+  "allow_bucket_creation": true
 }
 ```
 
@@ -145,7 +145,7 @@ High level configuration -
 
 3.1. accounts/ - directory that contains accounts configurations, each account configuration file is called {account_name}.json and fits to the account schema.
 
-3.2. access_keys/ - directory that contains symlinks to accounts configurations, each symlink called {access_key}.symlink and links to an account under accounts/ directory.
+3.2. access_keys/ - directory that contains symlinks to accounts configurations, each symlink called {access_key}.symlink and links to an account under accounts/ directory. Access key symlink is targeted to relative account path not absolute path. eg: `../accounts/acc_symlink1.json`
 
 3.3. buckets/ - directory that contains buckets configurations, each bucket configuration file called {bucket_name}.json and fits the bucket schema.
 

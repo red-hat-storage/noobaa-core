@@ -95,6 +95,18 @@ ManageCLIError.InvalidSchema = Object.freeze({
     http_code: 400,
 });
 
+ManageCLIError.InvalidFilePath = Object.freeze({
+    code: 'InvalidFilePath',
+    message: 'Invalid file path',
+    http_code: 400,
+});
+
+ManageCLIError.InvalidJSONFile = Object.freeze({
+    code: 'InvalidJSONFile',
+    message: 'Invalid JSON file',
+    http_code: 400,
+});
+
 //////////////////////////////
 //// IP WHITE LIST ERRORS ////
 //////////////////////////////
@@ -223,6 +235,12 @@ ManageCLIError.InvalidAccountNewBucketsPath = Object.freeze({
     http_code: 400,
 });
 
+ManageCLIError.InvalidBooleanValue = Object.freeze({
+    code: 'InvalidBooleanValue',
+    message: 'supported values are true and false',
+    http_code: 400,
+});
+
 ManageCLIError.InvalidNewNameAccountIdentifier = Object.freeze({
     code: 'InvalidNewNameAccountIdentifier',
     message: 'Account new_name can not be used on add command, please remove the --new_name flag',
@@ -291,6 +309,13 @@ ManageCLIError.BucketSetForbiddenNoBucketOwner = Object.freeze({
 ManageCLIError.BucketCreationNotAllowed = Object.freeze({
     code: 'BucketCreationNotAllowed',
     message: 'Not allowed to create new buckets',
+    http_code: 403,
+});
+
+ManageCLIError.BucketDeleteForbiddenHasObjects = Object.freeze({
+    code: 'BucketDeleteForbiddenHasObjects',
+    message: 'Cannot delete non-empty bucket. ' +
+    'You must delete all object before deleting the bucket or use --force flag',
     http_code: 403,
 });
 

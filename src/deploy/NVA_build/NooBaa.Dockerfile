@@ -74,7 +74,8 @@ RUN dnf install -y -q bash \
     python3-setuptools \
     jemalloc \
     xz \
-    python3-pip && \
+    python3-pip \
+    cronie && \
     dnf clean all
 
 COPY ./src/deploy/NVA_build/install_arrow_run.sh ./src/deploy/NVA_build/install_arrow_run.sh
@@ -113,7 +114,7 @@ COPY ./src/deploy/NVA_build/logrotate_noobaa.conf /etc/logrotate.d/noobaa/
 COPY ./src/deploy/NVA_build/noobaa_init.sh /noobaa_init_files/
 
 COPY ./src/deploy/NVA_build/setup_platform.sh /usr/bin/setup_platform.sh
-RUN /usr/bin/setup_platform.sh 
+RUN /usr/bin/setup_platform.sh
 
 RUN chmod 775 /noobaa_init_files && \
     chgrp -R 0 /noobaa_init_files/ && \
@@ -137,7 +138,7 @@ COPY --from=server_builder /noobaa/noobaa-NVA.tar.gz /tmp/
 RUN cd /root/node_modules && \
     tar -xzf /tmp/noobaa-NVA.tar.gz && \
     chgrp -R 0 /root/node_modules && \
-    chmod -R 775 /root/node_modules 
+    chmod -R 775 /root/node_modules
 
 ###############
 # PORTS SETUP #
@@ -161,6 +162,7 @@ ENV LD_PRELOAD /usr/lib64/libjemalloc.so.2
 # EXEC SETUP #
 ###############
 # Run as non root user that belongs to root 
+RUN useradd -u 10001 -g 0 -m -d /home/noob -s /bin/bash noob
 USER 10001:0
 
 # We are using CMD and not ENDPOINT so 
