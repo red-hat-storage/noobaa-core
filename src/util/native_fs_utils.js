@@ -187,6 +187,20 @@ async function safe_unlink(fs_context, src_path, src_ver_info, gpfs_options, tmp
     }
 }
 
+async function safe_link(fs_context, src_path, dst_path, src_ver_info, gpfs_options) {
+    if (_is_gpfs(fs_context)) {
+        const { src_file = undefined, dir_file = undefined } = gpfs_options;
+        if (dir_file) {
+            await safe_link_gpfs(fs_context, src_path, src_file, dir_file);
+        } else {
+            dbg.error(`safe_link: dir_file is ${dir_file}, cannot use it to call safe_unlink_gpfs`);
+            throw new Error(`dir_file is ${dir_file}, need a value to safe unlink GPFS`);
+        }
+    } else {
+        await safe_link_posix(fs_context, src_path, dst_path, src_ver_info);
+    }
+}
+
 // this function handles best effort of files move in posix file systems
 // 1. safe_link
 // 2. safe_unlink
@@ -240,9 +254,9 @@ async function unlink_ignore_enoent(fs_context, to_delete_path) {
     try {
         await nb_native().fs.unlink(fs_context, to_delete_path);
     } catch (err) {
-        dbg.warn(`native_fs_utils.unlink_ignore_enoent unlink error: file path ${to_delete_path} error`, err);
-        if (err.code !== 'ENOENT') throw err;
-        dbg.warn(`native_fs_utils.unlink_ignore_enoent unlink: file ${to_delete_path} already deleted, ignoring..`);
+        dbg.warn(`native_fs_utils.unlink_ignore_enoent unlink error: file path ${to_delete_path} error`, err, err.code, err.code !== 'EISDIR');
+        if (err.code !== 'ENOENT' && err.code !== 'EISDIR') throw err;
+        dbg.warn(`native_fs_utils.unlink_ignore_enoent unlink: file ${to_delete_path} already deleted or key is pointing to dir, ignoring..`);
     }
 }
 
@@ -268,11 +282,11 @@ async function safe_unlink_gpfs(fs_context, to_delete_path, to_delete_file, dir_
     }
 }
 
-function should_retry_link_unlink(is_gpfs, err) {
+function should_retry_link_unlink(err) {
     const should_retry_general = ['ENOENT', 'EEXIST', 'VERSION_MOVED', 'MISMATCH_VERSION'].includes(err.code);
     const should_retry_gpfs = [gpfs_link_unlink_retry_err, gpfs_unlink_retry_catch].includes(err.code);
     const should_retry_posix = [posix_link_retry_err, posix_unlink_retry_err].includes(err.message);
-    return should_retry_general || (is_gpfs ? should_retry_gpfs : should_retry_posix);
+    return should_retry_general || should_retry_gpfs || should_retry_posix;
 }
 
 ////////////////////////
@@ -434,7 +448,7 @@ async function update_config_file(fs_context, schema_dir, config_path, config_da
                 break;
             } catch (err) {
                 retries -= 1;
-                if (retries <= 0 || !should_retry_link_unlink(is_gpfs, err)) throw err;
+                if (retries <= 0 || !should_retry_link_unlink(err)) throw err;
                 dbg.warn(`native_fs_utils.update_config_file: Retrying failed move to dest retries=${retries}` +
                     ` source_path=${open_path} dest_path=${config_path}`, err);
                 if (is_gpfs) {
@@ -669,10 +683,12 @@ exports.open_file = open_file;
 exports.copy_bytes = copy_bytes;
 exports.finally_close_files = finally_close_files;
 exports.get_user_by_distinguished_name = get_user_by_distinguished_name;
+exports.get_config_files_tmpdir = get_config_files_tmpdir;
 
 exports._is_gpfs = _is_gpfs;
 exports.safe_move = safe_move;
 exports.safe_unlink = safe_unlink;
+exports.safe_link = safe_link;
 exports.safe_move_posix = safe_move_posix;
 exports.safe_move_gpfs = safe_move_gpfs;
 exports.safe_link_posix = safe_link_posix;

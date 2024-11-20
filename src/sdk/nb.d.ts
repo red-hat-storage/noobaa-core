@@ -5,6 +5,7 @@ import * as mongodb from 'mongodb';
 import { EventEmitter } from 'events';
 import { Readable, Writable } from 'stream';
 import { IncomingMessage, ServerResponse } from 'http';
+import { ObjectPart, Checksum} from '@aws-sdk/client-s3';
 
 type Semaphore = import('../util/semaphore');
 type KeysSemaphore = import('../util/keys_semaphore');
@@ -439,6 +440,8 @@ interface ObjectInfo {
     ns?: Namespace;
     storage_class?: StorageClass;
     restore_status?: { ongoing?: boolean; expiry_time?: Date; };
+    checksum?: Checksum;
+    object_parts?: GetObjectAttributesParts;
 }
 
 
@@ -814,6 +817,7 @@ interface Namespace {
     get_blob_block_lists(params: object, object_sdk: ObjectSDK): Promise<any>;
 
     restore_object(params: object, object_sdk: ObjectSDK): Promise<any>;
+    get_object_attributes(params: object, object_sdk: ObjectSDK): Promise<any>;
 }
 
 interface BucketSpace {
@@ -821,7 +825,7 @@ interface BucketSpace {
     read_account_by_access_key({ access_key: string }): Promise<any>;
     read_bucket_sdk_info({ name: string }): Promise<any>;
 
-    list_buckets(object_sdk: ObjectSDK): Promise<any>;
+    list_buckets(params: object, object_sdk: ObjectSDK): Promise<any>;
     read_bucket(params: object): Promise<any>;
     create_bucket(params: object, object_sdk: ObjectSDK): Promise<any>;
     delete_bucket(params: object, object_sdk: ObjectSDK): Promise<any>;
@@ -851,6 +855,9 @@ interface BucketSpace {
     put_bucket_policy(params: object): Promise<any>;
     delete_bucket_policy(params: object): Promise<any>;
     get_bucket_policy(params: object, object_sdk: ObjectSDK): Promise<any>;
+
+    put_bucket_notification(params: object): Promise<any>;
+    get_bucket_notification(params: object): Promise<any>;
 
     get_object_lock_configuration(params: object, object_sdk: ObjectSDK): Promise<any>;
     put_object_lock_configuration(params: object, object_sdk: ObjectSDK): Promise<any>;
@@ -1096,7 +1103,7 @@ interface X509Name {
     O: string;
 }
 
-type select_input_format =  'CSV' | 'JSON' | 'Parquet';
+type select_input_format = 'CSV' | 'JSON' | 'Parquet';
 interface S3SelectOptions {
     query: string;
     input_format: select_input_format;
@@ -1122,7 +1129,24 @@ type NodeCallback<T = void> = (err: Error | null, res?: T) => void;
 type RestoreState = 'CAN_RESTORE' | 'ONGOING' | 'RESTORED';
 
 interface RestoreStatus {
-  state: nb.RestoreState;
-  ongoing?: boolean;
-  expiry_time?: Date;
+    state: nb.RestoreState;
+    ongoing?: boolean;
+    expiry_time?: Date;
 }
+
+/**********************************************************
+ *
+ * OTHER - S3 Structure
+ *
+ **********************************************************/
+
+// Since the interface is a bit different between the SDKs
+// we couldn't import and reuse
+interface GetObjectAttributesParts {
+    TotalPartsCount?: number;
+    PartNumberMarker?: string; // in AWS SDK V2 it is number
+    NextPartNumberMarker?: string; // in AWS SDK V2 it is number
+    MaxParts?: number;
+    IsTruncated?: boolean;
+    Parts?: ObjectPart[];
+  }

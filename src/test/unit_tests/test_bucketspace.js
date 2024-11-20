@@ -1,5 +1,5 @@
 /* Copyright (C) 2020 NooBaa */
-/*eslint max-lines: ["error", 2200]*/
+/*eslint max-lines: ["error", 2500]*/
 /*eslint max-lines-per-function: ["error", 1300]*/
 /*eslint max-statements: ["error", 80, { "ignoreTopLevelFunctions": true }]*/
 'use strict';
@@ -12,14 +12,20 @@ const util = require('util');
 const http = require('http');
 const mocha = require('mocha');
 const assert = require('assert');
+const http_utils = require('../../util/http_utils');
 const config = require('../../../config');
 const fs_utils = require('../../util/fs_utils');
+const fetch = require('node-fetch');
+const P = require('../../util/promise');
+const cloud_utils = require('../../util/cloud_utils');
+const SensitiveString = require('../../util/sensitive_string');
+const S3Error = require('../../../src/endpoint/s3/s3_errors').S3Error;
 const test_utils = require('../system_tests/test_utils');
 const { stat, open } = require('../../util/nb_native')().fs;
 const { get_process_fs_context } = require('../../util/native_fs_utils');
 const { TYPES } = require('../../manage_nsfs/manage_nsfs_constants');
 const ManageCLIError = require('../../manage_nsfs/manage_nsfs_cli_errors').ManageCLIError;
-const { TMP_PATH, is_nc_coretest, get_coretest_path, invalid_nsfs_root_permissions,
+const { TMP_PATH, IS_GPFS, is_nc_coretest, get_coretest_path, invalid_nsfs_root_permissions,
     generate_s3_policy, create_fs_user_by_platform, delete_fs_user_by_platform, get_new_buckets_path_by_test_env,
     generate_s3_client, exec_manage_cli, generate_anon_s3_client, generate_nsfs_account } = require('../system_tests/test_utils');
 const nc_mkm = require('../../manage_nsfs/nc_master_key_manager').get_instance();
@@ -37,7 +43,7 @@ coretest.setup({});
 let CORETEST_ENDPOINT;
 const inspect = (x, max_arr = 5) => util.inspect(x, { colors: true, depth: null, maxArrayLength: max_arr });
 
-const DEFAULT_FS_CONFIG = get_process_fs_context();
+const DEFAULT_FS_CONFIG = get_process_fs_context(IS_GPFS ? 'GPFS' : '');
 const new_account_params = {
     has_login: false,
     s3_access: true,
@@ -147,6 +153,7 @@ mocha.describe('bucket operations - namespace_fs', function() {
         }
     });
     mocha.it('export other dir as bucket - and update bucket path to original bucket path', async function() {
+        this.timeout(600000); // eslint-disable-line no-invalid-this
         const obj_nsr = { resource: nsr, path: bucket_path };
         const other_obj_nsr = { resource: nsr, path: other_bucket_path };
         // give read and write permission to owner
@@ -188,6 +195,7 @@ mocha.describe('bucket operations - namespace_fs', function() {
     });
 
     mocha.it('list buckets without uid, gid', async function() {
+        this.timeout(600000); // eslint-disable-line no-invalid-this
         // Give s3_owner access to the required buckets
         const generated = generate_s3_policy(EMAIL, first_bucket, ['s3:*']);
         await rpc_client.bucket.put_bucket_policy({ name: first_bucket, policy: generated.policy });
@@ -576,11 +584,13 @@ mocha.describe('bucket operations - namespace_fs', function() {
         const s3_xattr = {}; // invalid xattr won't return on s3 head object
         await tmpfile.replacexattr(DEFAULT_FS_CONFIG, fs_xattr);
         const xattr_res = (await tmpfile.stat(DEFAULT_FS_CONFIG)).xattr;
+        //filter unrelated xattr added by operating system
+        const xattr_res_filtered = _.pickBy(xattr_res, (val, name) => name.startsWith("user."));
         await tmpfile.close(DEFAULT_FS_CONFIG);
 
         const head_res = await s3_client.headObject({ Bucket: bucket, Key: key });
         assert.deepStrictEqual(head_res.Metadata, s3_xattr);
-        assert.deepStrictEqual(fs_xattr, xattr_res);
+        assert.deepStrictEqual(fs_xattr, xattr_res_filtered);
         const get_res = await s3_client.getObject({ Bucket: bucket, Key: key });
         assert.deepStrictEqual(get_res.Metadata, s3_xattr);
         await s3_client.deleteObject({ Bucket: bucket, Key: key });
@@ -599,11 +609,13 @@ mocha.describe('bucket operations - namespace_fs', function() {
         const s3_xattr = { 'key1.2.3': encoded_xattr };
         await tmpfile.replacexattr(DEFAULT_FS_CONFIG, fs_xattr);
         const xattr_res = (await tmpfile.stat(DEFAULT_FS_CONFIG)).xattr;
+        //filter unrelated xattr added by operating system
+        const xattr_res_filtered = _.pickBy(xattr_res, (val, name) => name.startsWith("user."));
         await tmpfile.close(DEFAULT_FS_CONFIG);
 
         const head_res = await s3_client.headObject({ Bucket: bucket, Key: key });
         assert.deepStrictEqual(head_res.Metadata, s3_xattr);
-        assert.deepStrictEqual(fs_xattr, xattr_res);
+        assert.deepStrictEqual(fs_xattr, xattr_res_filtered);
         const get_res = await s3_client.getObject({ Bucket: bucket, Key: key });
         assert.deepStrictEqual(get_res.Metadata, s3_xattr);
         await s3_client.deleteObject({ Bucket: bucket, Key: key });
@@ -818,6 +830,7 @@ mocha.describe('bucket operations - namespace_fs', function() {
     });
 
     mocha.it('delete bucket with uid, gid - bucket is empty', async function() {
+        this.timeout(600000); // eslint-disable-line no-invalid-this
         const res = await s3_correct_uid_default_nsr.deleteBucket({ Bucket: bucket_name + '-s3' });
         console.log(inspect(res));
     });
@@ -924,6 +937,7 @@ mocha.describe('bucket operations - namespace_fs', function() {
         }
     });
     mocha.it('delete bucket with uid, gid - bucket is empty', async function() {
+        this.timeout(600000); // eslint-disable-line no-invalid-this
         // Give s3_correct_uid_default_nsr access to the required buckets
         await Promise.all(
             [bucket_name + '-other1', bucket_name]
@@ -1148,6 +1162,7 @@ mocha.describe('nsfs account configurations', function() {
         await fs_utils.folder_delete(tmp_fs_root1);
     });
     mocha.it('export dir as a bucket', async function() {
+        this.timeout(600000); // eslint-disable-line no-invalid-this
         await rpc_client.pool.create_namespace_resource({
             name: nsr1,
             nsfs_config: {
@@ -1628,6 +1643,7 @@ mocha.describe('list buckets - namespace_fs', async function() {
     });
 
     mocha.it('account1 - all accounts are allowed to list bucket1', async function() {
+        this.timeout(50000); // eslint-disable-line no-invalid-this
         // allow all accounts to list bucket1
         const public_bucket = accounts.account1.bucket;
         const bucket_policy = generate_s3_policy('*', public_bucket, ['s3:ListBucket']);
@@ -1666,6 +1682,7 @@ mocha.describe('list buckets - namespace_fs', async function() {
     });
 
     mocha.it('account2 - set allow only account1 list bucket2, account1/account2 can list bucket2 but account3 cant', async function() {
+        this.timeout(50000); // eslint-disable-line no-invalid-this
         const bucket2 = accounts.account2.bucket;
         const account_name = 'account1';
         // on NC the account identifier is account name, and on containerized it's the account's email
@@ -2114,3 +2131,129 @@ async function delete_anonymous_account(accounts_dir_path, account_config_path) 
     console.log('Anonymous account Deleted');
 }
 
+mocha.describe('Presigned URL tests', function() {
+    this.timeout(50000); // eslint-disable-line no-invalid-this
+    const nsr = 'presigned_url_nsr';
+    const account_name = 'presigned_url_account';
+    const fs_path = path.join(TMP_PATH, 'presigned_url_tests/');
+    const presigned_url_bucket = 'presigned-url-bucket';
+    const presigned_url_object = 'presigned-url-object.txt';
+    const presigned_body = 'presigned_body';
+    let s3_client;
+    let access_key;
+    let secret_key;
+    CORETEST_ENDPOINT = coretest.get_http_address();
+    let valid_default_presigned_url;
+    let presigned_url_params;
+
+    mocha.before(async function() {
+        await fs_utils.create_fresh_path(fs_path);
+        await rpc_client.pool.create_namespace_resource({ name: nsr, nsfs_config: { fs_root_path: fs_path } });
+        const new_buckets_path = is_nc_coretest ? fs_path : '/';
+        const nsfs_account_config = {
+            uid: process.getuid(), gid: process.getgid(), new_buckets_path, nsfs_only: true
+        };
+        const account_params = { ...new_account_params, email: `${account_name}@noobaa.io`, name: account_name, default_resource: nsr, nsfs_account_config };
+        const res = await rpc_client.account.create_account(account_params);
+        access_key = res.access_keys[0].access_key;
+        secret_key = res.access_keys[0].secret_key;
+        s3_client = generate_s3_client(access_key.unwrap(), secret_key.unwrap(), CORETEST_ENDPOINT);
+        await s3_client.createBucket({ Bucket: presigned_url_bucket });
+        await s3_client.putObject({ Bucket: presigned_url_bucket, Key: presigned_url_object, Body: presigned_body });
+
+        presigned_url_params = {
+            bucket: new SensitiveString(presigned_url_bucket),
+            key: presigned_url_object,
+            endpoint: CORETEST_ENDPOINT,
+            access_key: access_key,
+            secret_key: secret_key
+        };
+        valid_default_presigned_url = cloud_utils.get_signed_url(presigned_url_params);
+    });
+
+    mocha.after(async function() {
+        if (!is_nc_coretest) return;
+        await s3_client.deleteObject({ Bucket: presigned_url_bucket, Key: presigned_url_object });
+        await s3_client.deleteBucket({ Bucket: presigned_url_bucket });
+        await rpc_client.account.delete_account({ email: `${account_name}@noobaa.io` });
+        await fs_utils.folder_delete(fs_path);
+    });
+
+    it('fetch valid presigned URL - 604800 seconds - epoch expiry - should return object data', async () => {
+        const data = await fetchData(valid_default_presigned_url);
+        assert.equal(data, presigned_body);
+    });
+
+    it('fetch valid presigned URL - 604800 seconds - should return object data - with valid date + expiry in seconds', async () => {
+        const now = new Date();
+        const valid_url_with_date = valid_default_presigned_url + '&X-Amz-Date=' + now.toISOString() + '&X-Amz-Expires=' + 604800;
+        const data = await fetchData(valid_url_with_date);
+        assert.equal(data, presigned_body);
+    });
+
+    it('fetch invalid presigned URL - 604800 seconds - epoch expiry + with future date', async () => {
+        const now = new Date();
+        // Add one hour (3600000 milliseconds)
+        const one_hour_in_ms = 60 * 60 * 1000;
+        const one_hour_from_now = new Date(now.getTime() + one_hour_in_ms);
+        const future_presigned_url = valid_default_presigned_url + '&X-Amz-Date=' + one_hour_from_now.toISOString();
+        const expected_err = new S3Error(S3Error.RequestNotValidYet);
+        await assert_throws_async(fetchData(future_presigned_url), expected_err.message);
+    });
+
+    it('fetch invalid presigned URL - 604800 expiry seconds + with future date', async () => {
+        const now = new Date();
+        // Add one hour (3600000 milliseconds)
+        const one_hour_in_ms = 60 * 60 * 1000;
+        const one_hour_from_now = new Date(now.getTime() + one_hour_in_ms);
+        const future_presigned_url = valid_default_presigned_url + '&X-Amz-Date=' + one_hour_from_now.toISOString() + '&X-Amz-Expires=' + 604800;
+        const expected_err = new S3Error(S3Error.RequestNotValidYet);
+        await assert_throws_async(fetchData(future_presigned_url), expected_err.message);
+    });
+
+    it('fetch invalid presigned URL - 604800 seconds - epoch expiry - URL expired', async () => {
+        const expired_presigned_url = cloud_utils.get_signed_url(presigned_url_params, 1);
+        // wait for 2 seconds before fetching the url
+        await P.delay(2000);
+        const expected_err = new S3Error(S3Error.RequestExpired);
+        await assert_throws_async(fetchData(expired_presigned_url), expected_err.message);
+    });
+
+    it('fetch invalid presigned URL - 604800 expiry seconds - URL expired', async () => {
+        const now = new Date();
+        const expired_presigned_url = cloud_utils.get_signed_url(presigned_url_params, 1) + '&X-Amz-Date=' + now.toISOString() + '&X-Amz-Expires=' + 1;
+        // wait for 2 seconds before fetching the url
+        await P.delay(2000);
+        const expected_err = new S3Error(S3Error.RequestExpired);
+        await assert_throws_async(fetchData(expired_presigned_url), expected_err.message);
+    });
+
+    it('fetch invalid presigned URL - expiry expoch - expire in bigger than limit', async () => {
+        const invalid_expiry = 604800 + 10;
+        const invalid_expiry_presigned_url = cloud_utils.get_signed_url(presigned_url_params, invalid_expiry);
+        const expected_err = new S3Error(S3Error.AuthorizationQueryParametersError);
+        await assert_throws_async(fetchData(invalid_expiry_presigned_url), expected_err.message);
+    });
+
+    it('fetch invalid presigned URL - expire in bigger than limit', async () => {
+        const now = new Date();
+        const invalid_expiry = 604800 + 10;
+        const invalid_expiry_presigned_url = cloud_utils.get_signed_url(presigned_url_params, invalid_expiry) + '&X-Amz-Date=' + now.toISOString() + '&X-Amz-Expires=' + invalid_expiry;
+        const expected_err = new S3Error(S3Error.AuthorizationQueryParametersError);
+        await assert_throws_async(fetchData(invalid_expiry_presigned_url), expected_err.message);
+    });
+});
+
+async function fetchData(presigned_url) {
+    const response = await fetch(presigned_url, { agent: new http.Agent({ keepAlive: false }) });
+    let data;
+    if (!response.ok) {
+        data = (await response.text()).trim();
+        const err_json = (await http_utils.parse_xml_to_js(data)).Error;
+        const err = new Error(err_json.Message);
+        err.code = err_json.Code;
+        throw err;
+    }
+    data = await response.text();
+    return data.trim();
+}

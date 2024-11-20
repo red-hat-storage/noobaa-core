@@ -23,6 +23,7 @@ const os = require('os');
 const fs = require('fs');
 const util = require('util');
 const minimist = require('minimist');
+const { ConfigFS } = require('../sdk/config_fs');
 
 if (process.env.LOCAL_MD_SERVER === 'true') {
     require('../server/system_services/system_store').get_instance({ standalone: true });
@@ -39,14 +40,12 @@ const BucketSpaceSimpleFS = require('../sdk/bucketspace_simple_fs');
 const BucketSpaceFS = require('../sdk/bucketspace_fs');
 const SensitiveString = require('../util/sensitive_string');
 const endpoint_stats_collector = require('../sdk/endpoint_stats_collector');
-const path = require('path');
-const json_utils = require('../util/json_utils');
 //const { RPC_BUFFERS } = require('../rpc');
-const pkg = require('../../package.json');
 const AccountSDK = require('../sdk/account_sdk');
 const AccountSpaceFS = require('../sdk/accountspace_fs');
 const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
 const { set_debug_level } = require('../manage_nsfs/manage_nsfs_cli_utils');
+const { NCUpgradeManager } = require('../upgrade/nc_upgrade_manager');
 
 const HELP = `
 Help:
@@ -122,7 +121,7 @@ function print_usage() {
 let nsfs_config_root;
 
 class NsfsObjectSDK extends ObjectSDK {
-    constructor(fs_root, fs_config, account, versioning, config_root) {
+    constructor(fs_root, fs_config, account, versioning, config_root, nsfs_system) {
         // const rpc_client_hooks = new_rpc_client_hooks();
         // rpc_client_hooks.account.read_account_by_access_key = async ({ access_key }) => {
         //     if (access_key) {
@@ -153,6 +152,7 @@ class NsfsObjectSDK extends ObjectSDK {
         this.nsfs_account = account;
         this.nsfs_versioning = versioning;
         this.nsfs_namespaces = {};
+        this.nsfs_system = nsfs_system;
         if (!config_root) {
             this._get_bucket_namespace = bucket_name => this._simple_get_single_bucket_namespace(bucket_name);
             this.load_requesting_account = auth_req => this._simple_load_requesting_account(auth_req);
@@ -240,38 +240,11 @@ class NsfsAccountSDK extends AccountSDK {
     }
 }
 
-async function init_nsfs_system(config_root) {
-    const system_data_path = path.join(config_root, 'system.json');
-    const system_data = new json_utils.JsonFileWrapper(system_data_path);
-
-    const data = await system_data.read();
-    const hostname = os.hostname();
-    // If the system data already exists, we should not create it again
-    if (data?.[hostname]?.current_version) return;
-
-    try {
-        await system_data.update({
-            ...data,
-            [hostname]: {
-                current_version: pkg.version,
-                upgrade_history: {
-                    successful_upgrades: [],
-                    last_failure: undefined
-                }
-            }
-        });
-        console.log('created NSFS system data with version: ', pkg.version);
-    } catch (err) {
-        const msg = 'failed to create NSFS system data due to - ' + err.message;
-        const error = new Error(msg);
-        console.error(msg, err);
-        throw error;
-    }
-}
-
+/* eslint-disable max-statements */
 async function main(argv = minimist(process.argv.slice(2))) {
     try {
         config.DB_TYPE = 'none';
+        config.EVENT_LOGGING_ENABLED = true;
         config.NSFS_VERSIONING_ENABLED = true;
         // when using data buckets on noobaa standalone we should set it to true
         config.ENABLE_OBJECT_IO_SEMAPHORE_MONITOR = false;
@@ -348,7 +321,18 @@ async function main(argv = minimist(process.argv.slice(2))) {
             nsfs_config_root,
         });
 
-        if (!simple_mode) await init_nsfs_system(nsfs_config_root);
+        let system_data;
+        if (!simple_mode) {
+            // Do not move this function - we need to create/update RPM changes before starting the endpoint
+            const config_fs = new ConfigFS(nsfs_config_root);
+            system_data = await config_fs.get_system_config_file({ silent_if_missing: true });
+            if (system_data && system_data[os.hostname()]) {
+                const nc_upgrade_manager = new NCUpgradeManager(config_fs);
+                await nc_upgrade_manager.update_rpm_upgrade();
+            } else {
+                system_data = await config_fs.init_nc_system();
+            }
+        }
 
         const endpoint = require('../endpoint/endpoint');
         await endpoint.main({
@@ -360,7 +344,7 @@ async function main(argv = minimist(process.argv.slice(2))) {
             forks,
             nsfs_config_root,
             init_request_sdk: (req, res) => {
-                req.object_sdk = new NsfsObjectSDK(fs_root, fs_config, account, versioning, nsfs_config_root);
+                req.object_sdk = new NsfsObjectSDK(fs_root, fs_config, account, versioning, nsfs_config_root, system_data);
                 req.account_sdk = new NsfsAccountSDK(fs_root, fs_config, account, nsfs_config_root);
             }
         });

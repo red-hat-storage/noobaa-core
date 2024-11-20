@@ -176,6 +176,7 @@ module.exports = {
                     content_type: { type: 'string' },
                     content_encoding: { type: 'string' },
                     size: { type: 'integer' },
+                    seq: { type: 'integer' },
                 }
             },
             auth: { system: ['admin', 'user'] }
@@ -653,6 +654,7 @@ module.exports = {
                     deleted_delete_marker: { type: 'boolean' },
                     created_version_id: { type: 'string' },
                     created_delete_marker: { type: 'boolean' },
+                    seq: { type: 'integer' },
                 }
             },
             auth: { system: ['admin', 'user'] }
@@ -690,6 +692,7 @@ module.exports = {
                         deleted_delete_marker: { type: 'boolean' },
                         created_version_id: { type: 'string' },
                         created_delete_marker: { type: 'boolean' },
+                        seq: { type: 'integer' },
                         err_code: {
                             type: 'string',
                             enum: ['AccessDenied', 'InternalError']
@@ -1148,6 +1151,9 @@ module.exports = {
                     },
                     limit: {
                         type: 'integer'
+                    },
+                    reply_objects: {
+                        type: 'boolean'
                     }
                 }
             },
@@ -1156,6 +1162,12 @@ module.exports = {
                 properties: {
                     num_objects_deleted: {
                         type: 'integer'
+                    },
+                    deleted_objects: {
+                        type: 'array',
+                        items: {
+                            $ref: '#/definitions/object_info'
+                        }
                     }
                 }
             },

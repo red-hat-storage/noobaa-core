@@ -12,7 +12,7 @@ const P = require('../../util/promise');
 const fs_utils = require('../../util/fs_utils');
 const nb_native = require('../../util/nb_native');
 const size_utils = require('../../util/size_utils');
-const { TMP_PATH, is_nc_coretest, set_path_permissions_and_owner, generate_nsfs_account, get_new_buckets_path_by_test_env,
+const { TMP_PATH, IS_GPFS, is_nc_coretest, set_path_permissions_and_owner, generate_nsfs_account, get_new_buckets_path_by_test_env,
     invalid_nsfs_root_permissions, generate_s3_client, get_coretest_path } = require('../system_tests/test_utils');
 const { get_process_fs_context } = require('../../util/native_fs_utils');
 
@@ -26,8 +26,9 @@ const XATTR_VERSION_ID = XATTR_INTERNAL_NOOBAA_PREFIX + 'version_id';
 const XATTR_DELETE_MARKER = XATTR_INTERNAL_NOOBAA_PREFIX + 'delete_marker';
 const NULL_VERSION_ID = 'null';
 const HIDDEN_VERSIONS_PATH = '.versions';
+const NSFS_FOLDER_OBJECT_NAME = '.folder';
 
-const DEFAULT_FS_CONFIG = get_process_fs_context();
+const DEFAULT_FS_CONFIG = get_process_fs_context(IS_GPFS ? 'GPFS' : '');
 let CORETEST_ENDPOINT;
 
 const tmp_fs_root = path.join(TMP_PATH, 'test_bucket_namespace_fs_versioning');
@@ -75,6 +76,7 @@ mocha.describe('bucketspace namespace_fs - versioning', function() {
     const suspended_dir1_versions_path = path.join(suspended_full_path, dir1, '.versions/');
 
     const dir_path_nested = 'photos/animals/January/';
+    const dir_path_complete = 'animal/mammals/dog/';
     const nested_key_level3 = path.join(dir_path_nested, 'cat.jpeg');
 
     mocha.before(async function() {
@@ -338,6 +340,21 @@ mocha.describe('bucketspace namespace_fs - versioning', function() {
                     res_version_ids.add(version_id);
                 }
                 assert.deepEqual(res_version_ids, res_put_version_ids);
+            });
+
+            // dir_content is not supported in versioning, but we want to make sure there are no errors
+            mocha.it('put object - versioning enabled - directory content', async function() {
+                await s3_uid6.putBucketVersioning({ Bucket: nested_keys_bucket_name, VersioningConfiguration: { MFADelete: 'Disabled', Status: 'Enabled' } });
+                const key_as_dir_content = '/a/b/c/';
+                const size = 4; // in the original issue the error started on the 3rd PUT of dir content
+                const res_put_object = [];
+                for (let i = 0; i < size; i++) {
+                    const res = await s3_uid6.putObject({ Bucket: nested_keys_bucket_name, Key: key_as_dir_content, Body: body1 });
+                    res_put_object.push(res);
+                }
+                assert(res_put_object.length === size);
+                const check_version_id_exists = res_put_object.every(res => res.VersionId !== undefined);
+                assert.ok(check_version_id_exists);
             });
         });
 
@@ -749,10 +766,30 @@ mocha.describe('bucketspace namespace_fs - versioning', function() {
 
         mocha.it('delete object - versioning enabled - nested key (more than 1 level) - delete inside directory', async function() {
             const res = await s3_uid6.deleteObject({ Bucket: nested_keys_bucket_name, Key: dir_path_nested });
-            assert.equal(res.DeleteMarker, true);
+            // object versioning is not enabled for dir, because of this no delete_marker.
+            assert.equal(res.DeleteMarker, undefined);
             const version_path_nested = path.join(nested_keys_full_path, dir_path_nested, HIDDEN_VERSIONS_PATH);
             const exist2 = await fs_utils.file_exists(version_path_nested);
             assert.ok(exist2);
+        });
+
+        mocha.it('delete object - versioning enabled - nested key (more than 1 level)- delete partial directory', async function() {
+            const parital_nested_directory = dir_path_complete.slice(0, -1); // the directory without the last slash
+            const folder_path_nested = path.join(nested_keys_full_path, dir_path_complete, NSFS_FOLDER_OBJECT_NAME);
+            const body_of_copied_key = 'make the lemon lemonade';
+            await s3_uid6.putObject({ Bucket: nested_keys_bucket_name, Key: dir_path_complete, Body: body_of_copied_key });
+            await fs_utils.file_must_exist(folder_path_nested);
+            await s3_uid6.deleteObject({ Bucket: nested_keys_bucket_name, Key: parital_nested_directory });
+            await fs_utils.file_must_exist(folder_path_nested);
+        });
+
+        mocha.it('delete object - versioning enabled - nested key (more than 1 level)- delete complete directory', async function() {
+            const res = await s3_uid6.deleteObject({ Bucket: nested_keys_bucket_name, Key: dir_path_complete });
+            // object versioning is not enabled for dir, because of this no delete_marker.
+            assert.equal(res.DeleteMarker, undefined);
+            const folder_path_nested = path.join(nested_keys_full_path, dir_path_complete, NSFS_FOLDER_OBJECT_NAME);
+            await fs_utils.file_must_not_exist(folder_path_nested);
+            await fs_utils.file_must_not_exist(path.join(nested_keys_full_path, dir_path_complete));
         });
     });
 
@@ -948,6 +985,115 @@ mocha.describe('bucketspace namespace_fs - versioning', function() {
             assert.equal(res.TagSet.length, 0);
         });
     });
+
+    mocha.describe('get object attributes', function() {
+        const key = 'my-key-att';
+        let version_id;
+
+        mocha.before(async function() {
+            await s3_uid6.putBucketVersioning({ Bucket: bucket_name, VersioningConfiguration: { MFADelete: 'Disabled', Status: 'Enabled' } });
+            const res_put = await s3_uid6.putObject({ Bucket: bucket_name, Key: key, Body: body1 });
+            await s3_uid6.putObject({ Bucket: bucket_name, Key: key, Body: body1 });
+            version_id = res_put.VersionId;
+        });
+
+        mocha.it("get object attributes - attributes (only ETag)", async function() {
+            const res = await s3_uid6.getObjectAttributes({
+                Bucket: bucket_name,
+                Key: key,
+                VersionId: version_id,
+                ObjectAttributes: ['ETag'],
+            });
+            assert.ok(res.$metadata.httpStatusCode === 200);
+            assert.ok(res.ETag !== undefined);
+            assert.ok(res.VersionId === version_id);
+            assert.ok(res.LastModified !== undefined);
+            // was not send in ObjectAttributes
+            assert.ok(res.StorageClass === undefined);
+            assert.ok(res.ObjectSize === undefined);
+        });
+
+        mocha.it("get object attributes - attributes (only StorageClass)", async function() {
+            const res = await s3_uid6.getObjectAttributes({
+                Bucket: bucket_name,
+                Key: key,
+                VersionId: version_id,
+                ObjectAttributes: ['StorageClass'],
+            });
+            assert.ok(res.$metadata.httpStatusCode === 200);
+            assert.ok(res.StorageClass === 'STANDARD');
+            assert.ok(res.VersionId === version_id);
+            assert.ok(res.LastModified !== undefined);
+            // was not send in ObjectAttributes
+            assert.ok(res.ETag === undefined);
+            assert.ok(res.ObjectSize === undefined);
+        });
+
+        mocha.it("get object attributes - attributes (only ObjectSize)", async function() {
+            const res = await s3_uid6.getObjectAttributes({
+                Bucket: bucket_name,
+                Key: key,
+                VersionId: version_id,
+                ObjectAttributes: ['ObjectSize'],
+            });
+            assert.ok(res.$metadata.httpStatusCode === 200);
+            assert.ok(res.ObjectSize === body1.length);
+            assert.ok(res.VersionId === version_id);
+            assert.ok(res.LastModified !== undefined);
+            // was not send in ObjectAttributes
+            assert.ok(res.ETag === undefined);
+            assert.ok(res.StorageClass === undefined);
+        });
+
+        mocha.it("get object attributes - attributes (all 3 supported attributes)", async function() {
+            const res = await s3_uid6.getObjectAttributes({
+                Bucket: bucket_name,
+                Key: key,
+                VersionId: version_id,
+                ObjectAttributes: ['ETag', 'ObjectSize', 'StorageClass'],
+            });
+            assert.ok(res.$metadata.httpStatusCode === 200);
+            assert.ok(res.ETag !== undefined);
+            assert.ok(res.ObjectSize === body1.length);
+            assert.ok(res.StorageClass === 'STANDARD');
+            assert.ok(res.VersionId === version_id);
+            assert.ok(res.LastModified !== undefined);
+        });
+
+        mocha.it("get object attributes - should fail - with invalid attribute", async function() {
+            try {
+                await s3_uid6.getObjectAttributes({
+                    Bucket: bucket_name,
+                    Key: key,
+                    VersionId: version_id,
+                    ObjectAttributes: ['non-existing-attribute'],
+                });
+            } catch (err) {
+                assert.strictEqual(err.$metadata.httpStatusCode, 400);
+                assert.strictEqual(err.Code, 'InvalidArgument');
+            }
+        });
+
+        mocha.it("get object attributes - check version-id header", async function() {
+            s3_uid6.middlewareStack.add(
+                next => async args => {
+                  const result = await next(args);
+                  result.output.$metadata.headers = result.response.headers;
+                  return result;
+                }
+              );
+
+            const res = await s3_uid6.getObjectAttributes({
+                Bucket: bucket_name,
+                Key: key,
+                VersionId: version_id,
+                ObjectAttributes: ['ETag', 'ObjectSize', 'StorageClass'],
+            });
+            assert.ok(res.$metadata.httpStatusCode === 200);
+            assert.equal(res.$metadata.headers['x-amz-version-id'], version_id);
+        });
+    });
+
 
     // dm = delete marker
     mocha.describe('delete object latest - versioning suspended', function() {
@@ -2913,6 +3059,20 @@ mocha.describe('bucketspace namespace_fs - versioning', function() {
                 assert.ok(err.$response.headers['x-amz-delete-marker'] === 'true', 'Should have x-amz-delete-marker header with value true');
                 // In AWS CLI it looks:
                 // An error occurred (MethodNotAllowed) when calling the GetObject operation: The specified method is not allowed against this resource.
+            }
+        });
+
+        mocha.it('get object attributes, with version enabled, version id specified delete marker - should throw error with code 405', async function() {
+            try {
+                await s3_client.getObjectAttributes({Bucket: bucket_name, Key: en_version_key, VersionId: versionID_1, ObjectAttributes: ['ETag']});
+                assert.fail('Should fail');
+            } catch (err) {
+                assert.strictEqual(err.$metadata.httpStatusCode, 405);
+                assert.strictEqual(err.Code, 'MethodNotAllowed');
+                assert.ok(err.$response.headers['last-modified'] !== undefined, 'Should have last-modified header');
+                assert.ok(err.$response.headers['x-amz-delete-marker'] === 'true', 'Should have x-amz-delete-marker header with value true');
+                // In AWS CLI it looks:
+                // An error occurred (MethodNotAllowed) when calling the GetObjectAttributes operation: The specified method is not allowed against this resource.
             }
         });
     });

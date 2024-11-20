@@ -38,6 +38,9 @@ const base64_regex = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{
 
 const X_NOOBAA_AVAILABLE_STORAGE_CLASSES = 'x-noobaa-available-storage-classes';
 
+const OBJECT_ATTRIBUTES = Object.freeze(['ETag', 'Checksum', 'ObjectParts', 'StorageClass', 'ObjectSize']);
+const OBJECT_ATTRIBUTES_UNSUPPORTED = Object.freeze(['Checksum', 'ObjectParts']);
+
  /**
  * get_default_object_owner returns bucket_owner info if exists
  * else it'll return the default owner
@@ -311,7 +314,7 @@ function set_response_object_md(res, object_md) {
     if (storage_class !== STORAGE_CLASS_STANDARD) {
         res.setHeader('x-amz-storage-class', storage_class);
     }
-    if (object_md.restore_status) {
+    if (object_md.restore_status?.ongoing || object_md.restore_status?.expiry_time) {
         const restore = [`ongoing-request="${object_md.restore_status.ongoing}"`];
         if (!object_md.restore_status.ongoing && object_md.restore_status.expiry_time) {
             // Expiry time is in UTC format
@@ -322,6 +325,28 @@ function set_response_object_md(res, object_md) {
 
         res.setHeader('x-amz-restore', restore);
     }
+}
+
+/** set_response_headers_get_object_attributes is based on set_response_object_md
+ * and serves get_object_attributes
+ * @param {nb.S3Request} req
+ * @param {nb.S3Response} res
+ * @param {object} reply
+ * @param {string} version_id 
+ */
+function set_response_headers_get_object_attributes(req, res, reply, version_id) {
+    if (version_id) {
+        res.setHeader('x-amz-version-id', version_id);
+        if (reply.delete_marker) {
+            res.setHeader('x-amz-delete-marker', 'true');
+        }
+    }
+    if (reply.last_modified_time) {
+        res.setHeader('Last-Modified', time_utils.format_http_header_date(new Date(reply.last_modified_time)));
+    } else {
+        res.setHeader('Last-Modified', time_utils.format_http_header_date(new Date(reply.create_time)));
+    }
+    set_encryption_response_headers(req, res, reply.encryption);
 }
 
 /**
@@ -724,6 +749,42 @@ function parse_restore_request_days(req) {
     return days;
 }
 
+/**
+ * cont_tok_to_key_marker takes an encoded string and decodes it.
+ * cont_tok is the token which represents the next item in
+ * the list which some API returns to user in parts.
+ * @param {string} cont_tok
+ * @returns {string}
+ */
+function cont_tok_to_key_marker(cont_tok) {
+    if (!cont_tok) return;
+    try {
+        const b = Buffer.from(cont_tok, 'base64');
+        const j = JSON.parse(b.toString());
+        return j.key;
+    } catch (err) {
+        throw new S3Error(S3Error.InvalidArgument);
+    }
+}
+
+/**
+ * key_marker_to_cont_tok takes a string and returns an encoded
+ * string. key_marker is the token which represents the next item in
+ * the list which some API returns to user in parts.
+ * @param {string} key_marker
+ * @param {array} objects_arr
+ * @param {boolean} is_truncated
+ * @returns {string}
+ */
+
+function key_marker_to_cont_tok(key_marker, objects_arr, is_truncated) {
+    if (!key_marker && !is_truncated) return;
+    // next marker is the key marker we got or the key of the last item in the objects list.
+    const next_marker = key_marker || (objects_arr && objects_arr.length > 0 ? objects_arr[objects_arr.length - 1].key : undefined);
+    const j = JSON.stringify({ key: next_marker });
+    return Buffer.from(j).toString('base64');
+}
+
 exports.STORAGE_CLASS_STANDARD = STORAGE_CLASS_STANDARD;
 exports.STORAGE_CLASS_GLACIER = STORAGE_CLASS_GLACIER;
 exports.STORAGE_CLASS_GLACIER_IR = STORAGE_CLASS_GLACIER_IR;
@@ -738,6 +799,7 @@ exports.parse_part_number = parse_part_number;
 exports.parse_copy_source = parse_copy_source;
 exports.format_copy_source = format_copy_source;
 exports.set_response_object_md = set_response_object_md;
+exports.set_response_headers_get_object_attributes = set_response_headers_get_object_attributes;
 exports.parse_storage_class = parse_storage_class;
 exports.parse_storage_class_header = parse_storage_class_header;
 exports.parse_encryption = parse_encryption;
@@ -763,3 +825,8 @@ exports.parse_version_id = parse_version_id;
 exports.get_object_owner = get_object_owner;
 exports.get_default_object_owner = get_default_object_owner;
 exports.set_response_supported_storage_classes = set_response_supported_storage_classes;
+exports.cont_tok_to_key_marker = cont_tok_to_key_marker;
+exports.key_marker_to_cont_tok = key_marker_to_cont_tok;
+exports.parse_sse_c = parse_sse_c;
+exports.OBJECT_ATTRIBUTES = OBJECT_ATTRIBUTES;
+exports.OBJECT_ATTRIBUTES_UNSUPPORTED = OBJECT_ATTRIBUTES_UNSUPPORTED;

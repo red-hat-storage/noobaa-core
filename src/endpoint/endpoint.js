@@ -43,6 +43,7 @@ const { NamespaceMonitor } = require('../server/bg_services/namespace_monitor');
 const { SemaphoreMonitor } = require('../server/bg_services/semaphore_monitor');
 const prom_reporting = require('../server/analytic_services/prometheus_reporting');
 const { PersistentLogger } = require('../util/persistent_logger');
+const { get_notification_logger } = require('../util/notifications_util');
 const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
 const cluster = /** @type {import('node:cluster').Cluster} */ (
     /** @type {unknown} */ (require('node:cluster'))
@@ -65,6 +66,7 @@ dbg.log0('endpoint: replacing old umask: ', old_umask.toString(8), 'with new uma
  *  sts_sdk?: StsSDK;
  *  virtual_hosts?: readonly string[];
  *  bucket_logger?: PersistentLogger;
+ *  notification_logger?: PersistentLogger;
  * }} EndpointRequest
  */
 
@@ -100,6 +102,7 @@ async function create_https_server(ssl_cert_info, honorCipherOrder, endpoint_han
 /* eslint-disable max-statements */
 async function main(options = {}) {
     let bucket_logger;
+    let notification_logger;
     try {
         // setting process title needed for letting GPFS to identify the noobaa endpoint processes see issue #8039.
         if (config.ENDPOINT_PROCESS_TITLE) {
@@ -136,6 +139,11 @@ async function main(options = {}) {
                 locking: 'SHARED',
                 poll_interval: config.NSFS_GLACIER_LOGS_POLL_INTERVAL,
             });
+
+        notification_logger = config.NOTIFICATION_LOG_DIR && get_notification_logger(
+            'SHARED', //shared locking for endpoitns
+            undefined, //use default namespace based on hostname
+            config.NSFS_GLACIER_LOGS_POLL_INTERVAL);
 
         process.on('warning', e => dbg.warn(e.stack));
 
@@ -174,7 +182,8 @@ async function main(options = {}) {
             init_request_sdk = create_init_request_sdk(rpc, internal_rpc_client, object_io);
         }
 
-        const endpoint_request_handler = create_endpoint_handler(init_request_sdk, virtual_hosts, /*is_sts?*/ false, bucket_logger);
+        const endpoint_request_handler = create_endpoint_handler(init_request_sdk, virtual_hosts, /*is_sts?*/ false,
+            bucket_logger, notification_logger);
         const endpoint_request_handler_sts = create_endpoint_handler(init_request_sdk, virtual_hosts, /*is_sts?*/ true);
 
         const ssl_cert_info = await ssl_utils.get_ssl_cert_info('S3', options.nsfs_config_root);
@@ -231,12 +240,15 @@ async function main(options = {}) {
         if (internal_rpc_client && config.NAMESPACE_MONITOR_ENABLED) {
             endpoint_stats_collector.instance().set_rpc_client(internal_rpc_client);
 
-            // Register a bg monitor on the endpoint
-            background_scheduler.register_bg_worker(new NamespaceMonitor({
-                name: 'namespace_fs_monitor',
-                client: internal_rpc_client,
-                should_monitor: nsr => Boolean(nsr.nsfs_config),
-            }));
+            //wait with monitoring until pod has started
+            setTimeout(() => {
+                // Register a bg monitor on the endpoint
+                background_scheduler.register_bg_worker(new NamespaceMonitor({
+                    name: 'namespace_fs_monitor',
+                    client: internal_rpc_client,
+                    should_monitor: nsr => Boolean(nsr.nsfs_config),
+                }));
+            }, 1000 * 60);
         }
 
         if (config.ENABLE_SEMAPHORE_MONITOR) {
@@ -263,7 +275,7 @@ async function main(options = {}) {
  * @param {readonly string[]} virtual_hosts
  * @returns {EndpointHandler}
  */
-function create_endpoint_handler(init_request_sdk, virtual_hosts, sts, logger) {
+function create_endpoint_handler(init_request_sdk, virtual_hosts, sts, logger, notification_logger) {
     const blob_rest_handler = process.env.ENDPOINT_BLOB_ENABLED === 'true' ? blob_rest : unavailable_handler;
     const lambda_rest_handler = config.DB_TYPE === 'mongodb' ? lambda_rest : unavailable_handler;
 
@@ -273,6 +285,7 @@ function create_endpoint_handler(init_request_sdk, virtual_hosts, sts, logger) {
         endpoint_utils.prepare_rest_request(req);
         req.virtual_hosts = virtual_hosts;
         if (logger) req.bucket_logger = logger;
+        if (notification_logger) req.notification_logger = notification_logger;
         init_request_sdk(req, res);
         if (req.url.startsWith('/2015-03-31/functions')) {
             return lambda_rest_handler(req, res);

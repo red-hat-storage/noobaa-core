@@ -877,12 +877,12 @@ class ObjectSDK {
     // BUCKET //
     ////////////
 
-    async list_buckets() {
+    async list_buckets(params = {}) {
         return this._call_op_and_update_stats({
             op_name: 'list_buckets',
             op_func: async () => {
                 const bs = this._get_bucketspace();
-                return bs.list_buckets(this);
+                return bs.list_buckets(params, this);
             },
         });
     }
@@ -1064,6 +1064,23 @@ class ObjectSDK {
             });
         }
     }
+
+    /////////////////////////
+    // BUCKET NOTIFICATION //
+    /////////////////////////
+
+    async put_bucket_notification(params) {
+        const bs = this._get_bucketspace();
+        const res = bs.put_bucket_notification(params);
+        bucket_namespace_cache.invalidate_key(params.bucket_name);
+        return res;
+    }
+
+    async get_bucket_notification(params) {
+        const { bucket } = await bucket_namespace_cache.get_with_cache({ sdk: this, name: params.bucket_name });
+        return bucket.notifications;
+    }
+
     ////////////////////
     //  OBJECT LOCK   //
     ////////////////////
@@ -1110,6 +1127,24 @@ class ObjectSDK {
         this._check_is_readonly_namespace(ns);
         return ns.put_object_acl(params, this);
     }
+
+    //////////////////////////
+    //  OBJECT ATTRIBUTES   //
+    //////////////////////////
+
+    async get_object_attributes(params) {
+        const ns = await this._get_bucket_namespace(params.bucket);
+        if (ns.get_object_attributes) {
+            return ns.get_object_attributes(params, this);
+          } else {
+            // fallback to calling get_object_md without attributes params
+            dbg.warn('namespace does not implement get_object_attributes action, fallback to read_object_md');
+            const md_params = { ...params };
+            delete md_params.attributes; // not part of the schema of read_object_md
+            return ns.read_object_md(md_params, this);
+          }
+    }
+
 }
 
 // EXPORT

@@ -1210,6 +1210,10 @@ module.exports = {
             wrapper: SensitiveString,
         },
 
+        continuation_token: {
+            wrapper: SensitiveString,
+        },
+
         port: {
             type: 'integer',
             minimum: 0,
@@ -1376,6 +1380,45 @@ module.exports = {
                 log_prefix: {
                     type: 'string',
                 },
+            }
+        },
+        bucket_notification: {
+            type: 'object',
+            required: ['Id', 'Connect'],
+            properties: {
+                Id: {
+                    type: 'string'
+                },
+                Connect: {
+                    type: 'string'
+                },
+                Events: {
+                    type: 'array',
+                    items: {
+                        type: 'string',
+                        enum: [
+                            's3:TestEvent',
+                            's3:ObjectCreated:*',
+                            's3:ObjectCreated:Put',
+                            's3:ObjectCreated:Post',
+                            's3:ObjectCreated:Copy',
+                            's3:ObjectCreated:CompleteMultipartUpload',
+                            's3:ObjectRemoved:*',
+                            's3:ObjectRemoved:Delete',
+                            's3:ObjectRemoved:DeleteMarkerCreated',
+                            's3:ObjectRestore:*',
+                            's3:ObjectRestore:Post',
+                            's3:ObjectRestore:Completed',
+                            's3:ObjectRestore:Delete',
+                            's3:ObjectTagging:*',
+                            's3:ObjectTagging:Put',
+                            's3:ObjectTagging:Delete',
+                            's3:LifecycleExpiration:*',
+                            's3:LifecycleExpiration:Delete',
+                            's3:LifecycleExpiration:DeleteMarkerCreated',
+                        ],
+                    }
+                }
             }
         }
     }

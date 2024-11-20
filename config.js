@@ -198,6 +198,22 @@ config.S3_RESTORE_REQUEST_MAX_DAYS = 30;
  */
 config.S3_RESTORE_REQUEST_MAX_DAYS_BEHAVIOUR = 'TRUNCATE';
 
+/**
+ * S3_MAX_KEY_LENGTH controls the maximum key length that will be accepted
+ * by NooBaa endpoints.
+ * 
+ * This value is 1024 bytes for S3 but the default is `Infinity`
+ */
+config.S3_MAX_KEY_LENGTH = Infinity;
+
+/**
+ * S3_MAX_BUCKET_NAME_LENGTH controls the maximum bucket name length that
+ * will be accepted by NooBaa endpoints.
+ * 
+ * This value is 63 bytes for S3 but the default is `Infinity`
+ */
+config.S3_MAX_BUCKET_NAME_LENGTH = Infinity;
+
 /////////////////////
 // SECRETS CONFIG  //
 /////////////////////
@@ -392,6 +408,9 @@ config.CHUNK_CODER_EC_PARITY_TYPE = 'cm256';
 config.CHUNK_CODER_EC_TOLERANCE_THRESHOLD = 2;
 config.CHUNK_CODER_EC_IS_DEFAULT = false;
 
+// DEDUP
+config.MIN_CHUNK_AGE_FOR_DEDUP = 60 * 60 * 1000; // 1 hour
+
 //////////////////////////
 // DEDUP INDEXER CONFIG //
 //////////////////////////
@@ -474,7 +493,7 @@ config.DEBUG_MODE_PERIOD = 10 * 60 * 1000; // 10 minutes for increased debug lev
 config.dbg_log_level = 0;
 config.DEBUG_FACILITY = 'LOG_LOCAL0';
 config.EVENT_FACILITY = 'LOG_LOCAL2';
-config.EVENT_LOGGING_ENABLED = true;
+config.EVENT_LOGGING_ENABLED = false; // should be changed in NC NSFS configuration
 config.EVENT_LEVEL = 5;
 
 config.LOG_TO_STDERR_ENABLED = true;
@@ -670,6 +689,12 @@ config.BUCKET_LOG_TYPE = process.env.GUARANTEED_LOGS_PATH ? 'PERSISTENT' : 'BEST
 config.PERSISTENT_BUCKET_LOG_DIR = process.env.GUARANTEED_LOGS_PATH;
 config.PERSISTENT_BUCKET_LOG_NS = 'bucket_logging';
 config.BUCKET_LOG_CONCURRENCY = 10;
+
+////////////////////////////////
+//      NOTIFICATIONS         //
+////////////////////////////////
+config.NOTIFICATION_LOG_NS = 'notification_logging';
+config.NOTIFICATION_LOG_DIR = process.env.NOTIFICATION_LOG_DIR;
 
 ///////////////////////////
 //      KEY ROTATOR      //
@@ -870,7 +895,7 @@ config.ENDPOINT_SSL_PORT = Number(process.env.ENDPOINT_SSL_PORT) || 6443;
 config.ENDPOINT_SSL_STS_PORT = Number(process.env.ENDPOINT_SSL_STS_PORT) || -1;
 config.ENDPOINT_SSL_IAM_PORT = Number(process.env.ENDPOINT_SSL_IAM_PORT) || -1;
 config.ALLOW_HTTP = false;
-// config files should allow access to the owner of the files 
+// config files should allow access to the owner of the files
 config.BASE_MODE_CONFIG_FILE = 0o600;
 config.BASE_MODE_CONFIG_DIR = 0o700;
 
@@ -895,6 +920,7 @@ config.NC_DISABLE_HEALTH_ACCESS_CHECK = false;
 config.NC_DISABLE_POSIX_MODE_ACCESS_CHECK = true;
 config.NC_DISABLE_SCHEMA_CHECK = false;
 
+config.ACCOUNTS_ID_CACHE_EXPIRY = 3 * 60 * 1000;
 ////////// GPFS //////////
 config.GPFS_DOWN_DELAY = 1000;
 
@@ -1053,10 +1079,10 @@ function _get_config_root() {
 }
 
 /**
- * validate_nc_master_keys_config validates the following - 
+ * validate_nc_master_keys_config validates the following -
  * 1. if type is file -
  *    1.1. no GET/PUT executables provided
- * 2. if type is executable - 
+ * 2. if type is executable -
  *    2.1. no file location provided
  *    2.2. GET & PUT executables exist and executables
  */

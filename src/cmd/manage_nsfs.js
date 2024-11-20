@@ -13,6 +13,7 @@ const cloud_utils = require('../util/cloud_utils');
 const native_fs_utils = require('../util/native_fs_utils');
 const mongo_utils = require('../util/mongo_utils');
 const SensitiveString = require('../util/sensitive_string');
+const { account_id_cache } = require('../sdk/accountspace_fs');
 const ManageCLIError = require('../manage_nsfs/manage_nsfs_cli_errors').ManageCLIError;
 const ManageCLIResponse = require('../manage_nsfs/manage_nsfs_cli_responses').ManageCLIResponse;
 const manage_nsfs_glacier = require('../manage_nsfs/manage_nsfs_glacier');
@@ -21,10 +22,12 @@ const noobaa_cli_diagnose = require('../manage_nsfs/diagnose');
 const noobaa_cli_upgrade = require('../manage_nsfs/upgrade');
 const { print_usage } = require('../manage_nsfs/manage_nsfs_help_utils');
 const { TYPES, ACTIONS, LIST_ACCOUNT_FILTERS, LIST_BUCKET_FILTERS, GLACIER_ACTIONS } = require('../manage_nsfs/manage_nsfs_constants');
-const { throw_cli_error, get_bucket_owner_account, write_stdout_response, get_boolean_or_string_value, has_access_keys, set_debug_level,
+const { throw_cli_error, get_bucket_owner_account_by_name,
+    write_stdout_response, get_boolean_or_string_value, has_access_keys, set_debug_level,
     is_name_update, is_access_key_update } = require('../manage_nsfs/manage_nsfs_cli_utils');
 const manage_nsfs_validations = require('../manage_nsfs/manage_nsfs_validations');
 const nc_mkm = require('../manage_nsfs/nc_master_key_manager').get_instance();
+const notifications_util = require('../util/notifications_util');
 
 let config_fs;
 
@@ -67,7 +70,9 @@ async function main(argv = minimist(process.argv.slice(2))) {
         } else if (type === TYPES.DIAGNOSE) {
             await noobaa_cli_diagnose.manage_diagnose_operations(action, user_input, config_fs);
         } else if (type === TYPES.UPGRADE) {
-            await noobaa_cli_upgrade.manage_upgrade_operations(action, config_fs);
+            await noobaa_cli_upgrade.manage_upgrade_operations(action, user_input, config_fs);
+        } else if (type === TYPES.NOTIFICATION) {
+            await notification_management();
         } else {
             throw_cli_error(ManageCLIError.InvalidType);
         }
@@ -98,8 +103,9 @@ async function fetch_bucket_data(action, user_input) {
         should_create_underlying_storage: action === ACTIONS.ADD ? false : undefined,
         new_name: user_input.new_name === undefined ? undefined : String(user_input.new_name),
         fs_backend: user_input.fs_backend === undefined ? config.NSFS_NC_STORAGE_BACKEND : String(user_input.fs_backend),
-        force_md5_etag: user_input.force_md5_etag === undefined || user_input.force_md5_etag === '' ? user_input.force_md5_etag : get_boolean_or_string_value(user_input.force_md5_etag)
-        };
+        force_md5_etag: user_input.force_md5_etag === undefined || user_input.force_md5_etag === '' ? user_input.force_md5_etag : get_boolean_or_string_value(user_input.force_md5_etag),
+        notifications: user_input.notifications
+    };
 
     if (user_input.bucket_policy !== undefined) {
         if (typeof user_input.bucket_policy === 'string') {
@@ -122,7 +128,7 @@ async function fetch_bucket_data(action, user_input) {
     //if we're updating the owner, needs to override owner in file with the owner from user input.
     //if we're adding a bucket, need to set its owner id field
     if ((action === ACTIONS.UPDATE && user_input.owner) || (action === ACTIONS.ADD)) {
-        const account = await get_bucket_owner_account(config_fs, String(user_input.owner));
+        const account = await get_bucket_owner_account_by_name(config_fs, String(user_input.owner));
         data.owner_account = account._id;
     }
 
@@ -194,7 +200,7 @@ async function get_bucket_status(data) {
  * @param {Object} data
  * @returns { Promise<{ code: typeof ManageCLIResponse.BucketUpdated, detail: Object }>} 
  */
-async function update_bucket(data) {
+async function update_bucket(data, user_input) {
     const cur_name = data.name;
     const new_name = data.new_name;
     const name_update = is_name_update(data);
@@ -202,6 +208,14 @@ async function update_bucket(data) {
     data = _.omit(data, cli_bucket_flags_to_remove);
 
     let parsed_bucket_data;
+
+    if (user_input.notifications) {
+        //notifications are tested before they can be updated
+        const test_notif_err = await notifications_util.test_notifications(data);
+        if (test_notif_err) {
+            throw_cli_error(ManageCLIError.InvalidArgument, "Failed to update notifications", test_notif_err);
+        }
+    }
     if (name_update) {
         parsed_bucket_data = await config_fs.create_bucket_config_file({ ...data, name: new_name });
         await config_fs.delete_bucket_config_file(cur_name);
@@ -269,7 +283,7 @@ async function bucket_management(action, user_input) {
     } else if (action === ACTIONS.STATUS) {
         response = await get_bucket_status(data);
     } else if (action === ACTIONS.UPDATE) {
-        response = await update_bucket(data);
+        response = await update_bucket(data, user_input);
     } else if (action === ACTIONS.DELETE) {
         const force = get_boolean_or_string_value(user_input.force);
         response = await delete_bucket(data, force);
@@ -597,8 +611,6 @@ async function list_config_files(type, wide, show_secrets, filters = {}) {
         entry_names = await config_fs.list_buckets();
     }
 
-    // temporary cache for mapping bucker owner_account (id) -> bucket_owner (name)
-    const bucket_owners_map = {};
     let config_files_list = await P.map_with_concurrency(10, entry_names, async entry_name => {
         if (wide || should_filter) {
             const data = type === TYPES.ACCOUNT ?
@@ -610,11 +622,7 @@ async function list_config_files(type, wide, show_secrets, filters = {}) {
             if (!wide) return { name: entry_name };
             if (type === TYPES.ACCOUNT) return _.omit(data, show_secrets ? [] : ['access_keys']);
             if (type === TYPES.BUCKET) {
-                data.bucket_owner = bucket_owners_map[data.owner_account];
-                if (!data.bucket_owner) {
-                    await set_bucker_owner(data);
-                    bucket_owners_map[data.owner_account] = data.bucket_owner;
-                }
+                await set_bucker_owner(data);
                 return data;
             }
         } else {
@@ -657,7 +665,12 @@ function get_access_keys(action, user_input) {
  * @param {object} bucket_data 
  */
 async function set_bucker_owner(bucket_data) {
-    const account_data = await config_fs.get_identity_by_id(bucket_data.owner_account, TYPES.ACCOUNT, { silent_if_missing: true});
+    let account_data;
+    try {
+        account_data = await account_id_cache.get_with_cache({ _id: bucket_data.owner_account, config_fs });
+    } catch (err) {
+        dbg.warn(`set_bucker_owner.couldn't find bucket owner data by id ${bucket_data.owner_account}`);
+    }
     bucket_data.bucket_owner = account_data?.name;
 }
 
@@ -703,6 +716,10 @@ async function manage_glacier_operations(action, argv) {
 
 async function logging_management() {
     await manage_nsfs_logging.export_bucket_logging(config_fs);
+}
+
+async function notification_management() {
+    new notifications_util.Notificator({fs_context: config_fs.fs_context}).process_notification_files();
 }
 
 exports.main = main;

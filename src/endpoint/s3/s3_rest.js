@@ -57,6 +57,7 @@ const OBJECT_SUB_RESOURCES = Object.freeze({
     'legal-hold': 'legal_hold',
     'retention': 'retention',
     'select': 'select',
+    'attributes': 'attributes',
 });
 
 let usage_report = new_usage_report();
@@ -243,9 +244,17 @@ async function authorize_request_policy(req) {
     if (is_system_owner) return;
 
     const is_owner = (function() {
+        // Containerized condition for bucket ownership
+        // 1. by bucket_claim_owner
+        // 2. by email
         if (account.bucket_claim_owner && account.bucket_claim_owner.unwrap() === req.params.bucket) return true;
+        // NC conditions for bucket ownership
+        // 1. by ID (when creating the bucket the owner is always an account) - comparison to ID which is unique
+        // 2. by name - account_identifier can be username which is not unique
+        //    to make sure it is only on accounts (account names are unique) we check there's no account's ownership
         if (owner_account && owner_account.id === account._id) return true;
-        if (account_identifier_name === bucket_owner.unwrap()) return true; // TODO: change it to root accounts after we will have the /users structure
+        // checked last on purpose (NC first checks the ID and then name for backward computability)
+        if (account.owner === undefined && account_identifier_name === bucket_owner.unwrap()) return true; // mutual check
         return false;
     }());
 
@@ -267,7 +276,7 @@ async function authorize_request_policy(req) {
             s3_policy, account_identifier_id, method, arn_path, req);
     }
 
-    if (!account_identifier_id || permission === "IMPLICIT_DENY") {
+    if ((!account_identifier_id || permission === "IMPLICIT_DENY") && account.owner === undefined) {
         permission = await s3_bucket_policy_utils.has_bucket_policy_permission(
             s3_policy, account_identifier_name, method, arn_path, req);
     }
@@ -288,6 +297,11 @@ async function authorize_anonymous_access(s3_policy, method, arn_path, req) {
     throw new S3Error(S3Error.AccessDenied);
 }
 
+/**
+ * _get_method_from_req parses the permission needed according to the bucket policy
+ * @param {nb.S3Request} req
+ * @returns {string|string[]}
+ */
 function _get_method_from_req(req) {
     const s3_op = s3_bucket_policy_utils.OP_NAME_TO_ACTION[req.op_name];
     if (!s3_op) {
@@ -354,6 +368,14 @@ function get_bucket_and_key(req) {
             key = suffix;
         }
     }
+
+    if (key?.length > config.S3_MAX_KEY_LENGTH) {
+        throw new S3Error(S3Error.KeyTooLongError);
+    }
+    if (bucket?.length > config.S3_MAX_BUCKET_NAME_LENGTH) {
+        throw new S3Error(S3Error.InvalidBucketName);
+    }
+
     return {
         bucket,
         // decode and replace hadoop _$folder$ in key
