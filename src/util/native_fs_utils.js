@@ -6,7 +6,7 @@ const fs = require('fs');
 const net = require('net');
 const path = require('path');
 const P = require('../util/promise');
-const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 const config = require('../../config');
 const RpcError = require('../rpc/rpc_error');
 const nb_native = require('../util/nb_native');
@@ -52,7 +52,7 @@ async function _create_path(dir, fs_context, dir_permissions = config.BASE_MODE_
 }
 
 async function _generate_unique_path(fs_context, tmp_dir_path) {
-    const rand_id = uuidv4();
+    const rand_id = crypto.randomUUID();
     const unique_temp_path = path.join(tmp_dir_path, 'lost+found', rand_id);
     await _make_path_dirs(unique_temp_path, fs_context);
     return unique_temp_path;
@@ -67,7 +67,7 @@ async function _generate_unique_path(fs_context, tmp_dir_path) {
  */
 // opens open_path on POSIX, and on GPFS it will open open_path parent folder
 async function open_file(fs_context, bucket_path, open_path, open_mode = config.NSFS_OPEN_READ_MODE,
-        file_permissions = config.BASE_MODE_FILE) {
+    file_permissions = config.BASE_MODE_FILE) {
     let retries = config.NSFS_MKDIR_PATH_RETRIES;
 
     const dir_path = path.dirname(open_path);
@@ -167,7 +167,7 @@ function _is_gpfs(fs_context) {
 
 async function safe_move(fs_context, src_path, dst_path, src_ver_info, gpfs_options, tmp_dir_path) {
     if (_is_gpfs(fs_context)) {
-        await safe_move_gpfs(fs_context, src_path, dst_path, gpfs_options, src_ver_info);
+        await safe_move_gpfs(fs_context, src_path, dst_path, gpfs_options);
     } else {
         await safe_move_posix(fs_context, src_path, dst_path, src_ver_info, tmp_dir_path);
     }
@@ -187,6 +187,20 @@ async function safe_unlink(fs_context, src_path, src_ver_info, gpfs_options, tmp
     }
 }
 
+async function safe_link(fs_context, src_path, dst_path, src_ver_info, gpfs_options) {
+    if (_is_gpfs(fs_context)) {
+        const { src_file = undefined, dst_file = undefined } = gpfs_options;
+        if (dst_file) {
+            await safe_link_gpfs(fs_context, dst_path, src_file, dst_file);
+        } else {
+            dbg.error(`safe_link: dst_file is ${dst_file}, cannot use it to call safe_link_gpfs`);
+            throw new Error(`dst_file is ${dst_file}, need a value to safe link GPFS`);
+        }
+    } else {
+        await safe_link_posix(fs_context, src_path, dst_path, src_ver_info);
+    }
+}
+
 // this function handles best effort of files move in posix file systems
 // 1. safe_link
 // 2. safe_unlink
@@ -199,15 +213,10 @@ async function safe_move_posix(fs_context, src_path, dst_path, src_ver_info, tmp
 // safe_link_posix links src_path to dst_path while verifing dst_path has the expected ino and mtimeNsBigint values
 // src_file exists on uploads (open mode = 'w' ) or deletions
 // on uploads (open mode 'wt') the dir_file is used as the link source
-async function safe_move_gpfs(fs_context, src_path, dst_path, gpfs_options, src_ver_info) {
-    const { src_file = undefined, dst_file = undefined, dir_file = undefined, should_unlink = false,
-        should_override = true } = gpfs_options;
+async function safe_move_gpfs(fs_context, src_path, dst_path, gpfs_options) {
+    const { src_file = undefined, dst_file = undefined, dir_file = undefined, should_unlink = false } = gpfs_options;
     dbg.log1('Namespace_fs.safe_move_gpfs', src_path, dst_path, dst_file, should_unlink);
-    if (should_override) {
-        await safe_link_gpfs(fs_context, dst_path, src_file || dir_file, dst_file);
-    } else {
-        await safe_link_posix(fs_context, src_path, dst_path, src_ver_info);
-    }
+    await safe_link_gpfs(fs_context, dst_path, src_file || dir_file, dst_file);
     if (should_unlink) await safe_unlink_gpfs(fs_context, src_path, src_file, dir_file);
 }
 
@@ -245,16 +254,17 @@ async function unlink_ignore_enoent(fs_context, to_delete_path) {
     try {
         await nb_native().fs.unlink(fs_context, to_delete_path);
     } catch (err) {
-        dbg.warn(`native_fs_utils.unlink_ignore_enoent unlink error: file path ${to_delete_path} error`, err);
-        if (err.code !== 'ENOENT') throw err;
-        dbg.warn(`native_fs_utils.unlink_ignore_enoent unlink: file ${to_delete_path} already deleted, ignoring..`);
+        dbg.warn(`native_fs_utils.unlink_ignore_enoent unlink error: file path ${to_delete_path} error`, err, err.code, err.code !== 'EISDIR');
+        if (err.code !== 'ENOENT' && err.code !== 'EISDIR') throw err;
+        dbg.warn(`native_fs_utils.unlink_ignore_enoent unlink: file ${to_delete_path} already deleted or key is pointing to dir, ignoring..`);
     }
 }
 
 // safe_link_gpfs links source_path to dest_path while verifing dest.fd
 async function safe_link_gpfs(fs_context, dst_path, src_file, dst_file) {
-    dbg.log1('Namespace_fs.safe_link_gpfs source_file:', src_file, src_file.fd, dst_file, dst_file && dst_file.fd);
-    await src_file.linkfileat(fs_context, dst_path, dst_file && dst_file.fd);
+    const should_not_override = !(dst_file && dst_file.fd);
+    dbg.log1('Namespace_fs.safe_link_gpfs source_file:', src_file, src_file.fd, dst_file, dst_file && dst_file.fd, should_not_override);
+    await src_file.linkfileat(fs_context, dst_path, dst_file && dst_file.fd, should_not_override);
 }
 
 // safe_unlink_gpfs unlinks to_delete_path while verifing to_delete_path.fd
@@ -272,11 +282,49 @@ async function safe_unlink_gpfs(fs_context, to_delete_path, to_delete_file, dir_
     }
 }
 
-function should_retry_link_unlink(is_gpfs, err) {
+function should_retry_link_unlink(err) {
     const should_retry_general = ['ENOENT', 'EEXIST', 'VERSION_MOVED', 'MISMATCH_VERSION'].includes(err.code);
     const should_retry_gpfs = [gpfs_link_unlink_retry_err, gpfs_unlink_retry_catch].includes(err.code);
     const should_retry_posix = [posix_link_retry_err, posix_unlink_retry_err].includes(err.message);
-    return should_retry_general || (is_gpfs ? should_retry_gpfs : should_retry_posix);
+    return should_retry_general || should_retry_gpfs || should_retry_posix;
+}
+
+/**
+ * stat_ignore_enoent unlinks a file and if recieved an ENOENT error it'll not fail
+ * @param {nb.NativeFSContext} fs_context
+ * @param {string} file_path
+ * @returns {Promise<nb.NativeFSStats>}
+ */
+async function stat_ignore_enoent(fs_context, file_path) {
+    try {
+        return await nb_native().fs.stat(fs_context, file_path);
+    } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+    }
+}
+
+/**
+ * stat_if_exists execute stat on entry_path and ignores on certain error codes.
+ * @param {nb.NativeFSContext} fs_context
+ * @param {string} entry_path
+ * @param {boolean} use_lstat
+ * @param {boolean} should_ignore_eacces
+ * @returns {Promise<nb.NativeFSStats | undefined>}
+ */
+async function stat_if_exists(fs_context, entry_path, use_lstat, should_ignore_eacces) {
+    try {
+        return await nb_native().fs.stat(fs_context, entry_path, { use_lstat });
+    } catch (err) {
+        // we might want to expand the error list due to permission/structure
+        // change (for example: ELOOP, ENAMETOOLONG) or other reason (EPERM) - need to be decided
+        if ((err.code === 'EACCES' && should_ignore_eacces) ||
+            err.code === 'ENOENT' || err.code === 'ENOTDIR') {
+            dbg.log0('stat_if_exists: Could not access file entry_path',
+                entry_path, 'error code', err.code, ', skipping...');
+        } else {
+            throw err;
+        }
+    }
 }
 
 ////////////////////////
@@ -295,10 +343,9 @@ function get_config_files_tmpdir() {
  * @param {string} config_data 
  */
 async function create_config_file(fs_context, schema_dir, config_path, config_data) {
-    const is_gpfs = _is_gpfs(fs_context);
-    const open_mode = is_gpfs ? 'wt' : 'w';
+    const open_mode = 'w';
+    let open_path;
     let upload_tmp_file;
-    let gpfs_dst_file;
     try {
         // validate config file doesn't exist
         try {
@@ -312,37 +359,30 @@ async function create_config_file(fs_context, schema_dir, config_path, config_da
         dbg.log1('create_config_file:: config_path:', config_path, 'config_data:', config_data, 'is_gpfs:', open_mode);
         // create config dir if it does not exist
         await _create_path(schema_dir, fs_context, config.BASE_MODE_CONFIG_DIR);
-        // when using GPFS open dst file as soon as possible for later linkat validation
-        if (is_gpfs) gpfs_dst_file = await open_file(fs_context, schema_dir, config_path, 'w*', config.BASE_MODE_CONFIG_FILE);
 
         // open tmp file (in GPFS we open the parent dir using wt open mode)
         const tmp_dir_path = path.join(schema_dir, get_config_files_tmpdir());
-        let open_path = is_gpfs ? config_path : await _generate_unique_path(fs_context, tmp_dir_path);
+        open_path = await _generate_unique_path(fs_context, tmp_dir_path);
         upload_tmp_file = await open_file(fs_context, schema_dir, open_path, open_mode, config.BASE_MODE_CONFIG_FILE);
 
         // write tmp file data
         await upload_tmp_file.writev(fs_context, [Buffer.from(config_data)], 0);
 
-        // moving tmp file to config path atomically
-        let src_stat;
-        let gpfs_options;
-        if (is_gpfs) {
-            gpfs_options = { dst_file: gpfs_dst_file, dir_file: upload_tmp_file };
-            // open path in GPFS is the parent dir 
-            open_path = schema_dir;
-        } else {
-            src_stat = await nb_native().fs.stat(fs_context, open_path);
-        }
-        dbg.log1('create_config_file:: moving from:', open_path, 'to:', config_path, 'is_gpfs=', is_gpfs);
+        dbg.log1('create_config_file:: moving from:', open_path, 'to:', config_path);
 
-        await safe_move(fs_context, open_path, config_path, src_stat, gpfs_options, tmp_dir_path);
+        await nb_native().fs.link(fs_context, open_path, config_path);
 
         dbg.log1('create_config_file:: done', config_path);
     } catch (err) {
         dbg.error('create_config_file:: error', err);
         throw err;
     } finally {
-        await finally_close_files(fs_context, [upload_tmp_file, gpfs_dst_file]);
+        await finally_close_files(fs_context, [upload_tmp_file]);
+        try {
+            await nb_native().fs.unlink(fs_context, open_path);
+        } catch (error) {
+            dbg.log0(`create_config_file:: unlink tmp file failed with error ${error}, skipping`);
+        }
     }
 }
 
@@ -438,7 +478,7 @@ async function update_config_file(fs_context, schema_dir, config_path, config_da
                 break;
             } catch (err) {
                 retries -= 1;
-                if (retries <= 0 || !should_retry_link_unlink(is_gpfs, err)) throw err;
+                if (retries <= 0 || !should_retry_link_unlink(err)) throw err;
                 dbg.warn(`native_fs_utils.update_config_file: Retrying failed move to dest retries=${retries}` +
                     ` source_path=${open_path} dest_path=${config_path}`, err);
                 if (is_gpfs) {
@@ -506,12 +546,18 @@ async function get_fs_context(nsfs_account_config, fs_backend) {
     if (nsfs_account_config.distinguished_name) {
         account_ids_by_dn = await get_user_by_distinguished_name({ distinguished_name: nsfs_account_config.distinguished_name });
     }
-    return {
+    const fs_context = {
         uid: (account_ids_by_dn && account_ids_by_dn.uid) ?? nsfs_account_config.uid,
         gid: (account_ids_by_dn && account_ids_by_dn.gid) ?? nsfs_account_config.gid,
         warn_threshold_ms: config.NSFS_WARN_THRESHOLD_MS,
         backend: fs_backend
     };
+
+    //napi does not accepts undefined value for an array. if supplemental_groups is undefined don't include this property at all
+    if (nsfs_account_config.supplemental_groups) {
+        fs_context.supplemental_groups = nsfs_account_config.supplemental_groups;
+    }
+    return fs_context;
 }
 
 function validate_bucket_creation(params) {
@@ -617,12 +663,14 @@ async function folder_delete(dir, fs_context, is_temp, silent_if_missing) {
  * read_file reads file and returns the parsed file data as object
  * @param {nb.NativeFSContext} fs_context
  * @param {string} _path 
+ * @param {{parse_json?: Boolean}} [options]
  * @return {Promise<object>} 
  */
-async function read_file(fs_context, _path) {
+async function read_file(fs_context, _path, options = {}) {
     const { data } = await nb_native().fs.readFile(fs_context, _path);
-    const data_parsed = JSON.parse(data.toString());
-    return data_parsed;
+    let data_parsed;
+    if (options?.parse_json) data_parsed = JSON.parse(data.toString());
+    return data_parsed || data.toString();
 }
 
 
@@ -650,6 +698,7 @@ function get_bucket_tmpdir_full_path(bucket_path, bucket_id) {
 /**
  * translate_error_codes we translate FS error codes to rpc_codes (strings)
  * and add the rpc_code property to the original error object
+ * default rpc_code is internal error
  * @param {object} err
  * @param {('OBJECT'|'BUCKET'|'USER'|'ACCESS_KEY')} entity
  */
@@ -661,8 +710,26 @@ function translate_error_codes(err, entity) {
     if (err.code === 'EEXIST') err.rpc_code = `${entity}_ALREADY_EXISTS`;
     if (err.code === 'EPERM' || err.code === 'EACCES') err.rpc_code = 'UNAUTHORIZED';
     if (err.code === 'IO_STREAM_ITEM_TIMEOUT') err.rpc_code = 'IO_STREAM_ITEM_TIMEOUT';
-    if (err.code === 'INTERNAL_ERROR') err.rpc_code = 'INTERNAL_ERROR';
+    if (err.code === 'INTERNAL_ERROR' || !err.rpc_code) err.rpc_code = 'INTERNAL_ERROR';
     return err;
+}
+
+/**
+ * lock_and_run acquires a fcntl and calls the given callback after
+ * acquiring the lock
+ * @param {nb.NativeFSContext} fs_context 
+ * @param {string} lock_path
+ * @param {Function} cb 
+ */
+async function lock_and_run(fs_context, lock_path, cb) {
+    const lockfd = await nb_native().fs.open(fs_context, lock_path, 'w');
+
+    try {
+        await lockfd.fcntllock(fs_context, 'EXCLUSIVE');
+        await cb();
+    } finally {
+        await lockfd.close(fs_context);
+    }
 }
 
 exports.get_umasked_mode = get_umasked_mode;
@@ -673,10 +740,14 @@ exports.open_file = open_file;
 exports.copy_bytes = copy_bytes;
 exports.finally_close_files = finally_close_files;
 exports.get_user_by_distinguished_name = get_user_by_distinguished_name;
+exports.get_config_files_tmpdir = get_config_files_tmpdir;
+exports.stat_ignore_enoent = stat_ignore_enoent;
+exports.stat_if_exists = stat_if_exists;
 
 exports._is_gpfs = _is_gpfs;
 exports.safe_move = safe_move;
 exports.safe_unlink = safe_unlink;
+exports.safe_link = safe_link;
 exports.safe_move_posix = safe_move_posix;
 exports.safe_move_gpfs = safe_move_gpfs;
 exports.safe_link_posix = safe_link_posix;
@@ -703,3 +774,5 @@ exports.get_bucket_tmpdir_full_path = get_bucket_tmpdir_full_path;
 exports.get_bucket_tmpdir_name = get_bucket_tmpdir_name;
 exports.entity_enum = entity_enum;
 exports.translate_error_codes = translate_error_codes;
+
+exports.lock_and_run = lock_and_run;

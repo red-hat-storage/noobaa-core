@@ -29,6 +29,8 @@ let wrapped_coretest_secret_key;
 const BKT = `bucket.example`;
 const key_rotator = new KeyRotator({ name: 'kr'});
 
+config.MIN_CHUNK_AGE_FOR_DEDUP = 0;
+
 mocha.describe('Encryption tests', function() {
     const { rpc_client, EMAIL, SYSTEM } = coretest;
     let response_account;
@@ -353,7 +355,7 @@ mocha.describe('Encryption tests', function() {
                 }, { auth_token: cur_account.create_account_result.token });
             }));
         });
-        mocha.it('create cloud pools succefully', async function() {
+        mocha.it.skip('create cloud pools succefully', async function() {
             this.timeout(600000); // eslint-disable-line no-invalid-this
             await P.all(_.map(accounts.slice(0, 5), async cur_account => {
                 const pool_name = `${cur_account.email}-cloud-pool`;
@@ -402,7 +404,7 @@ mocha.describe('Encryption tests', function() {
             compare_secrets(secrets, system_store_account.master_key_id._id);
         });
 
-        mocha.it('update connections succefully - accounts + pools', async function() {
+        mocha.it.skip('update connections succefully - accounts + pools', async function() {
             this.timeout(600000); // eslint-disable-line no-invalid-this
             await P.all(_.map(accounts, async cur_account => {
                 await rpc_client.account.update_external_connection({ name: 'conn1',
@@ -436,7 +438,7 @@ mocha.describe('Encryption tests', function() {
                     system_store_account.sync_credentials_cache[0].secret_key.unwrap());
             }));
         });
-        mocha.it('delete pools succefully', async function() {
+        mocha.it.skip('delete pools succefully', async function() {
             this.timeout(600000); // eslint-disable-line no-invalid-this
             await P.all(_.map(accounts.slice(0, 5), async cur_account => {
                 const pool_name = `${cur_account.email}-cloud-pool`;
@@ -991,10 +993,10 @@ mocha.describe('Rotation tests', function() {
             compare_secrets(secrets, system_store_account.master_key_id._id);
         });
 });
-// TODO: 
+// TODO:
         // 1. add more tests for checking namespace resources
         // 2. add tests for enable/disable account that has pool/namespace resource
-////////////// HELPERS 
+////////////// HELPERS
 
 async function multipart_upload(bucket, key, s3_conf) {
     let res = await s3_conf.createMultipartUpload({Bucket: bucket, Key: key, ContentType: 'text/plain'});

@@ -1,5 +1,5 @@
 /* Copyright (C) 2016 NooBaa */
-/*eslint max-lines-per-function: ["error", 800]*/
+/*eslint max-lines-per-function: ['error', 800]*/
 'use strict';
 
 const fs = require('fs');
@@ -90,7 +90,7 @@ const account_user2 = {
         secret_key: 's-abcdefghijklmn123457'
     }],
     nsfs_account_config: {
-        distinguished_name: "root",
+        distinguished_name: 'root',
         new_buckets_path: new_buckets_path_user2,
     },
     creation_date: '2023-10-30T04:46:33.815Z',
@@ -431,16 +431,17 @@ mocha.describe('bucketspace_fs', function() {
                 assert.ok(err.rpc_code === 'UNAUTHORIZED');
             }
         });
-        mocha.it('should fail - create bucket by iam account', async function() {
-            // currently we do not allow IAM accounts to create buckets
-            try {
-                const param = { name: test_bucket_iam_account };
-                const dummy_object_sdk_for_iam_account = make_dummy_object_sdk_for_account(dummy_object_sdk, account_iam_user1);
-                await bucketspace_fs.create_bucket(param, dummy_object_sdk_for_iam_account);
-                assert.fail('should have failed with UNAUTHORIZED bucket creation');
-            } catch (err) {
-                assert.ok(err.rpc_code === 'UNAUTHORIZED');
-            }
+        mocha.it('create bucket by iam account', async function() {
+            const param = { name: test_bucket_iam_account };
+            const dummy_object_sdk_for_iam_account = make_dummy_object_sdk_for_account(dummy_object_sdk, account_iam_user1);
+            await bucketspace_fs.create_bucket(param, dummy_object_sdk_for_iam_account);
+            const bucket_config_path = get_config_file_path(CONFIG_SUBDIRS.BUCKETS, param.name);
+            const stat1 = await fs.promises.stat(bucket_config_path);
+            assert.equal(stat1.nlink, 1);
+
+            // check that the owner is the account (not the user)
+            const bucket = await bucketspace_fs.read_bucket_sdk_info(param);
+            assert.ok(bucket.owner_account.id === account_iam_user1.owner);
         });
         mocha.after(async function() {
             await fs_utils.folder_delete(`${new_buckets_path}/${test_bucket}`);
@@ -489,34 +490,33 @@ mocha.describe('bucketspace_fs', function() {
             await create_bucket(test_bucket);
         });
         mocha.it('list buckets', async function() {
-            const objects = await bucketspace_fs.list_buckets(dummy_object_sdk);
+            const objects = await bucketspace_fs.list_buckets({}, dummy_object_sdk);
             assert.equal(objects.buckets.length, 1);
             assert.equal(objects.buckets[0].name.unwrap(), 'bucket1');
         });
         mocha.it('list buckets - only for bucket with config', async function() {
             await fs_utils.create_path(`${new_buckets_path}/${test_bucket_invalid}`);
-            const objects = await bucketspace_fs.list_buckets(dummy_object_sdk);
+            const objects = await bucketspace_fs.list_buckets({}, dummy_object_sdk);
             assert.equal(objects.buckets.length, 1);
         });
         mocha.it('list buckets - iam accounts', async function() {
             // root account created a bucket
-
             // account_iam_user2 can list the created bucket (the implicit policy - same root account)
             const dummy_object_sdk_for_iam_account = make_dummy_object_sdk_for_account(dummy_object_sdk, account_iam_user1);
-            const res = await bucketspace_fs.list_buckets(dummy_object_sdk_for_iam_account);
+            const res = await bucketspace_fs.list_buckets({}, dummy_object_sdk_for_iam_account);
             assert.equal(res.buckets.length, 1);
             assert.equal(res.buckets[0].name.unwrap(), test_bucket);
 
             // account_iam_user2 can list the created bucket (the implicit policy - same root account)
             const dummy_object_sdk_for_iam_account2 = make_dummy_object_sdk_for_account(dummy_object_sdk, account_iam_user2);
-            const res2 = await bucketspace_fs.list_buckets(dummy_object_sdk_for_iam_account2);
+            const res2 = await bucketspace_fs.list_buckets({}, dummy_object_sdk_for_iam_account2);
             assert.equal(res2.buckets.length, 1);
             assert.equal(res2.buckets[0].name.unwrap(), test_bucket);
         });
         mocha.it('list buckets - different account', async function() {
             // another user created a bucket (account_user3 cannot list it)
             const dummy_object_sdk_for_iam_account = make_dummy_object_sdk_for_account(dummy_object_sdk, account_user3);
-            const res = await bucketspace_fs.list_buckets(dummy_object_sdk_for_iam_account);
+            const res = await bucketspace_fs.list_buckets({}, dummy_object_sdk_for_iam_account);
             assert.equal(res.buckets.length, 0);
         });
         mocha.it('list buckets - different account with bucket policy (principal by name)', async function() {
@@ -526,7 +526,7 @@ mocha.describe('bucketspace_fs', function() {
             const param = { name: test_bucket, policy: policy };
             await bucketspace_fs.put_bucket_policy(param);
             const dummy_object_sdk_for_iam_account = make_dummy_object_sdk_for_account(dummy_object_sdk, account_user4);
-            const res = await bucketspace_fs.list_buckets(dummy_object_sdk_for_iam_account);
+            const res = await bucketspace_fs.list_buckets({}, dummy_object_sdk_for_iam_account);
             assert.equal(res.buckets.length, 1);
             assert.equal(res.buckets[0].name.unwrap(), test_bucket);
         });
@@ -537,7 +537,7 @@ mocha.describe('bucketspace_fs', function() {
             const param = { name: test_bucket, policy: policy };
             await bucketspace_fs.put_bucket_policy(param);
             const dummy_object_sdk_for_iam_account = make_dummy_object_sdk_for_account(dummy_object_sdk, account_user4);
-            const res = await bucketspace_fs.list_buckets(dummy_object_sdk_for_iam_account);
+            const res = await bucketspace_fs.list_buckets({}, dummy_object_sdk_for_iam_account);
             assert.equal(res.buckets.length, 1);
             assert.equal(res.buckets[0].name.unwrap(), test_bucket);
         });
@@ -548,11 +548,11 @@ mocha.describe('bucketspace_fs', function() {
         });
         mocha.it('list buckets - validate creation_date', async function() {
             const expected_bucket_name = 'bucket1';
-            const objects = await bucketspace_fs.list_buckets(dummy_object_sdk);
+            const objects = await bucketspace_fs.list_buckets({}, dummy_object_sdk);
             assert.equal(objects.buckets.length, 1);
             assert.equal(objects.buckets[0].name.unwrap(), expected_bucket_name);
             const bucket_config_path = get_config_file_path(CONFIG_SUBDIRS.BUCKETS, expected_bucket_name);
-            const bucket_data = await read_file(process_fs_context, bucket_config_path);
+            const bucket_data = await read_file(process_fs_context, bucket_config_path, { parse_json: true });
             assert.equal(objects.buckets[0].creation_date, bucket_data.creation_date);
         });
     });
@@ -565,7 +565,7 @@ mocha.describe('bucketspace_fs', function() {
         mocha.it('delete_bucket with valid bucket name ', async function() {
             const param = { name: test_bucket };
             await bucketspace_fs.delete_bucket(param, dummy_object_sdk);
-            const objects = await bucketspace_fs.list_buckets(dummy_object_sdk);
+            const objects = await bucketspace_fs.list_buckets({}, dummy_object_sdk);
             assert.equal(objects.buckets.length, 0);
         });
         mocha.it('delete_bucket with invalid bucket name ', async function() {
@@ -581,7 +581,7 @@ mocha.describe('bucketspace_fs', function() {
             await create_bucket(param.name);
             const bucket_file_path = path.join(new_buckets_path, param.name, 'dummy.txt');
             await nb_native().fs.writeFile(ACCOUNT_FS_CONFIG, bucket_file_path,
-                Buffer.from(JSON.stringify("data")), {
+                Buffer.from(JSON.stringify('data')), {
                     mode: config.BASE_MODE_FILE,
                 });
             try {
@@ -628,7 +628,7 @@ mocha.describe('bucketspace_fs', function() {
 
             // account_iam_user1 can see the bucket in the list
             const dummy_object_sdk_for_account_iam_user1 = make_dummy_object_sdk_for_account(dummy_object_sdk, account_iam_user1);
-            const res = await bucketspace_fs.list_buckets(dummy_object_sdk_for_account_iam_user1);
+            const res = await bucketspace_fs.list_buckets({}, dummy_object_sdk_for_account_iam_user1);
             assert.ok(res.buckets.length > 0);
             assert.ok(res.buckets.some(bucket => bucket.name.unwrap() === test_bucket_iam_account));
 
@@ -676,28 +676,33 @@ mocha.describe('bucketspace_fs', function() {
         });
 
         mocha.it('delete_bucket with delete marker', async function() {
-            const versioning_sdk = make_versioning_object_sdk();
-            const param = { name: test_bucket_delete_marker };
-            await create_bucket(param.name);
-
-            await bucketspace_fs.set_bucket_versioning({ name: param.name, versioning: 'ENABLED' }, versioning_sdk);
-            const version_dir = path.join(new_buckets_path, param.name, '.versions');
-            await nb_native().fs.mkdir(ACCOUNT_FS_CONFIG, version_dir);
-
-            const versioned_path = path.join(version_dir, 'dummy_mtime-crkfjum9883k-ino-guu7');
-            await create_versioned_object(versioned_path, Buffer.from(JSON.stringify("data")), 'mtime-crkfjum9883k-ino-guu7', false);
-
-            const delete_marker_path = path.join(version_dir, 'dummy_mtime-crkfjx1hui2o-ino-guu9');
-            const delete_marker_obj = await create_versioned_object(delete_marker_path, Buffer.from(JSON.stringify("data")), 'mtime-crkfjx1hui2o-ino-guu9', true);
-            const xattr_delete_marker = { [XATTR_DELETE_MARKER]: 'true' };
-            delete_marker_obj.replacexattr(DEFAULT_FS_CONFIG, xattr_delete_marker);
-
+            let delete_marker_fd;
             try {
-                await bucketspace_fs.delete_bucket(param, versioning_sdk);
-                assert.fail('should have failed with NOT EMPTY');
-            } catch (err) {
-                assert.strictEqual(err.rpc_code, 'NOT_EMPTY');
-                assert.equal(err.message, 'underlying directory has files in it');
+                const versioning_sdk = make_versioning_object_sdk();
+                const param = { name: test_bucket_delete_marker };
+                await create_bucket(param.name);
+
+                await bucketspace_fs.set_bucket_versioning({ name: param.name, versioning: 'ENABLED' }, versioning_sdk);
+                const version_dir = path.join(new_buckets_path, param.name, '.versions');
+                await nb_native().fs.mkdir(ACCOUNT_FS_CONFIG, version_dir);
+
+                const versioned_path = path.join(version_dir, 'dummy_mtime-crkfjum9883k-ino-guu7');
+                await create_versioned_object(versioned_path, Buffer.from(JSON.stringify('data')), 'mtime-crkfjum9883k-ino-guu7', false);
+
+                const delete_marker_path = path.join(version_dir, 'dummy_mtime-crkfjx1hui2o-ino-guu9');
+                delete_marker_fd = await create_versioned_object(delete_marker_path, Buffer.from(JSON.stringify('data')), 'mtime-crkfjx1hui2o-ino-guu9', true);
+                const xattr_delete_marker = { [XATTR_DELETE_MARKER]: 'true' };
+                delete_marker_fd.replacexattr(DEFAULT_FS_CONFIG, xattr_delete_marker);
+
+                try {
+                    await bucketspace_fs.delete_bucket(param, versioning_sdk);
+                    assert.fail('should have failed with NOT EMPTY');
+                } catch (err) {
+                    assert.strictEqual(err.rpc_code, 'NOT_EMPTY');
+                    assert.equal(err.message, 'underlying directory has files in it');
+                }
+            } finally {
+                if (delete_marker_fd) await delete_marker_fd.close(ACCOUNT_FS_CONFIG);
             }
         });
     });
@@ -710,7 +715,7 @@ mocha.describe('bucketspace_fs', function() {
             const param = { name: test_bucket, versioning: 'ENABLED' };
             await bucketspace_fs.set_bucket_versioning(param, dummy_object_sdk);
             const bucket_config_path = get_config_file_path(CONFIG_SUBDIRS.BUCKETS, param.name);
-            const bucket = await read_file(process_fs_context, bucket_config_path);
+            const bucket = await read_file(process_fs_context, bucket_config_path, { parse_json: true });
             assert.equal(bucket.versioning, 'ENABLED');
 
         });
@@ -964,6 +969,15 @@ async function create_bucket(bucket_name) {
     assert.equal(stat1.nlink, 1);
 }
 
+/**
+ * create_versioned_object creates a versioned object in the filesystem
+ * IMPORTANT - if return_fd is true, the file will not be closed and should be closed manually by the test
+ * @param {String} object_path 
+ * @param {Object} data 
+ * @param {String} version_id 
+ * @param {Boolean} return_fd 
+ * @returns {Promise<Void | nb.NativeFile>}
+ */
 async function create_versioned_object(object_path, data, version_id, return_fd) {
     console.log(object_path);
     const target_file = await nb_native().fs.open(ACCOUNT_FS_CONFIG, object_path, 'w+');

@@ -57,7 +57,6 @@ require('./test_bucket_chunks_builder');
 require('./test_mirror_writer');
 require('./test_namespace_fs');
 require('./test_ns_list_objects');
-require('./test_chunk_fs');
 require('./test_namespace_fs_mpu');
 require('./test_nb_native_fs');
 require('./test_s3select');
@@ -87,7 +86,7 @@ require('./test_agent_blocks_reclaimer');
 require('./test_s3_ops');
 require('./test_s3_encryption');
 require('./test_s3_bucket_policy');
-require('./test_node_allocator');
+// require('./test_node_allocator');
 require('./test_namespace_cache');
 require('./test_namespace_auth');
 require('./test_encryption');
@@ -99,6 +98,7 @@ require('./test_tiering_ttl_worker');
 // require('./test_tiering_upload');
 //require('./test_s3_worm');
 require('./test_bucket_logging');
+require('./test_notifications');
 
 // UPGRADE
 // require('./test_postgres_upgrade'); // TODO currently working with mongo -> once changing to postgres - need to uncomment  

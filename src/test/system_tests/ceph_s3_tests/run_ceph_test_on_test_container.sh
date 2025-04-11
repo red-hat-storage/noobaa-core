@@ -25,12 +25,20 @@ export JWT_SECRET=123456789
 export NOOBAA_ROOT_SECRET='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
 export LOCAL_MD_SERVER=true
 
+#The default max connections for postgres is 100. limit max clients to 10 per pool (per process). 
+export CONFIG_JS_POSTGRES_MD_MAX_CLIENTS=10
+export CONFIG_JS_POSTGRES_DEFAULT_MAX_CLIENTS=10
+
 export POSTGRES_HOST=${POSTGRES_HOST:-localhost}
 export MGMT_ADDR=wss://${NOOBAA_MGMT_SERVICE_HOST:-localhost}:${NOOBAA_MGMT_SERVICE_PORT:-5443}
 export BG_ADDR=wss://localhost:5445
 export HOSTED_AGENTS_ADDR=wss://localhost:5446
 
 export CEPH_TEST_LOGS_DIR=/logs/ceph-test-logs
+
+export CONFIG_JS_OBJECT_SDK_BUCKET_CACHE_EXPIRY_MS=0 # Needed for disabling cache for ceph cors test and maybe some more
+export CONFIG_JS_allow_anonymous_access_in_test=true # Needed for allowing anon access for tests using ACL='public-read-write'
+export CONFIG_JS_S3_CORS_DEFAULTS_ENABLED=false # Needed for disabling cors defaults for ceph cors test
 
 # ====================================================================================
 

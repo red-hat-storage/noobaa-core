@@ -3,22 +3,43 @@
 
 const fs = require('fs');
 const _ = require('lodash');
+const path = require('path');
 const http = require('http');
+const https = require('https');
 const P = require('../../util/promise');
-const os_utils = require('../../util/os_utils');
-const nb_native = require('../../util/nb_native');
-const native_fs_utils = require('../../util/native_fs_utils');
 const config = require('../../../config');
 const { S3 } = require('@aws-sdk/client-s3');
-const { NodeHttpHandler } = require("@smithy/node-http-handler");
-const path = require('path');
+const { IAMClient } = require('@aws-sdk/client-iam');
+const os_utils = require('../../util/os_utils');
+const fs_utils = require('../../util/fs_utils');
+const nb_native = require('../../util/nb_native');
 const { CONFIG_TYPES } = require('../../sdk/config_fs');
+const native_fs_utils = require('../../util/native_fs_utils');
+const { NodeHttpHandler } = require("@smithy/node-http-handler");
+
+const GPFS_ROOT_PATH = process.env.GPFS_ROOT_PATH;
+const IS_GPFS = !_.isUndefined(GPFS_ROOT_PATH);
+const TMP_PATH = get_tmp_path();
+const TEST_TIMEOUT = 60 * 1000;
+
+// NC CLI Constants
+const CLI_UNSET_EMPTY_STRING = "''";
 
 /**
  * TMP_PATH is a path to the tmp path based on the process platform
  * in contrast to linux, /tmp/ path on mac is a symlink to /private/tmp/
+ * on gpfs should point to GPFS file system. should create tmp dir on file system and pass it as process.env.GPFS_ROOT_PATH
  */
-const TMP_PATH = os_utils.IS_MAC ? '/private/tmp/' : '/tmp/';
+function get_tmp_path() {
+    if (os_utils.IS_MAC) {
+        return '/private/tmp/';
+    } else if (IS_GPFS) {
+        return GPFS_ROOT_PATH;
+    } else {
+        return '/tmp/';
+    }
+}
+
 
 /**
  * is_nc_coretest returns true when the test runs on NC env
@@ -33,7 +54,7 @@ const is_nc_coretest = process.env.NC_CORETEST === 'true';
  * @param {*} blocks 
  * @param {AWS.S3} s3 
  */
-function blocks_exist_on_cloud(need_to_exist, pool_id, bucket_name, blocks, s3) {
+async function blocks_exist_on_cloud(need_to_exist, pool_id, bucket_name, blocks, s3) {
     console.log('blocks_exist_on_cloud::', need_to_exist, pool_id, bucket_name);
     let isDone = true;
     // Time in seconds to wait, notice that it will only check once a second.
@@ -41,59 +62,60 @@ function blocks_exist_on_cloud(need_to_exist, pool_id, bucket_name, blocks, s3) 
     const MAX_RETRIES = 10 * 60;
     let wait_counter = 1;
 
-    return P.pwhile(
-            () => isDone,
-            () => Promise.allSettled(_.map(blocks, block => {
+    try {
+        while (isDone) {
+            const response = Promise.allSettled(_.map(blocks, block => {
                 console.log(`noobaa_blocks/${pool_id}/blocks_tree/${block.slice(block.length - 3)}.blocks/${block}`);
                 return s3.headObject({
                     Bucket: bucket_name,
                     Key: `noobaa_blocks/${pool_id}/blocks_tree/${block.slice(block.length - 3)}.blocks/${block}`
                 }).promise();
-            }))
-            .then(response => {
-                let condition_correct;
-                if (need_to_exist) {
-                    condition_correct = true;
-                    _.forEach(response, promise_result => {
-                        if (promise_result.status === 'rejected') {
-                            condition_correct = false;
-                        }
-                    });
+            }));
 
-                    if (condition_correct) {
-                        isDone = false;
-                    } else {
-                        wait_counter += 1;
-                        if (wait_counter >= MAX_RETRIES) {
-                            throw new Error('Blocks do not exist');
-                        }
-                        return P.delay(1000);
+            let condition_correct;
+            if (need_to_exist) {
+                condition_correct = true;
+                _.forEach(response, promise_result => {
+                    if (promise_result.status === 'rejected') {
+                        condition_correct = false;
                     }
+                });
+
+                if (condition_correct) {
+                    isDone = false;
                 } else {
-                    condition_correct = true;
-                    _.forEach(response, promise_result => {
-                        if (promise_result.status === 'fulfilled') {
-                            condition_correct = false;
-                        }
-                    });
-
-                    if (condition_correct) {
-                        isDone = false;
-                    } else {
-                        wait_counter += 1;
-                        if (wait_counter >= MAX_RETRIES) {
-                            throw new Error('Blocks still exist');
-                        }
-                        return P.delay(1000);
+                    wait_counter += 1;
+                    if (wait_counter >= MAX_RETRIES) {
+                        throw new Error('Blocks do not exist');
                     }
+                    await P.delay(1000);
                 }
-            })
-        )
-        .then(() => true)
-        .catch(err => {
-            console.error('blocks_exist_on_cloud::Final Error', err);
-            throw err;
-        });
+            } else {
+                condition_correct = true;
+                _.forEach(response, promise_result => {
+                    if (promise_result.status === 'fulfilled') {
+                        condition_correct = false;
+                    }
+                });
+
+                if (condition_correct) {
+                    isDone = false;
+                } else {
+                    wait_counter += 1;
+                    if (wait_counter >= MAX_RETRIES) {
+                        throw new Error('Blocks still exist');
+                    }
+                    await P.delay(1000);
+                }
+            }
+
+        }
+    } catch (err) {
+        console.error('blocks_exist_on_cloud::Final Error', err);
+        throw err;
+    }
+
+    return true;
 }
 
 async function create_hosts_pool(
@@ -198,17 +220,15 @@ function generate_s3_policy(principal, bucket, action) {
     return {
         policy: {
             Version: '2012-10-17',
-            Statement: [
-                {
-                    Effect: 'Allow',
-                    Principal: { AWS: [principal] },
-                    Action: action,
-                    Resource: [
-                        `arn:aws:s3:::${bucket}/*`,
-                        `arn:aws:s3:::${bucket}`
-                    ]
-                }
-            ]
+            Statement: [{
+                Effect: 'Allow',
+                Principal: { AWS: [principal] },
+                Action: action,
+                Resource: [
+                    `arn:aws:s3:::${bucket}/*`,
+                    `arn:aws:s3:::${bucket}`
+                ]
+            }]
         },
         params: {
             bucket,
@@ -319,7 +339,54 @@ async function delete_fs_user_by_platform(name) {
     }
 }
 
-/** 
+/**
+ * creates a new file system group. if user_name is define add it to the group
+ * @param {string} group_name
+ * @param {number} gid
+ * @param {string} [user_name]
+ */
+async function create_fs_group_by_platform(group_name, gid, user_name) {
+    if (process.platform === 'darwin') {
+        const create_group_cmd = `sudo dscl . create /Groups/${group_name} UserShell /bin/bash`;
+        const create_group_realname_cmd = `sudo dscl . create /Groups/${group_name} RealName ${group_name}`;
+        const create_group_gid_cmd = `sudo dscl . create /Groups/${group_name} gid ${gid}`;
+        await os_utils.exec(create_group_cmd, { return_stdout: true });
+        await os_utils.exec(create_group_realname_cmd, { return_stdout: true });
+        await os_utils.exec(create_group_gid_cmd, { return_stdout: true });
+        if (user_name) {
+            const add_user_to_group_cmd = `sudo dscl . append /Groups/${group_name} GroupMembership ${user_name}`;
+            await os_utils.exec(add_user_to_group_cmd, { return_stdout: true });
+        }
+
+    } else {
+        const create_group_cmd = `groupadd -g ${gid} ${group_name}`;
+        await os_utils.exec(create_group_cmd, { return_stdout: true });
+        if (user_name) {
+            const add_user_to_group_cmd = `usermod -a -G ${group_name} ${user_name}`;
+            await os_utils.exec(add_user_to_group_cmd, { return_stdout: true });
+        }
+    }
+}
+
+/**
+ * deletes a file system group. if force is true, delete the group even if its the primary group of a user
+ * @param {string} group_name
+ * @param {boolean} [force]
+ */
+async function delete_fs_group_by_platform(group_name, force = false) {
+    if (process.platform === 'darwin') {
+        const delete_group_cmd = `sudo dscl . -delete /Groups/${group_name}`;
+        const delete_group_home_cmd = `sudo rm -rf /Groups/${group_name}`;
+        await os_utils.exec(delete_group_cmd, { return_stdout: true });
+        await os_utils.exec(delete_group_home_cmd, { return_stdout: true });
+    } else {
+        const flags = force ? '-f' : '';
+        const delete_group_cmd = `groupdel ${flags} ${group_name}`;
+        await os_utils.exec(delete_group_cmd, { return_stdout: true });
+    }
+}
+
+/**
  * set_path_permissions_and_owner sets path permissions and owner and group
  * @param {string} p
  * @param {object} owner_options
@@ -341,6 +408,32 @@ async function set_path_permissions_and_owner(p, owner_options, permissions = 0o
  */
 function set_nc_config_dir_in_config(config_root) {
     config.NSFS_NC_CONF_DIR = config_root;
+}
+
+
+///////////////////////////////
+///     REDIRECT FILE      ////
+///////////////////////////////
+
+
+/**
+ * create_redirect_file will create the redirect file inside the default config directory,
+ * its content is a path to a custom config directory
+ * @returns {Promise<Void>}
+ */
+async function create_redirect_file(config_fs, custom_config_root_path) {
+    const redirect_file_path = path.join(config.NSFS_NC_DEFAULT_CONF_DIR, config.NSFS_NC_CONF_DIR_REDIRECT_FILE);
+    await nb_native().fs.writeFile(config_fs.fs_context, redirect_file_path, Buffer.from(custom_config_root_path));
+}
+
+/**
+ * delete_redirect_file will delete the redirect file inside the default config directory,
+ * WARNING - this will cause loosing of contact to the existing custom config directory
+ * @returns {Promise<Void>}
+ */
+async function delete_redirect_file(config_fs) {
+    const redirect_file_path = path.join(config.NSFS_NC_DEFAULT_CONF_DIR, config.NSFS_NC_CONF_DIR_REDIRECT_FILE);
+    await fs_utils.file_delete(redirect_file_path);
 }
 
 function generate_anon_s3_client(endpoint) {
@@ -373,6 +466,20 @@ function generate_s3_client(access_key, secret_key, endpoint) {
         endpoint
     });
 }
+
+function generate_iam_client(access_key, secret_key, endpoint) {
+    const httpsAgent = new https.Agent({ rejectUnauthorized: false }); // disable SSL certificate validation
+    return new IAMClient({
+        region: config.DEFAULT_REGION,
+        credentials: {
+            accessKeyId: access_key,
+            secretAccessKey: secret_key,
+        },
+        endpoint,
+        requestHandler: new NodeHttpHandler({ httpsAgent }),
+    });
+}
+
 /**
  * generate_nsfs_account generate an nsfs account and returns its credentials
  * if the admin flag is received (in the options object) the function will not create 
@@ -435,53 +542,111 @@ function get_new_buckets_path_by_test_env(new_buckets_full_path, new_buckets_dir
 /**
  * write_manual_config_file writes config file directly to the file system without using config FS
  * used for creating backward compatibility tests, invalid config files etc
+ * 1. if it's account - 
+ *    1.1. create identity directory /{config_dir_path}/identities/{id}/
+ * 2. create the config file - 
+ *    2.1. if it's a bucket - create it in /{config_dir_path}/buckets/{bucket_name}.json
+ *    2.2. if it's an account - create it in /{config_dir_path}/identities/{id}/identity.json
+ * 3. if it's an account and symlink_name is true - create /{config_dir_path}/accounts_by_name/{account_name}.symlink -> /{config_dir_path}/identities/{id}/identity.json
+ * 4. if it's an account and symlink_access_key is true and there is access key in the account config - create /{config_dir_path}/access_keys/{access_key}.symlink -> /{config_dir_path}/identities/{id}/identity.json
  * @param {String} type 
  * @param {import('../../sdk/config_fs').ConfigFS} config_fs
  * @param {Object} config_data 
  * @param {String} [invalid_str]
+ * @param {{symlink_name?: Boolean, symlink_access_key?: Boolean}} [options]
  * @returns {Promise<Void>}
  */
-async function write_manual_config_file(type, config_fs, config_data, invalid_str = '') {
+async function write_manual_config_file(type, config_fs, config_data, invalid_str = '', { symlink_name, symlink_access_key } = { symlink_name: true, symlink_access_key: true }) {
     const config_path = type === CONFIG_TYPES.BUCKET ?
         config_fs.get_bucket_path_by_name(config_data.name) :
         config_fs.get_identity_path_by_id(config_data._id);
     if (type === CONFIG_TYPES.ACCOUNT) {
-        const dir_path = config_fs.get_identity_dir_path_by_id(config_data._id);
-        await nb_native().fs.mkdir(config_fs.fs_context, dir_path, native_fs_utils.get_umasked_mode(config.BASE_MODE_DIR));
+        await create_identity_dir_if_missing(config_fs, config_data._id);
     }
     await nb_native().fs.writeFile(
         config_fs.fs_context,
         config_path,
-        Buffer.from(JSON.stringify(config_data) + invalid_str),
-        {
+        Buffer.from(JSON.stringify(config_data) + invalid_str), {
             mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_FILE)
         }
     );
+    const id_relative_path = config_fs.get_account_relative_path_by_id(config_data._id);
 
-    if (type === CONFIG_TYPES.ACCOUNT) {
-        const id_relative_path = config_fs.get_account_relative_path_by_id(config_data._id);
-        const name_symlink_path = config_fs.get_account_or_user_path_by_name(config_data.name);
-        await nb_native().fs.symlink(config_fs.fs_context, id_relative_path, name_symlink_path);
+    if (type === CONFIG_TYPES.ACCOUNT && symlink_name) {
+        await symlink_account_name(config_fs, config_data.name, id_relative_path);
+    }
+
+    if (type === CONFIG_TYPES.ACCOUNT && symlink_access_key && config_data.access_keys &&
+        Object.keys(config_data.access_keys).length > 0) {
+        await symlink_account_access_keys(config_fs, config_data.access_keys, id_relative_path);
     }
 }
 
+/**
+ * symlink_account_name symlinks the account's name path to the target link path
+ * used for manual creation of the account name symlink
+ * @param {import('../../sdk/config_fs').ConfigFS} config_fs
+ * @param {String} account_name 
+ * @param {String} link_target 
+ */
+async function symlink_account_name(config_fs, account_name, link_target) {
+    const name_symlink_path = config_fs.get_account_or_user_path_by_name(account_name);
+    await nb_native().fs.symlink(config_fs.fs_context, link_target, name_symlink_path);
+}
+
+/**
+ * symlink_account_access_keys symlinks the account's access key path to the target link path
+ * used for manual creation of the account access key symlink
+ * @param {import('../../sdk/config_fs').ConfigFS} config_fs
+ * @param {Object} access_keys
+ * @param {String} link_target 
+ */
+async function symlink_account_access_keys(config_fs, access_keys, link_target) {
+    for (const { access_key } of access_keys) {
+        const access_key_symlink_path = config_fs.get_account_or_user_path_by_access_key(access_key);
+        await nb_native().fs.symlink(config_fs.fs_context, link_target, access_key_symlink_path);
+    }
+}
+
+/**
+ * create_identity_dir_if_missing created the identity directory if missing
+ * @param {import('../../sdk/config_fs').ConfigFS} config_fs
+ * @param {String} _id 
+ * @returns {Promise<Void>}
+ */
+async function create_identity_dir_if_missing(config_fs, _id) {
+    const dir_path = config_fs.get_identity_dir_path_by_id(_id);
+    try {
+        await nb_native().fs.mkdir(config_fs.fs_context, dir_path, native_fs_utils.get_umasked_mode(config.BASE_MODE_DIR));
+    } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+    }
+}
 
 /**
  * write_manual_old_account_config_file writes account config file directly to the old file system account path without using config FS
+ * 1. create old json file in /config_dir_path/accounts/account.json
+ * 2. if symlink_access_key is true - create old access key symlink /config_dir_path/access_keys/{access_key}.symlink -> /config_dir_path/accounts/account.json
  * @param {import('../../sdk/config_fs').ConfigFS} config_fs
  * @param {Object} config_data 
+ * @param {{symlink_access_key?: Boolean}} [options]
  * @returns {Promise<Void>}
  */
-async function write_manual_old_account_config_file(config_fs, config_data) {
+async function write_manual_old_account_config_file(config_fs, config_data, { symlink_access_key } = { symlink_access_key: false }) {
     const config_path = config_fs._get_old_account_path_by_name(config_data.name);
     await nb_native().fs.writeFile(
         config_fs.fs_context,
         config_path,
-        Buffer.from(JSON.stringify(config_data)),
-        {
+        Buffer.from(JSON.stringify(config_data)), {
             mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_FILE)
         }
     );
+
+    const account_name_relative_path = config_fs.get_old_account_relative_path_by_name(config_data.name);
+    if (symlink_access_key) {
+        const access_key_symlink_path = config_fs.get_account_or_user_path_by_access_key(config_data.access_keys[0].access_key);
+        await nb_native().fs.symlink(config_fs.fs_context, account_name_relative_path, access_key_symlink_path);
+    }
 }
 
 /**
@@ -510,6 +675,108 @@ async function delete_manual_config_file(type, config_fs, config_data) {
     }
 }
 
+
+/**
+ * @param {any} test_name
+ * @param {import('../../sdk/config_fs').ConfigFS} [config_fs]
+ */
+async function fail_test_if_default_config_dir_exists(test_name, config_fs) {
+    const fs_context = config_fs?.fs_context || native_fs_utils.get_process_fs_context();
+    const config_dir_exists = await native_fs_utils.is_path_exists(fs_context, config.NSFS_NC_DEFAULT_CONF_DIR);
+    const msg = `${test_name} found an existing default config directory ${config.NSFS_NC_DEFAULT_CONF_DIR},` +
+        `this test needs to test the creation of the config directory elements, therefore make sure ` +
+        `the content of the config directory is not needed and remove it for ensuring a used config directory will not get deleted`;
+    if (config_dir_exists) {
+        console.error(msg);
+        process.exit(1);
+    }
+}
+
+
+/**
+ * create_config_dir will create the config directory on the file system
+ * @param {String} config_dir 
+ * @returns {Promise<Void>}
+ */
+async function create_config_dir(config_dir) {
+    await fs_utils.create_fresh_path(config_dir);
+}
+
+
+/**
+ * clean_config_dir cleans the config directory
+ * custom_config_dir_path is created in some tests that are not using the default /etc/noobaa.conf.d/
+ * config directory path
+ * @param {import('../../sdk/config_fs').ConfigFS} config_fs
+ * @param {String} [custom_config_dir_path]
+ * @returns {Promise<Void>}
+ */
+async function clean_config_dir(config_fs, custom_config_dir_path) {
+    const buckets_dir_name = '/buckets/';
+    const identities_dir_name = '/identities/';
+    const accounts_by_name = '/accounts_by_name/';
+    const access_keys_dir_name = '/access_keys/';
+    const system_json = '/system.json';
+    for (const dir of [buckets_dir_name, identities_dir_name, access_keys_dir_name, accounts_by_name, config.NSFS_TEMP_CONF_DIR_NAME]) {
+        const default_path = path.join(config.NSFS_NC_DEFAULT_CONF_DIR, dir);
+        await fs_utils.folder_delete_skip_enoent(default_path);
+        if (custom_config_dir_path) {
+            const custom_path = path.join(custom_config_dir_path, dir);
+            await fs_utils.folder_delete_skip_enoent(custom_path);
+        }
+    }
+
+    await delete_redirect_file(config_fs);
+    await fs_utils.file_delete(system_json);
+    await fs_utils.folder_delete_skip_enoent(config.NSFS_NC_DEFAULT_CONF_DIR);
+    await fs_utils.folder_delete_skip_enoent(custom_config_dir_path);
+}
+
+/**
+ * create_file creates a file in the file system
+ * @param {nb.NativeFSContext} fs_context 
+ * @param {String} file_path 
+ * @param {Object} file_data 
+ * @param {{stringify_json?: Boolean}} [options={}] 
+ */
+async function create_file(fs_context, file_path, file_data, options = {}) {
+    const buf = Buffer.from(options?.stringify_json ? JSON.stringify(file_data) : file_data);
+    await nb_native().fs.writeFile(
+        fs_context,
+        file_path,
+        buf,
+        {
+            mode: native_fs_utils.get_umasked_mode(config.BASE_MODE_FILE)
+        }
+    );
+}
+
+/**
+ * create_system_json creates the system.json file
+ * if mock_config_dir_version it sets it before creating the file
+ * @param {import('../../sdk/config_fs').ConfigFS} config_fs
+ * @param {String} [mock_config_dir_version] 
+ * @returns {Promise<Void>}
+ */
+async function create_system_json(config_fs, mock_config_dir_version) {
+    const system_data = await config_fs._get_new_system_json_data();
+    if (mock_config_dir_version) system_data.config_directory.config_dir_version = mock_config_dir_version;
+    await config_fs.create_system_config_file(JSON.stringify(system_data));
+}
+
+/**
+ * update_system_json updates the system.json file
+ * if mock_config_dir_version it sets it before creating the file
+ * @param {import('../../sdk/config_fs').ConfigFS} config_fs
+ * @param {String} [mock_config_dir_version] 
+ * @returns {Promise<Void>}
+ */
+async function update_system_json(config_fs, mock_config_dir_version) {
+    const system_data = await config_fs.get_system_config_file();
+    if (mock_config_dir_version) system_data.config_directory.config_dir_version = mock_config_dir_version;
+    await config_fs.update_system_config_file(JSON.stringify(system_data));
+}
+
 exports.blocks_exist_on_cloud = blocks_exist_on_cloud;
 exports.create_hosts_pool = create_hosts_pool;
 exports.delete_hosts_pool = delete_hosts_pool;
@@ -517,19 +784,35 @@ exports.empty_and_delete_buckets = empty_and_delete_buckets;
 exports.disable_accounts_s3_access = disable_accounts_s3_access;
 exports.generate_s3_policy = generate_s3_policy;
 exports.generate_s3_client = generate_s3_client;
+exports.generate_iam_client = generate_iam_client;
 exports.invalid_nsfs_root_permissions = invalid_nsfs_root_permissions;
 exports.get_coretest_path = get_coretest_path;
 exports.exec_manage_cli = exec_manage_cli;
 exports.create_fs_user_by_platform = create_fs_user_by_platform;
 exports.delete_fs_user_by_platform = delete_fs_user_by_platform;
+exports.create_fs_group_by_platform = create_fs_group_by_platform;
+exports.delete_fs_group_by_platform = delete_fs_group_by_platform;
 exports.set_path_permissions_and_owner = set_path_permissions_and_owner;
 exports.set_nc_config_dir_in_config = set_nc_config_dir_in_config;
 exports.generate_anon_s3_client = generate_anon_s3_client;
 exports.TMP_PATH = TMP_PATH;
+exports.IS_GPFS = IS_GPFS;
 exports.is_nc_coretest = is_nc_coretest;
+exports.TEST_TIMEOUT = TEST_TIMEOUT;
 exports.generate_nsfs_account = generate_nsfs_account;
 exports.get_new_buckets_path_by_test_env = get_new_buckets_path_by_test_env;
 exports.write_manual_config_file = write_manual_config_file;
 exports.write_manual_old_account_config_file = write_manual_old_account_config_file;
 exports.delete_manual_config_file = delete_manual_config_file;
-
+exports.create_identity_dir_if_missing = create_identity_dir_if_missing;
+exports.symlink_account_name = symlink_account_name;
+exports.symlink_account_access_keys = symlink_account_access_keys;
+exports.create_file = create_file;
+exports.create_redirect_file = create_redirect_file;
+exports.delete_redirect_file = delete_redirect_file;
+exports.create_system_json = create_system_json;
+exports.update_system_json = update_system_json;
+exports.fail_test_if_default_config_dir_exists = fail_test_if_default_config_dir_exists;
+exports.create_config_dir = create_config_dir;
+exports.clean_config_dir = clean_config_dir;
+exports.CLI_UNSET_EMPTY_STRING = CLI_UNSET_EMPTY_STRING;

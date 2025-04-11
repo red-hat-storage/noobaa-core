@@ -2,7 +2,8 @@
 'use strict';
 
 const _ = require('lodash');
-const { v4: uuid } = require('uuid');
+const s3_const = require('../s3_constants');
+const crypto = require('crypto');
 const dbg = require('../../../util/debug_module')(__filename);
 const S3Error = require('../s3_errors').S3Error;
 
@@ -46,6 +47,13 @@ function parse_filter(filter) {
     return current_rule_filter;
 }
 
+function reject_empty_field(field) {
+    if (_.isEmpty(field)) {
+        dbg.error('Invalid field - empty', field);
+        throw new S3Error(S3Error.MalformedXML);
+    }
+}
+
 // parse lifecycle rule expiration
 function parse_expiration(expiration) {
     const output_expiration = {};
@@ -75,21 +83,35 @@ function parse_lifecycle_field(field, field_parser = parseInt) {
  * http://docs.aws.amazon.com/AmazonS3/latest/API/RESTBucketPUTlifecycle.html
  */
 async function put_bucket_lifecycle(req) {
+    const id_set = new Set();
     const lifecycle_rules = _.map(req.body.LifecycleConfiguration.Rule, rule => {
         const current_rule = {
             filter: {},
         };
 
         if (rule.ID?.length === 1) {
-            current_rule.id = rule.ID[0];
+            if (rule.ID[0].length > s3_const.MAX_RULE_ID_LENGTH) {
+                dbg.error('Rule should not have ID length exceed allowed limit of ', s3_const.MAX_RULE_ID_LENGTH, ' characters', rule);
+                throw new S3Error({ ...S3Error.InvalidArgument, message: `ID length should not exceed allowed limit of ${s3_const.MAX_RULE_ID_LENGTH}` });
+            } else {
+                current_rule.id = rule.ID[0];
+            }
         } else {
             // Generate a random ID if missing
-            current_rule.id = uuid();
+            current_rule.id = crypto.randomUUID();
         }
 
-        if (rule.Status?.length !== 1) {
-            dbg.error('Rule should have status', rule);
-            throw new S3Error(S3Error.InvalidArgument);
+        // Check for duplicate ID in the rules
+        if (id_set.has(current_rule.id)) {
+            dbg.error('Rule ID must be unique. Found same ID for more than one rule: ', current_rule.id);
+            throw new S3Error({ ...S3Error.InvalidArgument, message: 'Rule ID must be unique. Found same ID for more than one rule' });
+        }
+        id_set.add(current_rule.id);
+
+        if (!rule.Status || rule.Status.length !== 1 ||
+            (rule.Status[0] !== s3_const.LIFECYCLE_STATUS.STAT_ENABLED && rule.Status[0] !== s3_const.LIFECYCLE_STATUS.STAT_DISABLED)) {
+            dbg.error(`Rule should have a status value of "${s3_const.LIFECYCLE_STATUS.STAT_ENABLED}" or "${s3_const.LIFECYCLE_STATUS.STAT_DISABLED}".`, rule);
+            throw new S3Error(S3Error.MalformedXML);
         }
         current_rule.status = rule.Status[0];
 
@@ -99,6 +121,7 @@ async function put_bucket_lifecycle(req) {
                 throw new S3Error(S3Error.InvalidArgument);
             }
             current_rule.filter.prefix = rule.Prefix[0];
+            current_rule.uses_prefix = true;
 
         } else {
             if (rule.Filter?.length !== 1) {
@@ -110,12 +133,14 @@ async function put_bucket_lifecycle(req) {
 
         if (rule.Expiration?.length === 1) {
             current_rule.expiration = parse_expiration(rule.Expiration[0]);
+            reject_empty_field(current_rule.expiration);
         }
 
         if (rule.AbortIncompleteMultipartUpload?.length === 1) {
             current_rule.abort_incomplete_multipart_upload = _.omitBy({
                 days_after_initiation: parse_lifecycle_field(rule.AbortIncompleteMultipartUpload[0].DaysAfterInitiation),
             }, _.isUndefined);
+            reject_empty_field(current_rule.abort_incomplete_multipart_upload);
         }
 
         if (rule.Transition?.length === 1) {
@@ -124,6 +149,7 @@ async function put_bucket_lifecycle(req) {
                 date: parse_lifecycle_field(rule.Transition[0].Date, s => new Date(s)),
                 days: parse_lifecycle_field(rule.Transition[0].Days),
             }, _.isUndefined);
+            reject_empty_field(current_rule.transition);
         }
 
         if (rule.NoncurrentVersionExpiration?.length === 1) {
@@ -131,6 +157,7 @@ async function put_bucket_lifecycle(req) {
                 noncurrent_days: parse_lifecycle_field(rule.NoncurrentVersionExpiration[0].NoncurrentDays),
                 newer_noncurrent_versions: parse_lifecycle_field(rule.NoncurrentVersionExpiration[0].NewerNoncurrentVersions),
             }, _.isUndefined);
+            reject_empty_field(current_rule.noncurrent_version_expiration);
         }
 
         if (rule.NoncurrentVersionTransition?.length === 1) {
@@ -139,6 +166,7 @@ async function put_bucket_lifecycle(req) {
                 noncurrent_days: parse_lifecycle_field(rule.NoncurrentVersionTransition[0].NoncurrentDays),
                 newer_noncurrent_versions: parse_lifecycle_field(rule.NoncurrentVersionTransition[0].NewerNoncurrentVersions),
             }, _.isUndefined);
+            reject_empty_field(current_rule.noncurrent_version_transition);
         }
 
         return current_rule;

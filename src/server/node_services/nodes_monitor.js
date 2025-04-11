@@ -8,7 +8,6 @@ const chance = require('chance')();
 // const dclassify = require('dclassify');
 const EventEmitter = require('events').EventEmitter;
 
-const kmeans = require('../../util/kmeans');
 const P = require('../../util/promise');
 const api = require('../../api');
 const pkg = require('../../../package.json');
@@ -16,7 +15,7 @@ const dbg = require('../../util/debug_module')(__filename);
 const config = require('../../../config');
 const js_utils = require('../../util/js_utils');
 const MDStore = require('../object_services/md_store').MDStore;
-const Semaphore = require('../../util/semaphore');
+const semaphore = require('../../util/semaphore');
 const NodesStore = require('./nodes_store').NodesStore;
 const IoStatsStore = require('../analytic_services/io_stats_store').IoStatsStore;
 const size_utils = require('../../util/size_utils');
@@ -188,8 +187,8 @@ class NodesMonitor extends EventEmitter {
         this._started = false;
         this._loaded = false;
         this._num_running_rebuilds = 0;
-        this._run_serial = new Semaphore(1);
-        this._update_nodes_store_serial = new Semaphore(1);
+        this._run_serial = new semaphore.Semaphore(1);
+        this._update_nodes_store_serial = new semaphore.Semaphore(1);
 
         // This is used in order to test n2n connection from node_monitor to agents
         this.n2n_rpc = api.new_rpc();
@@ -248,7 +247,7 @@ class NodesMonitor extends EventEmitter {
         return P.resolve()
             .then(() => this._run())
             .then(() => {
-                // do nothing. 
+                // do nothing.
             });
     }
 
@@ -714,8 +713,6 @@ class NodesMonitor extends EventEmitter {
         }
         item.node.drives = item.node.drives || [];
         item.node.latency_to_server = item.node.latency_to_server || [];
-        item.node.latency_of_disk_read = item.node.latency_of_disk_read || [];
-        item.node.latency_of_disk_write = item.node.latency_of_disk_write || [];
         item.node.storage = _.defaults(item.node.storage, {
             total: 0,
             free: 0,
@@ -845,7 +842,6 @@ class NodesMonitor extends EventEmitter {
                     .then(worker);
             };
             return P.all(_.times(concur, worker))
-                // .then(() => this._suggest_pool_assign()) // need to be rethinked - out for
                 .then(() => this._update_nodes_store('force'))
                 .catch(err => {
                     dbg.warn('_run: ERROR', err.stack || err);
@@ -855,7 +851,7 @@ class NodesMonitor extends EventEmitter {
 
     _run_node(item) {
         if (!this._started) return P.reject(new Error('monitor has not started'));
-        item._run_node_serial = item._run_node_serial || new Semaphore(1);
+        item._run_node_serial = item._run_node_serial || new semaphore.Semaphore(1);
         if (item.node.deleted) return P.reject(new Error(`node ${item.node.name} is deleted`));
         return item._run_node_serial.surround(() =>
             P.resolve()
@@ -1016,7 +1012,7 @@ class NodesMonitor extends EventEmitter {
             })
             .then(() => this._update_nodes_store('force'))
             .then(() => {
-                // do nothing. 
+                // do nothing.
             });
     }
 
@@ -1240,7 +1236,7 @@ class NodesMonitor extends EventEmitter {
         if (item.node.deleted) return;
         if (!item.connection) return;
         if (!item.agent_info) return;
-        //The node should be set as enable if it is not decommissioned. 
+        //The node should be set as enable if it is not decommissioned.
         const should_enable = !item.node.decommissioned;
         const item_pool = system_store.data.get_by_id(item.node.pool);
         const location_info = {
@@ -1248,7 +1244,7 @@ class NodesMonitor extends EventEmitter {
             host_id: String(item.node.host_id),
             pool_id: String(item.node.pool),
         };
-        // We should only add region if it is defined. 
+        // We should only add region if it is defined.
         if (item_pool && !_.isUndefined(item_pool.region)) location_info.region = item_pool.region;
         // We should change the service enable field if the field is not equal to the decommissioned decision.
         const service_enabled_not_changed = (item.node.enabled === should_enable);
@@ -1386,44 +1382,10 @@ class NodesMonitor extends EventEmitter {
         }
     }
 
-    async _test_store_perf(item) {
-        const now = Date.now();
-        if (item.last_store_perf_test && now < item.last_store_perf_test + config.STORE_PERF_TEST_INTERVAL) return;
-        try {
-
-
-            dbg.log1('running _test_store_perf::', item.node.name);
-            const res = await P.timeout(config.AGENT_RESPONSE_TIMEOUT,
-                this.client.agent.test_store_perf({
-                    count: 5
-                }, {
-                    connection: item.connection
-                })
-            );
-            item.last_store_perf_test = Date.now();
-            dbg.log0(`_test_store_perf for node ${item.node.name} returned:`, res);
-            this._set_need_update.add(item);
-            item.node.latency_of_disk_read = js_utils.array_push_keep_latest(
-                item.node.latency_of_disk_read, res.read, MAX_NUM_LATENCIES);
-            item.node.latency_of_disk_write = js_utils.array_push_keep_latest(
-                item.node.latency_of_disk_write, res.write, MAX_NUM_LATENCIES);
-        } catch (err) {
-            // ignore "unkonown" errors for cloud resources - we don't want to put the node in detention in cases where we don't know what is the problem
-            // if there is a real issue, we will take it into account in report_error_on_node_blocks
-            if (this._is_cloud_node(item) && err.rpc_code !== 'AUTH_FAILED' && err.rpc_code !== 'STORAGE_NOT_EXIST') {
-                dbg.warn(`encountered an unknown error in _test_store_perf. `, err);
-            } else {
-                dbg.log0(`encountered an error in _test_store_perf. `, err);
-                throw err;
-            }
-        }
-    }
-
     async _test_store(item) {
         if (!item.connection) return;
 
         try {
-            await this._test_store_perf(item);
             await this._test_store_validity(item);
 
             dbg.log2('_test_store:: success in test', item.node.name);
@@ -1874,8 +1836,6 @@ class NodesMonitor extends EventEmitter {
         item.io_detention = this._get_item_io_detention(item);
         item.connectivity = 'TCP';
         item.avg_ping = _.mean(item.node.latency_to_server);
-        item.avg_disk_read = _.mean(item.node.latency_of_disk_read);
-        item.avg_disk_write = _.mean(item.node.latency_of_disk_write);
         item.storage_full = this._get_item_storage_full(item);
         item.has_issues = this._get_item_has_issues(item);
         item.readable = this._get_item_readable(item);
@@ -2520,8 +2480,6 @@ class NodesMonitor extends EventEmitter {
 
         // aggregate data used by suggested pools classification
         host_item.avg_ping = _.mean(host_nodes.map(item => item.avg_ping));
-        host_item.avg_disk_read = _.mean(host_nodes.map(item => item.avg_disk_read));
-        host_item.avg_disk_write = _.mean(host_nodes.map(item => item.avg_disk_write));
 
 
         const host_aggragate = this._aggregate_nodes_list(host_nodes);
@@ -2701,126 +2659,6 @@ class NodesMonitor extends EventEmitter {
     _paginate_nodes_list(list, options) {
         const { skip = 0, limit = list.length } = options;
         return list.slice(skip, skip + limit);
-    }
-
-    // _suggest_pool_assign() {
-    //     // prepare nodes data per pool
-    //     const pools_data_map = new Map();
-    //     for (const host_nodes of this._map_host_id.values()) {
-    //         // get the host aggregated item
-    //         const item = this._consolidate_host(host_nodes);
-    //         item.suggested_pool = ''; // reset previous suggestion
-    //         const host_id = String(item.node.host_id);
-    //         const pool_id = String(item.node.pool);
-    //         const pool = system_store.data.get_by_id(pool_id);
-    //         dbg.log3('_suggest_pool_assign: node', item.node.name, 'pool', pool && pool.name);
-    //         // skip new nodes and cloud\internal nodes
-    //         if (pool && item.node_from_store && item.node.node_type === 'BLOCK_STORE_FS') {
-    //             let pool_data = pools_data_map.get(pool_id);
-    //             if (!pool_data) {
-    //                 pool_data = {
-    //                     pool_id: pool_id,
-    //                     pool_name: pool.name,
-    //                     docs: []
-    //                 };
-    //                 pools_data_map.set(pool_id, pool_data);
-    //             }
-    //             const tokens = this._classify_node_tokens(item);
-    //             pool_data.docs.push(new dclassify.Document(host_id, tokens));
-    //         }
-    //     }
-
-    //     // take the data of all the pools and use it to train a classifier of nodes to pools
-    //     const data_set = new dclassify.DataSet();
-    //     const classifier = new dclassify.Classifier({
-    //         applyInverse: true
-    //     });
-    //     const pools_to_classify = ['default_resource', config.NEW_SYSTEM_POOL_NAME];
-    //     let num_trained_pools = 0;
-    //     for (const pool_data of pools_data_map.values()) {
-    //         // don't train by the nodes that we need to classify
-    //         if (!pools_to_classify.includes(pool_data.pool_name)) {
-    //             dbg.log3('_suggest_pool_assign: add to data set',
-    //                 pool_data.pool_name, pool_data.docs);
-    //             data_set.add(pool_data.pool_name, pool_data.docs);
-    //             num_trained_pools += 1;
-    //         }
-    //     }
-    //     if (num_trained_pools <= 0) {
-    //         dbg.log3('_suggest_pool_assign: no pools to suggest');
-    //         return;
-    //     } else if (num_trained_pools === 1) {
-    //         // the classifier requires at least two options to work
-    //         dbg.log3('_suggest_pool_assign: only one pool to suggest,',
-    //             'too small for real suggestion');
-    //         return;
-    //     }
-    //     classifier.train(data_set);
-    //     dbg.log3('_suggest_pool_assign: Trained:', classifier,
-    //         'probabilities', JSON.stringify(classifier.probabilities));
-
-    //     // for nodes in the default_resource use the classifier to suggest a pool
-    //     const system = system_store.data.systems[0];
-    //     const target_pool = system.pools_by_name[config.NEW_SYSTEM_POOL_NAME];
-    //     const target_pool_data = pools_data_map.get(String(target_pool._id));
-    //     if (target_pool_data) {
-    //         for (const doc of target_pool_data.docs) {
-    //             const host_nodes = this._map_host_id.get(doc.id);
-    //             const hostname = this._item_hostname(host_nodes[0]);
-    //             dbg.log0('_suggest_pool_assign: classify start', hostname, doc);
-    //             const res = classifier.classify(doc);
-    //             dbg.log0('_suggest_pool_assign: classify result', hostname, res);
-    //             let suggested_pool;
-    //             if (res.category !== config.NEW_SYSTEM_POOL_NAME) {
-    //                 suggested_pool = res.category;
-    //             } else if (res.secondCategory !== config.NEW_SYSTEM_POOL_NAME) {
-    //                 suggested_pool = res.secondCategory;
-    //             }
-    //             host_nodes.forEach(item => {
-    //                 item.suggested_pool = suggested_pool;
-    //             });
-
-    //         }
-
-    //     }
-    // }
-
-    _classify_node_tokens(item) {
-        // cannot use numbers as dclassify tokens only discrete strings,
-        // so we have to transform numbers to some relevant tokens
-        const tokens = [];
-        if (item.node.ip) {
-            const x = item.node.ip.split('.');
-            if (x.length === 4) {
-                tokens.push('ip:' + x[0] + '.x.x.x');
-                tokens.push('ip:' + x[0] + '.' + x[1] + '.x.x');
-                tokens.push('ip:' + x[0] + '.' + x[1] + '.' + x[2] + '.x');
-                tokens.push('ip:' + x[0] + '.' + x[1] + '.' + x[2] + '.' + x[3]);
-            }
-        }
-        if (item.node.os_info) {
-            tokens.push('platform:' + item.node.os_info.platform);
-            tokens.push('arch:' + item.node.os_info.arch);
-            tokens.push('totalmem:' + scale_size_token(item.node.os_info.totalmem));
-        }
-        if (_.isNumber(item.avg_ping)) {
-            tokens.push('avg_ping:' + scale_number_token(item.avg_ping));
-        }
-        if (_.isNumber(item.avg_disk_read)) {
-            tokens.push('avg_disk_read:' + scale_number_token(item.avg_disk_read));
-        }
-        if (_.isNumber(item.avg_disk_write)) {
-            tokens.push('avg_disk_write:' + scale_number_token(item.avg_disk_write));
-        }
-        if (item.node.storage && _.isNumber(item.node.storage.total)) {
-            const storage_other =
-                item.node.storage.total -
-                item.node.storage.used -
-                item.node.storage.free;
-            tokens.push('storage_other:' + scale_size_token(storage_other));
-            tokens.push('storage_total:' + scale_size_token(item.node.storage.total));
-        }
-        return tokens;
     }
 
     list_nodes(query, options) {
@@ -3484,53 +3322,18 @@ class NodesMonitor extends EventEmitter {
             list.push(item);
         }
 
-        const latency_groups = [];
-        // Not all nodes always have the avg_disk_write.
-        // KMeans needs valid vectors so we exclude the nodes and assume that they are the slowest
-        // Since we assume them to be the slowest we will place them in the last KMeans group
-        const partition_avg_disk_write = _.partition(list, item => !Number.isNaN(item.avg_disk_write) && _.isNumber(item.avg_disk_write));
-        const nodes_with_avg_disk_write = partition_avg_disk_write[0];
-        const nodes_without_avg_disk_write = partition_avg_disk_write[1];
-        if (nodes_with_avg_disk_write.length >= config.NODE_ALLOCATOR_NUM_CLUSTERS) {
-            // TODO:
-            // Not handling noise at all.
-            // This means that we can have a group of 1 noisy drive.
-            // I rely on avg_disk_write as an average reading to handle any noise.
-            const kmeans_clusters = kmeans.run(
-                nodes_with_avg_disk_write.map(item => [item.avg_disk_write]), {
-                    k: config.NODE_ALLOCATOR_NUM_CLUSTERS
-                }
-            );
-
-            // Sort the groups by latency (centroid is the computed centralized latency for each group)
-            kmeans_clusters.sort(js_utils.sort_compare_by(item => item.centroid[0], 1));
-
-            kmeans_clusters.forEach(kmeans_cluster =>
-                latency_groups.push(kmeans_cluster.clusterInd.map(index => list[index]))
-            );
-
-            if (nodes_without_avg_disk_write.length) {
-                latency_groups[latency_groups.length - 1] =
-                    _.concat(latency_groups[latency_groups.length - 1], nodes_without_avg_disk_write);
-            }
-
-        } else {
-            latency_groups.push(list);
-        }
-
-        const lg_res = latency_groups.map(cluster => {
-            const max = 1000;
-            // This is done in order to get the most unused or free drives
-            // Since we sclice the response up to 1000 drives
-            cluster.sort(js_utils.sort_compare_by(item => item.node.storage.used, 1));
-            const nodes_set = (cluster.length < max) ? cluster : cluster.slice(0, max);
-            return {
-                nodes: nodes_set.map(item => this._get_node_info(item, params.fields))
-            };
-        });
+        if (_.isEmpty(list)) return { latency_groups: [{ nodes: [] }] };
+        const max = 1000;
+        // This is done in order to get the most unused or free drives
+        // Since we sclice the response up to 1000 drives
+        list.sort(js_utils.sort_compare_by(item => item.node.storage.used, 1));
+        const nodes_set = (list.length < max) ? list : list.slice(0, max);
+        const latency_groups = [{
+            nodes: nodes_set.map(item => this._get_node_info(item, params.fields))
+        }];
 
         return {
-            latency_groups: _.isEmpty(lg_res) ? [{ nodes: [] }] : lg_res
+            latency_groups
         };
     }
 
@@ -3570,12 +3373,16 @@ class NodesMonitor extends EventEmitter {
                 'node', item.node.name,
                 'issues_report', item.node.issues_report,
                 'block_report', block_report);
-            // disconnect from the node to force reconnect
-            // only disconnect if enough time passed since last disconnect to avoid amplification of errors in R\W flows
-            const DISCONNECT_GRACE_PERIOD = 2 * 60 * 1000; // 2 minutes grace before another disconnect
-            if (!item.disconnect_time || item.disconnect_time + DISCONNECT_GRACE_PERIOD < Date.now()) {
-                dbg.log0('disconnecting node to force reconnect. node:', item.node.name);
-                this._disconnect_node(item);
+
+
+            if (config.NODES_DISCONNECT_ON_ERROR) {
+                // disconnect from the node to force reconnect
+                // only disconnect if enough time passed since last disconnect to avoid amplification of errors in R\W flows
+                const DISCONNECT_GRACE_PERIOD = 2 * 60 * 1000; // 2 minutes grace before another disconnect
+                if (!item.disconnect_time || item.disconnect_time + DISCONNECT_GRACE_PERIOD < Date.now()) {
+                    dbg.log0('disconnecting node to force reconnect. node:', item.node.name);
+                    this._disconnect_node(item);
+                }
             }
         }
     }
@@ -3664,15 +3471,6 @@ class NodesMonitor extends EventEmitter {
             item.node.node_type === 'BLOCK_STORE_FS'
         );
     }
-}
-
-function scale_number_token(num) {
-    return 2 ** Math.round(Math.log2(num));
-}
-
-function scale_size_token(size) {
-    const scaled = Math.max(scale_number_token(size), size_utils.GIGABYTE);
-    return size_utils.human_size(scaled);
 }
 
 function progress_by_time(time, now) {

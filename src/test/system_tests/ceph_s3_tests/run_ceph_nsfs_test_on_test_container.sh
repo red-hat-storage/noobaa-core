@@ -24,13 +24,15 @@ export CEPH_TEST_LOGS_DIR=/logs/ceph-nsfs-test-logs
 export CONFIG_DIR=/etc/noobaa.conf.d/
 export FS_ROOT_1=/tmp/nsfs_root1/
 export FS_ROOT_2=/tmp/nsfs_root2/
+export CONFIG_JS_allow_anonymous_access_in_test=true # Needed for allowing anon access for tests using ACL='public-read-write'
+export CONFIG_JS_S3_CORS_DEFAULTS_ENABLED=false # Needed for disabling cors defaults for ceph cors test
 
 # ====================================================================================
 
 # 1. Create configuration directory
 # 2. Create config.json file
 mkdir -p ${CONFIG_DIR}
-config='{"ALLOW_HTTP":true}'
+config='{"ALLOW_HTTP":true, "ENDPOINT_FORKS":2}'
 echo "$config" > ${CONFIG_DIR}/config.json
 
 # 1. Create root directory for bucket creation

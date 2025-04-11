@@ -1,5 +1,6 @@
 /* Copyright (C) 2016 NooBaa */
 /* eslint max-lines-per-function: ['error', 650] */
+/* eslint max-lines: ["error", 2500] */
 'use strict';
 
 // setup coretest first to prepare the env
@@ -10,6 +11,7 @@ const { rpc_client, EMAIL, POOL_LIST, anon_rpc_client } = coretest;
 const MDStore = require('../../server/object_services/md_store').MDStore;
 coretest.setup({ pools_to_create: process.env.NC_CORETEST ? undefined : [POOL_LIST[1]] });
 const path = require('path');
+const _ = require('lodash');
 const fs_utils = require('../../util/fs_utils');
 
 const { S3 } = require('@aws-sdk/client-s3');
@@ -32,6 +34,10 @@ async function assert_throws_async(promise, expected_message = 'Access Denied') 
 }
 const BKT = 'test2-bucket-policy-ops';
 const BKT_B = 'test2-bucket-policy-ops-1';
+const BKT_C = 'test2-bucket-policy-ops-2';
+const BKT_D = 'test2-bucket-policy-ops-3';
+const VER_BKT = 'test-object-ver-policy-ops';
+
 const KEY = 'file1.txt';
 const user_a = 'alice';
 const user_b = 'bob';
@@ -132,6 +138,10 @@ async function setup() {
     };
     s3_owner = new S3(s3_creds);
     await s3_owner.createBucket({ Bucket: BKT });
+    await s3_owner.createBucket({ Bucket: BKT_C });
+    await s3_owner.createBucket({ Bucket: BKT_D });
+    await s3_owner.createBucket({ Bucket: VER_BKT });
+
     s3_anon = new S3({
         ...s3_creds,
         credentials: {
@@ -145,7 +155,7 @@ async function setup() {
     });
 }
 
-/*eslint max-lines-per-function: ["error", 1300]*/
+/*eslint max-lines-per-function: ["error", 3000]*/
 mocha.describe('s3_bucket_policy', function() {
     mocha.before(setup);
     mocha.it('should fail setting bucket policy when user doesn\'t exist', async function() {
@@ -331,6 +341,289 @@ mocha.describe('s3_bucket_policy', function() {
             Bucket: BKT,
             Key: KEY
         }));
+    });
+
+    mocha.describe('s3_bucket_policy with more complex policies (conflict statements)', function() {
+        mocha.after(async function() {
+            await s3_owner.deleteBucketPolicy({
+                Bucket: BKT_D,
+            });
+        });
+
+        const allow_all_principals_all_s3_actions_statement = {
+            Sid: `Allow all s3 actions on bucket ${BKT_D} to all principals`,
+            Effect: 'Allow',
+            Principal: { AWS: "*" },
+            Action: ['s3:*'],
+            Resource: [`arn:aws:s3:::${BKT_D}`, `arn:aws:s3:::${BKT_D}/*`]
+        };
+
+        const deny_all_principals_get_object_action_statement = {
+            Sid: `Deny all GetObject on bucket ${BKT_D} to all principals`,
+            Effect: 'Deny',
+            Principal: { AWS: "*" },
+            Action: 's3:GetObject',
+            Resource: [`arn:aws:s3:::${BKT_D}/*`]
+        };
+
+        function get_deny_account_by_id_all_s3_actions_statement(_id) {
+            return {
+                Sid: `Do not allow user ${_id} any s3 action`,
+                Effect: 'Deny',
+                Principal: { AWS: [_id] },
+                Action: ['s3:*'],
+                Resource: [`arn:aws:s3:::${BKT_D}/*`]
+            };
+        }
+
+        const deny_account_by_name_all_s3_actions_statement = {
+            Sid: `Do not allow user ${user_a} any s3 action`,
+            Effect: 'Deny',
+            Principal: { AWS: [user_a] },
+            Action: ['s3:*'],
+            Resource: [`arn:aws:s3:::${BKT_D}/*`]
+        };
+
+        mocha.it('should not allow principal get object bucket policy with 2 statements: ' +
+            '(1) DENY principal by account ID (2) ALLOW all principals as *', async function() {
+                // in NC we allow principal to be also IDs
+                if (!is_nc_coretest) this.skip(); // eslint-disable-line no-invalid-this
+                const deny_account_by_id_all_s3_actions_statement =
+                    get_deny_account_by_id_all_s3_actions_statement(user_a_account_details._id);
+                const policy = {
+                    Statement: [
+                        allow_all_principals_all_s3_actions_statement,
+                        deny_account_by_id_all_s3_actions_statement
+                    ]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_D,
+                    Policy: JSON.stringify(policy)
+                });
+                // prepare - put the object to get
+                const key2 = 'file2.txt';
+                const res_put_object = await s3_owner.putObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key2
+                });
+                assert.equal(res_put_object.$metadata.httpStatusCode, 200);
+                // should fail - user a has a DENY statement
+                await assert_throws_async(s3_a.getObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key2
+                }));
+                // should fail - user b does not have a DENY statement (uses the general ALLOW statement)
+                const res_get_object = await s3_b.getObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key2
+                });
+                assert.equal(res_get_object.$metadata.httpStatusCode, 200);
+            });
+
+        mocha.it('should not allow principal get object bucket policy with 2 statements: ' +
+            '(1) DENY principal by account name (2) ALLOW all principals as *', async function() {
+                const policy = {
+                    Statement: [
+                        allow_all_principals_all_s3_actions_statement,
+                        deny_account_by_name_all_s3_actions_statement
+                    ]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_D,
+                    Policy: JSON.stringify(policy)
+                });
+                // prepare - put the object to get
+                const key3 = 'file3.txt';
+                const res_put_object = await s3_owner.putObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key3
+                });
+                assert.equal(res_put_object.$metadata.httpStatusCode, 200);
+                // should fail - user a has a DENY statement
+                await assert_throws_async(s3_a.getObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key3
+                }));
+                // should fail - user b does not have a DENY statement (uses the general ALLOW statement)
+                const res_get_object = await s3_b.getObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key3
+                });
+                assert.equal(res_get_object.$metadata.httpStatusCode, 200);
+            });
+
+        mocha.it('should not allow principal get object bucket policy with 2 statements: ' +
+            '(1) DENY principal by account ID (2) ALLOW by account name', async function() {
+                // in NC we allow principal to be also IDs
+                if (!is_nc_coretest) this.skip(); // eslint-disable-line no-invalid-this
+                const deny_account_by_id_all_s3_actions_statement =
+                    get_deny_account_by_id_all_s3_actions_statement(user_a_account_details._id);
+                const allow_account_by_name_all_s3_actions_statement = _.cloneDeep(deny_account_by_name_all_s3_actions_statement);
+                allow_account_by_name_all_s3_actions_statement.Effect = 'Allow';
+                allow_account_by_name_all_s3_actions_statement.Sid = `Allow user ${user_a} any s3 action`;
+                const policy = {
+                    Statement: [
+                        deny_account_by_id_all_s3_actions_statement,
+                        allow_account_by_name_all_s3_actions_statement
+                    ]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_D,
+                    Policy: JSON.stringify(policy)
+                });
+                // prepare - put the object to get
+                const key4 = 'file4.txt';
+                const res_put_object = await s3_owner.putObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key4
+                });
+                assert.equal(res_put_object.$metadata.httpStatusCode, 200);
+                // should fail - user a has a DENY statement
+                await assert_throws_async(s3_a.getObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key4
+                }));
+            });
+
+        mocha.it('should not allow principal get object bucket policy with 2 statements: ' +
+            '(1) DENY principal by account name (2) ALLOW by account ID', async function() {
+                // in NC we allow principal to be also IDs
+                if (!is_nc_coretest) this.skip(); // eslint-disable-line no-invalid-this
+                const deny_account_by_id_all_s3_actions_statement =
+                    get_deny_account_by_id_all_s3_actions_statement(user_a_account_details._id);
+                const allow_account_by_id_all_s3_actions_statement = _.cloneDeep(deny_account_by_id_all_s3_actions_statement);
+                allow_account_by_id_all_s3_actions_statement.Effect = 'Allow';
+                allow_account_by_id_all_s3_actions_statement.Sid = `Allow user ${user_a_account_details._id} any s3 action`;
+                const policy = {
+                    Statement: [
+                        deny_account_by_name_all_s3_actions_statement,
+                        allow_account_by_id_all_s3_actions_statement
+                    ]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_D,
+                    Policy: JSON.stringify(policy)
+                });
+                // prepare - put the object to get
+                const key5 = 'file5.txt';
+                const res_put_object = await s3_owner.putObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key5
+                });
+                assert.equal(res_put_object.$metadata.httpStatusCode, 200);
+                // should fail - user a has a DENY statement
+                await assert_throws_async(s3_a.getObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key5
+                }));
+            });
+
+        mocha.it('should not allow principal get object bucket policy with 2 statements: ' +
+            '(1) ALLOW principal by account name (2) DENY all principals as * (specific action only)', async function() {
+                const allow_account_by_name_all_s3_actions_statement = _.cloneDeep(deny_account_by_name_all_s3_actions_statement);
+                allow_account_by_name_all_s3_actions_statement.Effect = 'Allow';
+                allow_account_by_name_all_s3_actions_statement.Sid = `Allow user ${user_a} any s3 action`;
+                const policy = {
+                    Statement: [
+                        allow_account_by_name_all_s3_actions_statement,
+                        deny_all_principals_get_object_action_statement
+                    ]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_D,
+                    Policy: JSON.stringify(policy)
+                });
+                // prepare - put the object to get
+                const key6 = 'file6.txt';
+                const res_put_object = await s3_owner.putObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key6
+                });
+                assert.equal(res_put_object.$metadata.httpStatusCode, 200);
+                // should fail - user a has a DENY statement
+                await assert_throws_async(s3_a.getObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key6
+                }));
+            });
+
+        mocha.it('should not allow principal get object bucket policy with 2 statements: ' +
+            '(1) ALLOW principal by account ID (2) DENY all principals as * (specific action only)', async function() {
+                // in NC we allow principal to be also IDs
+                if (!is_nc_coretest) this.skip(); // eslint-disable-line no-invalid-this
+                const deny_account_by_id_all_s3_actions_statement =
+                    get_deny_account_by_id_all_s3_actions_statement(user_a_account_details._id);
+                const allow_account_by_id_all_s3_actions_statement = _.cloneDeep(deny_account_by_id_all_s3_actions_statement);
+                allow_account_by_id_all_s3_actions_statement.Effect = 'Allow';
+                allow_account_by_id_all_s3_actions_statement.Sid = `Allow user ${user_a_account_details._id} any s3 action`;
+                const policy = {
+                    Statement: [
+                        allow_account_by_id_all_s3_actions_statement,
+                        deny_all_principals_get_object_action_statement
+                    ]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_D,
+                    Policy: JSON.stringify(policy)
+                });
+                // prepare - put the object to get
+                const key7 = 'file7.txt';
+                const res_put_object = await s3_owner.putObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key7
+                });
+                assert.equal(res_put_object.$metadata.httpStatusCode, 200);
+                // should fail - user a has a DENY statement
+                await assert_throws_async(s3_a.getObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key7
+                }));
+            });
+
+        mocha.it('should not allow principal get object bucket policy with 2 statements: ' +
+            '(1) ALLOW principal by account name (2) DENY all principals as * (specific action only)', async function() {
+                const allow_account_by_name_all_s3_actions_statement = _.cloneDeep(deny_account_by_name_all_s3_actions_statement);
+                allow_account_by_name_all_s3_actions_statement.Effect = 'Allow';
+                allow_account_by_name_all_s3_actions_statement.Sid = `Allow user ${user_a} any s3 action`;
+                const policy = {
+                    Statement: [
+                        allow_account_by_name_all_s3_actions_statement,
+                        deny_all_principals_get_object_action_statement
+                    ]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_D,
+                    Policy: JSON.stringify(policy)
+                });
+                // prepare - put the object to get
+                const key6 = 'file6.txt';
+                const res_put_object = await s3_owner.putObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key6
+                });
+                assert.equal(res_put_object.$metadata.httpStatusCode, 200);
+                // should fail - user a has a DENY statement
+                await assert_throws_async(s3_a.getObject({
+                    Body: BODY,
+                    Bucket: BKT_D,
+                    Key: key6
+                }));
+            });
     });
 
     mocha.it('should be able to set bucket policy when none set', async function() {
@@ -582,6 +875,249 @@ mocha.describe('s3_bucket_policy', function() {
             Bucket: BKT,
             Key: new_key,
             VersionId: process.env.NC_CORETEST ? first_version_etag : 'nbver-' + (seq - 1)
+        });
+    });
+
+    mocha.describe('bucket policy on get object attributes', async function() {
+        const new_key = 'file105.txt';
+        const body = 'Some data for the file... bla bla bla...';
+
+        mocha.describe('bucket policy on get object attributes - versioning disabled', async function() {
+            mocha.before('put object', async function() {
+                await s3_owner.putObject({
+                    Body: body,
+                    Bucket: BKT_C,
+                    Key: new_key
+                });
+            });
+
+            mocha.after('delete object', async function() {
+                await s3_owner.deleteObject({
+                    Body: body,
+                    Bucket: BKT_C,
+                    Key: new_key
+                });
+            });
+
+            mocha.it('should be able to get object attributes when bucket policy permits - 1 statement (versioning disabled)', async function() {
+                const self = this; // eslint-disable-line no-invalid-this
+                self.timeout(15000);
+
+                const policy = {
+                    Version: '2012-10-17',
+                    Statement: [{
+                        Sid: 'id-1',
+                        Effect: 'Allow',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:GetObject', 's3:GetObjectAttributes'],
+                        Resource: [`arn:aws:s3:::${BKT_C}/*`]
+                    }]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_C,
+                    Policy: JSON.stringify(policy)
+                });
+                await s3_a.getObjectAttributes({
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    ObjectAttributes: ['ObjectSize'],
+                });
+                await assert_throws_async(s3_b.getObjectAttributes({
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    ObjectAttributes: ['ObjectSize'],
+                }));
+            });
+
+            mocha.it('should be able to get object attributes when bucket policy permits - 2 statements (versioning disabled)', async function() {
+                const self = this; // eslint-disable-line no-invalid-this
+                self.timeout(15000);
+
+                const policy = {
+                    Version: '2012-10-17',
+                    Statement: [{
+                        Sid: 'id-1',
+                        Effect: 'Allow',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:GetObject'],
+                        Resource: [`arn:aws:s3:::${BKT_C}/*`]
+                    },
+                    {
+                        Sid: 'id-1',
+                        Effect: 'Allow',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:GetObjectAttributes'],
+                        Resource: [`arn:aws:s3:::${BKT_C}/*`]
+                    }]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_C,
+                    Policy: JSON.stringify(policy)
+                });
+                await s3_a.getObjectAttributes({
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    ObjectAttributes: ['ObjectSize'],
+                });
+                await assert_throws_async(s3_b.getObjectAttributes({
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    ObjectAttributes: ['ObjectSize'],
+                }));
+            });
+
+            mocha.it('should not be able to get object attributes when bucket policy permits - partial permissions (versioning disabled)', async function() {
+                const self = this; // eslint-disable-line no-invalid-this
+                self.timeout(15000);
+
+                const policy = {
+                    Version: '2012-10-17',
+                    Statement: [{
+                        Sid: 'id-1',
+                        Effect: 'Allow',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:GetObject'], // missing 's3:GetObjectAttributes'
+                        Resource: [`arn:aws:s3:::${BKT_C}/*`]
+                    }]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_C,
+                    Policy: JSON.stringify(policy)
+                });
+                await assert_throws_async(s3_a.getObjectAttributes({
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    ObjectAttributes: ['ObjectSize'],
+                }));
+            });
+        });
+
+        mocha.describe('bucket policy on get object attributes - versioning enabled', async function() {
+            // currently the read_object in the object server is hard-coded on regular head object permission
+            // and not flexible to versioned way
+            let version_id;
+
+            mocha.before('put object', async function() {
+                await s3_owner.putBucketVersioning({
+                    Bucket: BKT_C,
+                    VersioningConfiguration: {
+                        MFADelete: 'Disabled',
+                        Status: 'Enabled'
+                    }
+                });
+
+                const res_put = await s3_owner.putObject({
+                    Body: body,
+                    Bucket: BKT_C,
+                    Key: new_key
+                });
+                version_id = res_put.VersionId;
+            });
+
+            mocha.after('delete object', async function() {
+                await s3_owner.deleteObject({
+                    Body: body,
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    VersionId: version_id
+                });
+            });
+
+            mocha.it('should be able to get object attributes when bucket policy permits - 1 statement (versioning enabled)', async function() {
+                const self = this; // eslint-disable-line no-invalid-this
+                self.timeout(15000);
+
+                const policy = {
+                    Version: '2012-10-17',
+                    Statement: [{
+                        Sid: 'id-1',
+                        Effect: 'Allow',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:GetObjectVersion', 's3:GetObjectVersionAttributes'],
+                        Resource: [`arn:aws:s3:::${BKT_C}/*`]
+                    }]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_C,
+                    Policy: JSON.stringify(policy)
+                });
+                await s3_a.getObjectAttributes({
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    VersionId: version_id,
+                    ObjectAttributes: ['ETag'],
+                });
+                await assert_throws_async(s3_b.getObjectAttributes({
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    VersionId: version_id,
+                    ObjectAttributes: ['VersionId'],
+                }));
+            });
+
+            mocha.it('should be able to get object attributes when bucket policy permits - 2 statements (versioning enabled)', async function() {
+                const self = this; // eslint-disable-line no-invalid-this
+                self.timeout(15000);
+
+                const policy = {
+                    Version: '2012-10-17',
+                    Statement: [{
+                        Sid: 'id-1',
+                        Effect: 'Allow',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:GetObjectVersion'],
+                        Resource: [`arn:aws:s3:::${BKT_C}/*`]
+                    },
+                    {
+                        Sid: 'id-1',
+                        Effect: 'Allow',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:GetObjectVersionAttributes'],
+                        Resource: [`arn:aws:s3:::${BKT_C}/*`]
+                    }]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_C,
+                    Policy: JSON.stringify(policy)
+                });
+                await s3_a.getObjectAttributes({
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    VersionId: version_id,
+                    ObjectAttributes: ['ObjectSize'],
+                });
+                await assert_throws_async(s3_b.getObjectAttributes({
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    VersionId: version_id,
+                    ObjectAttributes: ['ObjectSize'],
+                }));
+            });
+
+            mocha.it('should not be able to get object attributes when bucket policy permits - partial permissions (versioning enabled)', async function() {
+                const self = this; // eslint-disable-line no-invalid-this
+                self.timeout(15000);
+
+                const policy = {
+                    Version: '2012-10-17',
+                    Statement: [{
+                        Sid: 'id-1',
+                        Effect: 'Allow',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:GetObjectVersion'], // missing 's3:GetObjectVersionAttributes'
+                        Resource: [`arn:aws:s3:::${BKT_C}/*`]
+                    }]
+                };
+                await s3_owner.putBucketPolicy({
+                    Bucket: BKT_C,
+                    Policy: JSON.stringify(policy)
+                });
+                await assert_throws_async(s3_a.getObjectAttributes({
+                    Bucket: BKT_C,
+                    Key: new_key,
+                    ObjectAttributes: ['ObjectSize'],
+                }));
+            });
         });
     });
 
@@ -1430,6 +1966,131 @@ mocha.describe('s3_bucket_policy', function() {
             });
             const res = await s3_owner.getBucketPolicyStatus({Bucket: BKT});
             assert.strictEqual(res.PolicyStatus.IsPublic, true);
+        });
+    });
+    mocha.describe('s3_bucket_policy: Granting access to a specific version of an object ', function() {
+        mocha.it('should be able to put access permission based on VersionId', async function() {
+            const self = this; // eslint-disable-line no-invalid-this
+            self.timeout(15000);
+            const object_key = 'allowed_file_1.txt';
+
+            await s3_owner.putBucketVersioning({
+                Bucket: VER_BKT,
+                VersioningConfiguration: {
+                    MFADelete: 'Disabled',
+                    Status: 'Enabled'
+                }
+            });
+
+            // Create an object and upload different copies of same object
+            const first_res = await s3_owner.putObject({
+                Body: 'Some data for the file... bla bla bla... version I',
+                Bucket: VER_BKT,
+                Key: object_key
+            });
+
+            await s3_owner.putObject({
+                Body: 'Some data for the file... bla bla bla bla... version II',
+                Bucket: VER_BKT,
+                Key: object_key
+            });
+
+            const third_res = await s3_owner.putObject({
+                Body: 'Some data for the file... bla bla bla bla... version III',
+                Bucket: VER_BKT,
+                Key: object_key
+            });
+
+            const version_policy = {
+                Version: '2012-10-17',
+                Statement: [
+                    {
+                        Sid: 'id-1',
+                        Effect: 'Allow',
+                        Principal: { AWS: user_b },
+                        Action: ['s3:*'],
+                        Resource: [`arn:aws:s3:::${VER_BKT}/${object_key}`]
+                    },
+                    {
+                        Sid: 'id-2',
+                        Effect: 'Allow',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:*'],
+                        Resource: [`arn:aws:s3:::${VER_BKT}/${object_key}`]
+                    },
+                    {
+                        Sid: 'id-3',
+                        Effect: 'Deny',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:GetObjectVersion'],
+                        Resource: [`arn:aws:s3:::${VER_BKT}/${object_key}`],
+                        Condition: {
+                            StringNotEquals: {
+                                's3:VersionId': first_res.VersionId // Use one of the VersionId to set policy
+                            }
+                        }
+                    },
+                    {
+                        Sid: 'id-4',
+                        Effect: 'Deny',
+                        Principal: { AWS: user_a },
+                        Action: ['s3:DeleteObjectVersion'],
+                        Resource: [`arn:aws:s3:::${VER_BKT}/${object_key}`],
+                        Condition: {
+                            StringNotEquals: {
+                                's3:VersionId': first_res.VersionId // Use one of the VersionId to set policy
+                            }
+                        }
+                    }
+                ]
+            };
+            // Put new policy to allow user_b full access while user_a has access on one VersionId
+            const res_put_bucket_policy = await s3_owner.putBucketPolicy({
+                Bucket: VER_BKT,
+                Policy: JSON.stringify(version_policy)
+            });
+            assert.equal(res_put_bucket_policy.$metadata.httpStatusCode, 200);
+
+            const res_get_bucket_policy = await s3_owner.getBucketPolicy({
+                Bucket: VER_BKT,
+            });
+            assert.equal(res_get_bucket_policy.$metadata.httpStatusCode, 200);
+
+            // Access should be Allowed
+            const res1 = await s3_a.getObject({
+                Bucket: VER_BKT,
+                Key: object_key,
+                VersionId: first_res.VersionId
+            });
+            assert.equal(res1.$metadata.httpStatusCode, 200);
+
+            // Access should be Denied
+            await assert_throws_async(s3_a.getObject({
+                Bucket: VER_BKT,
+                Key: object_key,
+                VersionId: third_res.VersionId
+            }));
+
+            // All Access should be allowed : For user_b
+            const res2 = await s3_b.getObject({
+                Bucket: VER_BKT,
+                Key: object_key,
+                VersionId: first_res.VersionId
+            });
+            assert.equal(res2.$metadata.httpStatusCode, 200);
+
+            const res4 = await s3_b.getObject({
+                Bucket: VER_BKT,
+                Key: object_key,
+            });
+            assert.equal(res4.$metadata.httpStatusCode, 200);
+
+            // DELETE should be Allowed : First Version
+            await s3_a.deleteObject({
+                Bucket: VER_BKT,
+                Key: object_key,
+                VersionId: first_res.VersionId
+            });
         });
     });
 });

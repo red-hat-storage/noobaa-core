@@ -3,7 +3,6 @@
 
 const _ = require('lodash');
 const bcrypt = require('bcrypt');
-const ip_module = require('ip');
 
 const P = require('../../util/promise');
 const dbg = require('../../util/debug_module')(__filename);
@@ -578,10 +577,10 @@ function _prepare_auth_request(req) {
             const client_ip = net_utils.unwrap_ipv6(req.auth.client_ip);
             if (client_ip) {
                 let is_allowed = false;
-                const client_ip_val = ip_module.toLong(client_ip);
+                const client_ip_val = net_utils.ip_toLong(client_ip);
                 for (const ip_range of req.account.allowed_ips) {
-                    const start = ip_module.toLong(ip_range.start);
-                    const end = ip_module.toLong(ip_range.end);
+                    const start = net_utils.ip_toLong(ip_range.start);
+                    const end = net_utils.ip_toLong(ip_range.end);
                     if (client_ip_val >= start && client_ip_val <= end) {
                         is_allowed = true;
                         break;
@@ -596,16 +595,16 @@ function _prepare_auth_request(req) {
         dbg.log3('load auth system:', req.system && req.system._id);
     };
 
-    req.has_bucket_anonymous_permission = function(bucket, action, bucket_path) {
-        return has_bucket_anonymous_permission(bucket, action, bucket_path);
+    req.has_bucket_anonymous_permission = function(bucket, action, bucket_path, req_query) {
+        return has_bucket_anonymous_permission(bucket, action, bucket_path, req_query);
     };
 
-    req.has_s3_bucket_permission = async function(bucket, action, bucket_path) {
+    req.has_s3_bucket_permission = async function(bucket, action, bucket_path, req_query) {
         // Since this method can be called both authorized and unauthorized
         // We need to check the anonymous permission only when the bucket is configured to server anonymous requests
         // In case of anonymous function but with authentication flow we roll back to previous code and not return here
         if (req.auth_token && typeof req.auth_token === 'object') {
-            return req.has_bucket_action_permission(bucket, action, bucket_path);
+            return req.has_bucket_action_permission(bucket, action, bucket_path, req_query);
         }
         // If we came with a NooBaa management token then we've already checked the method permissions prior to this function
         // There is nothing specific to bucket permissions for the management credentials
@@ -615,20 +614,20 @@ function _prepare_auth_request(req) {
         }
 
         if (options.anonymous === true) {
-            return req.has_bucket_anonymous_permission(bucket, action, bucket_path);
+            return req.has_bucket_anonymous_permission(bucket, action, bucket_path, req_query);
         }
 
         return false;
     };
 
     req.check_bucket_action_permission = async function(bucket, action, bucket_path) {
-        if (!await has_bucket_action_permission(bucket, req.account, action, bucket_path)) {
+        if (!await has_bucket_action_permission(bucket, req.account, action, undefined, bucket_path)) {
             throw new RpcError('UNAUTHORIZED', 'No permission to access bucket');
         }
     };
 
-    req.has_bucket_action_permission = async function(bucket, action, bucket_path) {
-        return has_bucket_action_permission(bucket, req.account, action, bucket_path);
+    req.has_bucket_action_permission = async function(bucket, action, bucket_path, req_query) {
+        return has_bucket_action_permission(bucket, req.account, action, req_query, bucket_path);
     };
 }
 
@@ -668,11 +667,10 @@ function _get_auth_info(account, system, authorized_by, role, extra) {
  * @param {Record<string, any>} account requesting account
  * @param {string} action s3 bucket action (lowercased only)
  * @param {string} bucket_path s3 bucket path (must start from "/")
- * @returns {boolean} true if the account has permission to perform the action on the bucket
+ * @returns  {Promise<boolean>} true if the account has permission to perform the action on the bucket
  */
-async function has_bucket_action_permission(bucket, account, action, bucket_path = "") {
+async function has_bucket_action_permission(bucket, account, action, req_query, bucket_path = "") {
     dbg.log1('has_bucket_action_permission:', bucket.name, account.email, bucket.owner_account.email);
-
     // If the system owner account wants to access the bucket, allow it
     if (bucket.system.owner.email.unwrap() === account.email.unwrap()) return true;
 
@@ -690,7 +688,7 @@ async function has_bucket_action_permission(bucket, account, action, bucket_path
         account.email.unwrap(),
         action,
         `arn:aws:s3:::${bucket.name.unwrap()}${bucket_path}`,
-        undefined
+        req_query
     );
 
     if (result === 'DENY') return false;
@@ -703,9 +701,10 @@ async function has_bucket_action_permission(bucket, account, action, bucket_path
  * @param {Record<string, any>} bucket bucket
  * @param {string} action s3 action (lowercased)
  * @param {string} bucket_path bucket path
- * @returns {boolean} true if the bucket is configured to serve anonymous requests
+ * @returns {Promise<boolean>} true if the bucket is configured to serve anonymous requests
  */
-async function has_bucket_anonymous_permission(bucket, action, bucket_path = "") {
+async function has_bucket_anonymous_permission(bucket, action, bucket_path, req_query) {
+    bucket_path = bucket_path ?? "";
     const bucket_policy = bucket.s3_policy;
     if (!bucket_policy) return false;
     return await s3_bucket_policy_utils.has_bucket_policy_permission(
@@ -714,7 +713,7 @@ async function has_bucket_anonymous_permission(bucket, action, bucket_path = "")
         undefined,
         action || `s3:GetObject`,
         `arn:aws:s3:::${bucket.name.unwrap()}${bucket_path}`,
-        undefined
+        req_query
     ) === 'ALLOW';
 }
 

@@ -16,10 +16,10 @@ if (test_utils.invalid_nsfs_root_permissions()) {
 
 // // CORE
 require('./test_nsfs_access');
-require('./test_bucketspace');
+require('./test_nsfs_integration');
 require('./test_bucketspace_versioning');
 require('./test_bucketspace_fs');
 require('./test_nsfs_versioning');
-require('./test_nc_nsfs_cli');
-require('./test_nc_nsfs_health');
+require('./test_nc_cli');
+require('./test_nc_health');
 

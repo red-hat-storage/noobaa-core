@@ -6,7 +6,7 @@ const fs = require('fs');
 const argv = require('minimist')(process.argv);
 const AWS = require('aws-sdk');
 const P = require('../../util/promise');
-const Semaphore = require('../../util/semaphore');
+const semaphore = require('../../util/semaphore');
 const os_utils = require('../../util/os_utils');
 
 const UL_TEST = {
@@ -50,43 +50,37 @@ function pre_generation() {
         .then(function() {
             return os_utils.exec('rm -rf ' + UL_TEST.base_dir + '/*');
         })
-        .then(function() {
-            let i = 0;
-            return P.pwhile(
-                function() {
-                    return i < dirs;
-                },
-                function() {
+        .then(async function() {
+            try {
+                let i = 0;
+                while (i < dirs) {
                     i += 1;
-                    return os_utils.exec('mkdir -p ' + UL_TEST.base_dir + '/dir' + i);
-                });
+                    await os_utils.exec('mkdir -p ' + UL_TEST.base_dir + '/dir' + i);
+                }
+            } catch (err) {
+                console.error('Error creating directory structure', err, err.stack);
+                throw new Error('Error creating directory structure');
+            }
         })
-        .catch(function(err) {
-            console.error('Failed creating directory structure', err, err.stack);
-            throw new Error('Failed creating directory structure');
-        })
-        .then(function() {
-            console.log('Generating files (this might take some time) ...');
-            let d = 0;
-            return P.pwhile(
-                function() {
-                    return d < dirs;
-                },
-                function() {
+        .then(async function() {
+            try {
+                console.log('Generating files (this might take some time) ...');
+                let d = 0;
+                while (d < dirs) {
                     d += 1;
                     const files = (d === dirs) ? UL_TEST.num_files % UL_TEST.files_per_dir : UL_TEST.files_per_dir;
                     console.log(' generating batch', d, 'of', files, 'files');
                     for (let i = 1; i <= files; ++i) {
                         UL_TEST.files.push(UL_TEST.base_dir + '/dir' + d + '/file_' + i);
                     }
-                    return os_utils.exec('for i in `seq 1 ' + files + '` ; do' +
+                    await os_utils.exec('for i in `seq 1 ' + files + '` ; do' +
                         ' dd if=/dev/urandom of=' + UL_TEST.base_dir + '/dir' + d +
                         '/file_$i  bs=' + UL_TEST.file_size + 'k count=1 ; done');
-                });
-        })
-        .catch(function(err) {
-            console.error('Failed generating files', err, err.stack);
-            throw new Error('Failed generating files');
+                }
+            } catch (err) {
+                console.error('Error generating files', err, err.stack);
+                throw new Error('Error generating files');
+            }
         });
 }
 
@@ -97,7 +91,7 @@ function upload_test() {
         Bucket: UL_TEST.bucket_name
     });
 
-    const upload_semaphore = new Semaphore(UL_TEST.num_threads);
+    const upload_semaphore = new semaphore.Semaphore(UL_TEST.num_threads);
     return P.all(_.map(UL_TEST.files, function(f) {
         return upload_semaphore.surround(function() {
             return upload_file(f);

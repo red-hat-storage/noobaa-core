@@ -84,6 +84,18 @@ endif
 BUILD_S3SELECT?=1
 BUILD_S3SELECT_PARQUET?=0
 
+## RPM VARIABLES 
+DATE := $(shell date +'%Y%m%d')
+NOOBAA_PKG_VERSION := $(shell jq -r '.version' < ./package.json)
+RPM_BASE_VERSION := noobaa-core-$(NOOBAA_PKG_VERSION)-${DATE}
+ifeq ($(CONTAINER_PLATFORM), linux/amd64)
+  ARCH_SUFFIX := x86_64
+else ifeq ($(CONTAINER_PLATFORM), linux/ppc64le)
+  ARCH_SUFFIX := ppc64le
+endif
+RPM_FULL_PATH := $(RPM_BASE_VERSION).el${CENTOS_VER}.$(ARCH_SUFFIX).rpm
+install_rpm_and_deps_command := dnf install -y make && rpm -i $(RPM_FULL_PATH) && systemctl enable noobaa --now && systemctl status noobaa && systemctl stop noobaa
+
 ###############
 # BUILD LOCAL #
 ###############
@@ -168,12 +180,31 @@ nbdev:
 rpm: builder
 	echo "\033[1;34mStarting RPM build for $${CONTAINER_PLATFORM}.\033[0m"
 	mkdir -p build/rpm
+	$(CONTAINER_ENGINE) rm -f noobaa-rpm-build-env
 	$(CONTAINER_ENGINE) build $(CONTAINER_PLATFORM_FLAG) $(CPUSET) -f src/deploy/RPM_build/RPM.Dockerfile $(CACHE_FLAG) -t $(NOOBAA_RPM_TAG) --build-arg CENTOS_VER=$(CENTOS_VER) --build-arg BUILD_S3SELECT=$(BUILD_S3SELECT) --build-arg BUILD_S3SELECT_PARQUET=$(BUILD_S3SELECT_PARQUET) --build-arg SRPM_ONLY=$(SRPM_ONLY) --build-arg GIT_COMMIT=$(GIT_COMMIT) . $(REDIRECT_STDOUT)
 	echo "\033[1;32mImage \"$(NOOBAA_RPM_TAG)\" is ready.\033[0m"
 	echo "Generating RPM..."
-	$(CONTAINER_ENGINE) run --rm -v $(PWD)/build/rpm:/export:z -t $(NOOBAA_RPM_TAG)
+	$(CONTAINER_ENGINE) run --name noobaa-rpm-build-env -t $(NOOBAA_RPM_TAG)
+	mkdir -p $(PWD)/build/rpm && $(CONTAINER_ENGINE) cp noobaa-rpm-build-env:/export/. $(PWD)/build/rpm/
+	$(CONTAINER_ENGINE) rm -f noobaa-rpm-build-env
 	echo "\033[1;32mRPM for platform \"$(NOOBAA_RPM_TAG)\" is ready in build/rpm.\033[0m";
 .PHONY: rpm
+
+assert-rpm-build-and-install-test-platform:
+	@ if [ "${CONTAINER_PLATFORM}" != "linux/amd64" ]; then \
+		echo "\n  Error: Running rpm-build-and-install-test linux/amd64 is currently the only supported container platform\n"; \
+		exit 1; \
+	fi
+.PHONY: assert-rpm-build-and-install-test-platform
+
+rpm-build-and-install-test: assert-rpm-build-and-install-test-platform rpm
+	@echo "Running RHEL linux/amd64 (currently only supported) container..."
+	$(CONTAINER_ENGINE) run --name noobaa-rpm-build-and-install-test --privileged --user root -dit --platform=linux/amd64 redhat/ubi$(CENTOS_VER)-init
+	@echo "Copying rpm_full_path=$(RPM_FULL_PATH) to the container..."
+	$(CONTAINER_ENGINE) cp ./build/rpm/$(RPM_FULL_PATH) noobaa-rpm-build-and-install-test:$(RPM_FULL_PATH)
+	@echo "Installing RPM and dependencies in the container... $(install_rpm_and_deps_command)"
+	$(CONTAINER_ENGINE) exec noobaa-rpm-build-and-install-test bash -c "$(install_rpm_and_deps_command)"
+.PHONY: rpm-build-and-install-test
 
 ###############
 # TEST IMAGES #
@@ -197,6 +228,12 @@ build-ssl-postgres: tester
 	@echo "\033[1;32mBuild SSL Postgres done.\033[0m"
 	@echo "##\033[1;32m Build image postgres:ssl done.\033[0m"
 .PHONY: build-ssl-postgres
+
+build-aws-client: noobaa
+	@echo "\n##\033[1;32m Build image for AWS Client tests ...\033[0m"
+	$(CONTAINER_ENGINE) build $(CONTAINER_PLATFORM_FLAG) $(CPUSET) -f src/deploy/NVA_build/AWSClient.Dockerfile $(CACHE_FLAG) $(NETWORK_FLAG) -t noobaa-aws-client . $(REDIRECT_STDOUT)
+	@echo "\033[1;32mBuild image for AWS Client tests done.\033[0m"
+.PHONY: build-aws-client
 
 test: tester
 	@echo "\033[1;34mRunning tests with Mongo.\033[0m"
@@ -228,7 +265,7 @@ run-single-test: tester
 	@$(call run_mongo)
 	@$(call run_blob_mock)
 	@echo "\033[1;34mRunning tests\033[0m"
-	$(CONTAINER_ENGINE) run $(CPUSET) --network noobaa-net --name noobaa_$(GIT_COMMIT)_$(NAME_POSTFIX) --env "SUPPRESS_LOGS=$(SUPPRESS_LOGS)" --env "DB_TYPE=mongodb" --env "MONGODB_URL=mongodb://noobaa:noobaa@coretest-mongo-$(GIT_COMMIT)-$(NAME_POSTFIX)" --env "BLOB_HOST=blob-mock-$(GIT_COMMIT)-$(NAME_POSTFIX)" $(TESTER_TAG) ./src/test/unit_tests/run_npm_test_on_test_container.sh -s $(testname)
+	$(CONTAINER_ENGINE) run $(CPUSET) --network noobaa-net --name noobaa_$(GIT_COMMIT)_$(NAME_POSTFIX) --env "SUPPRESS_LOGS=$(SUPPRESS_LOGS)" --env "DB_TYPE=mongodb" --env "MONGODB_URL=mongodb://noobaa:noobaa@coretest-mongo-$(GIT_COMMIT)-$(NAME_POSTFIX)" --env "BLOB_HOST=blob-mock-$(GIT_COMMIT)-$(NAME_POSTFIX)" --env "NOOBAA_LOG_LEVEL=all" $(TESTER_TAG) ./src/test/unit_tests/run_npm_test_on_test_container.sh -s $(testname)
 	@$(call stop_noobaa)
 	@$(call stop_blob_mock)
 	@$(call stop_mongo)
@@ -331,6 +368,17 @@ test-external-pg-sanity: build-ssl-postgres
 	@$(call stop_external_postgres)
 	@$(call remove_docker_network)
 .PHONY: test-external-pg-sanity
+
+test-aws-sdk-clients: build-aws-client
+	@echo "\033[1;34mRunning tests with Postgres.\033[0m"
+	@$(call create_docker_network)
+	@$(call run_postgres)
+	@echo "\033[1;34mRunning aws sdk clients tests\033[0m"
+	$(CONTAINER_ENGINE) run $(CPUSET) --network noobaa-net --name noobaa_$(GIT_COMMIT)_$(NAME_POSTFIX) --env "SUPPRESS_LOGS=$(SUPPRESS_LOGS)" --env "POSTGRES_HOST=coretest-postgres-$(GIT_COMMIT)-$(NAME_POSTFIX)" --env "POSTGRES_USER=noobaa" --env "DB_TYPE=postgres" --env "POSTGRES_DBNAME=coretest" --env "NOOBAA_LOG_LEVEL=all" -v $(PWD)/logs:/logs  noobaa-aws-client ./src/test/unit_tests/run_npm_test_on_test_container.sh -c ./node_modules/mocha/bin/mocha.js src/test/unit_tests/different_clients/test_go_sdkv2_script.js
+	@$(call stop_noobaa)
+	@$(call stop_postgres)
+	@$(call remove_docker_network)
+.PHONY: test-aws-sdk-clients
 
 clean:
 	@echo Stopping and Deleting containers

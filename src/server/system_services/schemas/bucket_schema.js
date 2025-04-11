@@ -203,6 +203,10 @@ module.exports = {
         lifecycle_configuration_rules: {
             $ref: 'common_api#/definitions/bucket_lifecycle_configuration'
         },
+        //cors rules if exist
+        cors_configuration_rules: {
+            $ref: 'common_api#/definitions/bucket_cors_configuration'
+        },
         tagging: {
             $ref: 'common_api#/definitions/tagging',
         },
@@ -275,5 +279,14 @@ module.exports = {
         logging: {
             $ref: 'common_api#/definitions/bucket_logging',
         },
+        notifications: {
+            type: 'array',
+            items: {
+                $ref: 'common_api#/definitions/bucket_notification'
+            }
+        },
+        public_access_block: {
+            $ref: 'common_api#/definitions/public_access_block',
+        }
     }
 };

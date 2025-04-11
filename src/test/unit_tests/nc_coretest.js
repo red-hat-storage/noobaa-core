@@ -8,7 +8,7 @@ const mocha = require('mocha');
 const child_process = require('child_process');
 const argv = require('minimist')(process.argv);
 const SensitiveString = require('../../util/sensitive_string');
-const { exec_manage_cli, TMP_PATH } = require('../system_tests/test_utils');
+const { exec_manage_cli, TMP_PATH, create_redirect_file, delete_redirect_file } = require('../system_tests/test_utils');
 const { TYPES, ACTIONS } = require('../../manage_nsfs/manage_nsfs_constants');
 const { ConfigFS } = require('../../sdk/config_fs');
 
@@ -18,7 +18,7 @@ const config_dir_name = 'nc_coretest_config_root_path';
 const master_key_location = `${TMP_PATH}/${config_dir_name}/master_keys.json`;
 const NC_CORETEST_CONFIG_DIR_PATH = `${TMP_PATH}/${config_dir_name}`;
 process.env.DEBUG_MODE = 'true';
-process.env.ACCOUNTS_CACHE_EXPIRY = '1';
+// process.env.ACCOUNTS_CACHE_EXPIRY = '1'; In NC we check if the config file was changed as validation
 process.env.NC_CORETEST = 'true';
 
 require('../../util/dotenv').load();
@@ -41,31 +41,37 @@ dbg.set_module_level(dbg_level, 'core');
 
 const P = require('../../util/promise');
 let _setup = false;
+let _nsfs_process = false;
 
 const SYSTEM = NC_CORETEST;
 const EMAIL = NC_CORETEST;
 const PASSWORD = NC_CORETEST;
 const http_port = 6001;
 const https_port = 6443;
+const https_port_iam = 7005;
 const http_address = `http://localhost:${http_port}`;
 const https_address = `https://localhost:${https_port}`;
+const https_address_iam = `https://localhost:${https_port_iam}`;
 
 const FIRST_BUCKET = 'first.bucket';
-const NC_CORETEST_REDIRECT_FILE_PATH = p.join(config.NSFS_NC_DEFAULT_CONF_DIR, '/config_dir_redirect');
-const NC_CORETEST_STORAGE_PATH = p.join(TMP_PATH, '/nc_coretest_storage_root_path/');
+const NC_CORETEST_STORAGE_PATH = p.join(TMP_PATH, 'nc_coretest_storage_root_path/');
 const FIRST_BUCKET_PATH = p.join(NC_CORETEST_STORAGE_PATH, FIRST_BUCKET, '/');
 const CONFIG_FILE_PATH = p.join(NC_CORETEST_CONFIG_DIR_PATH, 'config.json');
 const NC_CORETEST_CONFIG_FS = new ConfigFS(NC_CORETEST_CONFIG_DIR_PATH);
 
 const nsrs_to_root_paths = {};
 let nsfs_process;
+let current_setup_options = {};
 
 
 /**
  * setup will setup nc coretest
- * @param {object} options
+ * currently the setup_options we use are for the nsfs process: fork and debug
+ * @param {object} setup_options
  */
-function setup(options = {}) {
+function setup(setup_options = {}) {
+    console.log(`in setup - variables values: _setup ${_setup} _nsfs_process ${_nsfs_process} ` +
+        `setup_options`, setup_options);
     if (_setup) return;
     _setup = true;
 
@@ -77,28 +83,10 @@ function setup(options = {}) {
         await config_dir_setup();
         await admin_account_creation();
         await first_bucket_creation();
-
-        await announce('start nsfs script');
-        const logStream = fs.createWriteStream('src/logfile.txt', { flags: 'a' });
-
-        nsfs_process = child_process.spawn('node', ['src/cmd/nsfs.js'], {
-            detached: true
-        });
-        nsfs_process.stdout.pipe(logStream);
-        nsfs_process.stderr.pipe(logStream);
-
-
-        nsfs_process.on('exit', (code, signal) => {
-            dbg.error(`nsfs.js exited code=${code}, signal=${signal}`);
-            logStream.end();
-        });
-
-        nsfs_process.on('error', err => {
-            dbg.error(`nsfs.js exited with error`, err);
-            logStream.end();
-        });
+        await start_nsfs_process(setup_options);
 
         // TODO - run health
+        current_setup_options = setup_options;
         await announce(`nc coretest ready... (took ${((Date.now() - start) / 1000).toFixed(1)} sec)`);
     });
 
@@ -106,14 +94,82 @@ function setup(options = {}) {
     mocha.after('nc-coretest-after', async function() {
         this.timeout(60000); // eslint-disable-line no-invalid-this
         try {
-            await announce('stop nsfs script');
-            if (nsfs_process) nsfs_process.kill('SIGKILL');
+            await stop_nsfs_process();
             await config_dir_teardown();
             await announce('nc coretest done ...');
         } catch (err) {
             dbg.error('got error on mocha.after', err);
         }
     });
+}
+
+/**
+ * start_nsfs_process starts the NSFS process and attach the logs in a file
+ * the setup_options we support:
+ * 1. forks (number of processes to run)
+ * 2. debug (for logs printing level)
+ * @param {object} setup_options
+ */
+async function start_nsfs_process(setup_options) {
+    console.log(`in start_nsfs_process - variables values: _setup ${_setup} _nsfs_process ${_nsfs_process}`);
+    const { forks, debug, should_run_iam } = setup_options;
+    console.log(`setup_options: forks ${forks} debug ${debug} should_run_iam ${should_run_iam}`);
+    if (_nsfs_process) return;
+    await announce('start nsfs script');
+    const logStream = fs.createWriteStream('nsfs_integration_test_log.txt', { flags: 'a' });
+
+    const arguments_for_command = ['src/cmd/nsfs.js'];
+    if (forks) {
+        arguments_for_command.push('--forks');
+        arguments_for_command.push(`${forks}`);
+    }
+    if (debug) {
+        arguments_for_command.push('--debug');
+        arguments_for_command.push(`${debug}`);
+    }
+    if (should_run_iam && https_port_iam) {
+        arguments_for_command.push('--https_port_iam');
+        arguments_for_command.push(`${https_port_iam}`);
+    }
+    nsfs_process = child_process.spawn('node', arguments_for_command, {
+        detached: true
+    });
+
+    _nsfs_process = true;
+
+    nsfs_process.stdout.pipe(logStream);
+    nsfs_process.stderr.pipe(logStream);
+
+
+    nsfs_process.on('exit', (code, signal) => {
+        dbg.error(`nsfs.js exited code=${code}, signal=${signal}`);
+        logStream.end();
+    });
+
+    nsfs_process.on('error', err => {
+        dbg.error(`nsfs.js exited with error`, err);
+        logStream.end();
+    });
+    // wait for the process to be ready (else would see ECONNREFUSED issue)
+    await P.delay(5000);
+}
+
+/**
+ * stop_nsfs_process stops the NSFS
+ */
+async function stop_nsfs_process() {
+    console.log(`in stop_nsfs_process - variables values: _setup ${_setup} _nsfs_process ${_nsfs_process}`);
+    _nsfs_process = false;
+    await announce('stop nsfs script');
+    if (nsfs_process) nsfs_process.kill('SIGKILL');
+}
+
+/**
+ * get_current_setup_options returns the current_setup_options
+ * currently the setup_options we use are for the nsfs process: fork and debug
+ */
+function get_current_setup_options() {
+    return current_setup_options;
 }
 
 /**
@@ -141,14 +197,15 @@ async function config_dir_setup() {
     await fs.promises.mkdir(NC_CORETEST_STORAGE_PATH, { recursive: true });
     await fs.promises.mkdir(config.NSFS_NC_DEFAULT_CONF_DIR, { recursive: true });
     await fs.promises.mkdir(NC_CORETEST_CONFIG_DIR_PATH, { recursive: true });
-    await fs.promises.writeFile(NC_CORETEST_REDIRECT_FILE_PATH, NC_CORETEST_CONFIG_DIR_PATH);
+    await create_redirect_file(NC_CORETEST_CONFIG_FS, NC_CORETEST_CONFIG_DIR_PATH);
     await fs.promises.writeFile(CONFIG_FILE_PATH, JSON.stringify({
         ALLOW_HTTP: true,
         OBJECT_SDK_BUCKET_CACHE_EXPIRY_MS: 1,
         NC_RELOAD_CONFIG_INTERVAL: 1,
         // DO NOT CHANGE - setting VACCUM_ANALYZER_INTERVAL=1 needed for failing the tests
         // in case where vaccumAnalyzer is being called before setting process.env.NC_NSFS_NO_DB_ENV = 'true' on nsfs.js
-        VACCUM_ANALYZER_INTERVAL: 1
+        VACCUM_ANALYZER_INTERVAL: 1,
+        NSFS_CONTENT_DIRECTORY_VERSIONING_ENABLED: true
     }));
     await fs.promises.mkdir(FIRST_BUCKET_PATH, { recursive: true });
 }
@@ -160,7 +217,7 @@ async function config_dir_setup() {
 async function config_dir_teardown() {
     await announce('config_dir_teardown');
     await fs.promises.rm(NC_CORETEST_STORAGE_PATH, { recursive: true });
-    await fs.promises.rm(NC_CORETEST_REDIRECT_FILE_PATH);
+    await delete_redirect_file(NC_CORETEST_CONFIG_FS);
     await fs.promises.rm(NC_CORETEST_CONFIG_DIR_PATH, { recursive: true, force: true });
 }
 
@@ -216,6 +273,14 @@ function get_http_address() {
  */
 function get_https_address() {
     return https_address;
+}
+
+/**
+ * get_iam_https_address return nc coretest https_address_iam variable
+ * @returns {string}
+ */
+function get_iam_https_address() {
+    return https_address_iam;
 }
 
 ///////////////////////////////////
@@ -471,6 +536,9 @@ const rpc_cli_funcs_to_manage_nsfs_cli_cmds = {
 };
 
 exports.setup = setup;
+exports.get_current_setup_options = get_current_setup_options;
+exports.stop_nsfs_process = stop_nsfs_process;
+exports.start_nsfs_process = start_nsfs_process;
 exports.no_setup = _.noop;
 exports.log = log;
 exports.SYSTEM = SYSTEM;
@@ -480,6 +548,7 @@ exports.get_dbg_level = get_dbg_level;
 exports.rpc_client = rpc_cli_funcs_to_manage_nsfs_cli_cmds;
 exports.get_http_address = get_http_address;
 exports.get_https_address = get_https_address;
+exports.get_iam_https_address = get_iam_https_address;
 exports.get_admin_mock_account_details = get_admin_mock_account_details;
 exports.NC_CORETEST_CONFIG_DIR_PATH = NC_CORETEST_CONFIG_DIR_PATH;
 exports.NC_CORETEST_CONFIG_FS = NC_CORETEST_CONFIG_FS;

@@ -300,6 +300,59 @@ module.exports = {
             }
         },
 
+        get_bucket_notification: {
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: [
+                    'name'
+                ],
+                properties: {
+                    name: { $ref: 'common_api#/definitions/bucket_name' },
+                }
+            },
+            reply: {
+                type: 'object',
+                required: [
+                    'notifications'
+                ],
+                properties: {
+                    notifications: {
+                        type: 'array',
+                        items: {
+                            $ref: 'common_api#/definitions/bucket_notification'
+                        }
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        put_bucket_notification: {
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: [
+                    'notifications',
+                    'name',
+                ],
+                properties: {
+                    name: { $ref: 'common_api#/definitions/bucket_name' },
+                    notifications: {
+                        type: 'array',
+                        items: {
+                            $ref: 'common_api#/definitions/bucket_notification'
+                        }
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user'],
+            }
+        },
+
         read_bucket_sdk_info: {
             method: 'GET',
             params: {
@@ -388,6 +441,17 @@ module.exports = {
 
         list_buckets: {
             method: 'GET',
+            params: {
+                type: 'object',
+                properties: {
+                    continuation_token: { $ref: 'common_api#/definitions/continuation_token' },
+                    max_buckets: {
+                        type: 'integer',
+                        minimum: 1,
+                        maximum: 1000
+                    }
+                }
+            },
             reply: {
                 type: 'object',
                 required: ['buckets'],
@@ -401,10 +465,11 @@ module.exports = {
                                 name: { $ref: 'common_api#/definitions/bucket_name' },
                                 creation_date: {
                                     idate: true
-                                },
+                                }
                             }
                         }
-                    }
+                    },
+                    continuation_token: { $ref: 'common_api#/definitions/continuation_token' }
                 }
             },
             auth: {
@@ -825,6 +890,124 @@ module.exports = {
                 system: ['admin', 'user']
             }
         },
+
+        get_bucket_cors: {
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: ['name'],
+                properties: {
+                    name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                },
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    cors: {
+                        $ref: 'common_api#/definitions/bucket_cors_configuration'
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        put_bucket_cors: {
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: ['name', 'cors_rules'],
+                properties: {
+                    name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                    cors_rules: {
+                        $ref: 'common_api#/definitions/bucket_cors_configuration'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        delete_bucket_cors: {
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: ['name'],
+                properties: {
+                    name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        get_public_access_block: {
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: ['bucket_name'],
+                properties: {
+                    bucket_name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    }
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    public_access_block: {
+                        $ref: 'common_api#/definitions/public_access_block'
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        put_public_access_block: {
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: ['bucket_name', 'public_access_block'],
+                properties: {
+                    bucket_name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                    public_access_block: {
+                        $ref: 'common_api#/definitions/public_access_block'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        delete_public_access_block: {
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: ['bucket_name'],
+                properties: {
+                    bucket_name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
     },
 
     definitions: {
@@ -1130,6 +1313,15 @@ module.exports = {
                 bucket_info: {
                     $ref: '#/definitions/bucket_info'
                 },
+                notifications: {
+                    type: 'array',
+                    items: {
+                        $ref: 'common_api#/definitions/bucket_notification'
+                    }
+                },
+                cors_configuration_rules: {
+                    $ref: 'common_api#/definitions/bucket_cors_configuration',
+                }
             }
         },
 

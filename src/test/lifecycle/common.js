@@ -2,6 +2,7 @@
 'use strict';
 
 const assert = require('assert');
+const s3_const = require('../../endpoint/s3/s3_constants');
 
 /*
  *  https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html
@@ -26,6 +27,7 @@ function marker_lifecycle_configuration(Bucket, Key) {
         },
     };
 }
+exports.marker_lifecycle_configuration = marker_lifecycle_configuration;
 
 function empty_filter_marker_lifecycle_configuration(Bucket) {
     return {
@@ -187,6 +189,7 @@ function days_lifecycle_configuration(Bucket, Key) {
         },
     };
 }
+exports.days_lifecycle_configuration = days_lifecycle_configuration;
 
 function tags_lifecycle_configuration(Bucket, Key, Value) {
     return {
@@ -358,6 +361,80 @@ function id_lifecycle_configuration(Bucket, Key) {
     };
 }
 
+function duplicate_id_lifecycle_configuration(Bucket, Key) {
+    const ID1 = 'rule_id';
+    const ID2 = ID1; // set duplicate ID
+    return {
+        Bucket,
+        LifecycleConfiguration: {
+            Rules: [{
+                ID1,
+                Expiration: {
+                    Days: 17,
+                },
+                Filter: {
+                    Prefix: Key,
+                },
+                Status: 'Enabled',
+            },
+            {
+                ID2,
+                Expiration: {
+                    Days: 18,
+                },
+                Filter: {
+                    Prefix: Key,
+                },
+                Status: 'Enabled',
+            }, ],
+        },
+    };
+}
+
+function version_lifecycle_configuration(Bucket, Key, Days, NewnonCurrentVersion, NonCurrentDays) {
+    const ID = 'rule_id';
+    return {
+        Bucket,
+        LifecycleConfiguration: {
+            Rules: [{
+                ID,
+                Filter: {
+                    Prefix: Key,
+                },
+                Expiration: {
+                    Days: Days,
+                },
+                NoncurrentVersionExpiration: {
+                    NewerNoncurrentVersions: NewnonCurrentVersion,
+                    NoncurrentDays: NonCurrentDays,
+                },
+                Status: 'Enabled',
+            }, ],
+        },
+    };
+}
+exports.version_lifecycle_configuration = version_lifecycle_configuration;
+
+function multipart_lifecycle_configuration(Bucket, Key, Days) {
+    const ID = 'rule_id';
+    return {
+        Bucket,
+        LifecycleConfiguration: {
+            Rules: [{
+                ID,
+                Filter: {
+                    Prefix: Key,
+                },
+                AbortIncompleteMultipartUpload: {
+                    DaysAfterInitiation: Days,
+                },
+                Status: 'Enabled',
+            }, ],
+        },
+    };
+}
+exports.multipart_lifecycle_configuration = multipart_lifecycle_configuration;
+
 async function put_get_lifecycle_configuration(Bucket, putLifecycleParams, s3) {
     const putLifecycleResult = await s3.putBucketLifecycleConfiguration(putLifecycleParams);
     console.log('put lifecycle params:', putLifecycleParams, 'result', putLifecycleResult);
@@ -377,6 +454,27 @@ async function put_get_lifecycle_configuration(Bucket, putLifecycleParams, s3) {
 
     return getLifecycleResult;
 }
+
+exports.test_multipart = async function(Bucket, Key, s3) {
+    const putLifecycleParams = multipart_lifecycle_configuration(Bucket, Key, 10);
+    const getLifecycleResult = await put_get_lifecycle_configuration(Bucket, putLifecycleParams, s3);
+
+    const expirationDays = getLifecycleResult.Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation.Days;
+    const expectedExpirationDays = putLifecycleParams.LifecycleConfiguration.Rules[0]
+                                        .AbortIncompleteMultipartUpload.DaysAfterInitiation.Days;
+    console.log('get lifecycle multipart expiration:', expirationDays, ' expected:', expectedExpirationDays);
+    assert(expirationDays === expectedExpirationDays, 'Multipart Expiration days do not match');
+};
+
+exports.test_version = async function(Bucket, Key, s3) {
+    const putLifecycleParams = version_lifecycle_configuration(Bucket, Key, 10, 5, 10);
+    const getLifecycleResult = await put_get_lifecycle_configuration(Bucket, putLifecycleParams, s3);
+
+    const expirationDays = getLifecycleResult.Rules[0].Expiration.Days;
+    const expectedExpirationDays = putLifecycleParams.LifecycleConfiguration.Rules[0].Expiration.Days;
+    console.log('get lifecycle version expiration:', expirationDays, ' expected:', expectedExpirationDays);
+    assert(expirationDays === expectedExpirationDays, 'Expiration days do not match');
+};
 
 exports.test_rules_length = async function(Bucket, Key, s3) {
     const putLifecycleParams = rules_length_lifecycle_configuration(Bucket, Key);
@@ -511,4 +609,44 @@ exports.test_and_prefix_size = async function(Bucket, Key, s3) {
     assert(actualFilter.Prefix === expectedFilter.Prefix, 'and prefix size filter - Prefix');
     assert(actualFilter.ObjectSizeGreaterThan === expectedFilter.ObjectSizeGreaterThan, 'and prefix size filter - ObjectSizeGreaterThan');
     assert(actualFilter.ObjectSizeLessThan === expectedFilter.ObjectSizeLessThan, 'and prefix size filter - ObjectSizeLessThan');
+};
+
+exports.test_rule_id_length = async function(Bucket, Key, s3) {
+    const putLifecycleParams = id_lifecycle_configuration(Bucket, Key);
+
+    // set the ID to a value with more than 'MAX_RULE_ID_LENGTH' characters
+    const ID = 'A'.repeat(s3_const.MAX_RULE_ID_LENGTH + 5);
+    putLifecycleParams.LifecycleConfiguration.Rules[0].ID = ID;
+
+    try {
+        await s3.putBucketLifecycleConfiguration(putLifecycleParams);
+        assert.fail(`Expected error for ID length exceeding maximum allowed characters ${s3_const.MAX_RULE_ID_LENGTH}, but request was successful`);
+    } catch (error) {
+        assert(error.code === 'InvalidArgument', `Expected InvalidArgument: id length exceeding ${s3_const.MAX_RULE_ID_LENGTH} characters`);
+    }
+};
+
+exports.test_rule_duplicate_id = async function(Bucket, Key, s3) {
+    const putLifecycleParams = duplicate_id_lifecycle_configuration(Bucket, Key);
+
+    try {
+        await s3.putBucketLifecycleConfiguration(putLifecycleParams);
+        assert.fail('Expected error for duplicate rule ID, but request was successful');
+    } catch (error) {
+        assert(error.code === 'InvalidArgument', 'Expected InvalidArgument: duplicate ID found in the rules');
+    }
+};
+
+exports.test_rule_status_value = async function(Bucket, Key, s3) {
+    const putLifecycleParams = id_lifecycle_configuration(Bucket, Key);
+
+    // set the status value to an invalid value - other than 'Enabled' and 'Disabled'
+    putLifecycleParams.LifecycleConfiguration.Rules[0].Status = 'enabled';
+
+    try {
+        await s3.putBucketLifecycleConfiguration(putLifecycleParams);
+        assert.fail('Expected MalformedXML error due to wrong status value, but received a different response');
+    } catch (error) {
+        assert(error.code === 'MalformedXML', `Expected MalformedXML error: due to invalid status value`);
+    }
 };

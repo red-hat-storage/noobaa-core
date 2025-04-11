@@ -1,4 +1,4 @@
-FROM noobaa-builder
+FROM noobaa-builder AS noobaa-base
 
 ######################################################################
 # Layers:
@@ -9,6 +9,8 @@ FROM noobaa-builder
 COPY ./package*.json ./
 RUN npm install --omit=dev && \
     npm cache clean --force
+RUN rm -rf node_modules/node-rdkafka/deps/librdkafka/examples/
+RUN rm -rf node_modules/node-rdkafka/deps/librdkafka/src/
 
 ##############################################################
 # Layers:
@@ -30,6 +32,7 @@ RUN ./src/deploy/NVA_build/clone_s3select_submodules.sh
 RUN ln -s /lib64/libboost_thread.so.1.66.0 /lib64/libboost_thread.so.1.75.0 || true
 #Pass BUILD_S3SELECT down to GYP native build.
 #S3Select will be built only if this parameter is equal to "1".
+#Next step would fail for RHEL8 and derivatives
 RUN GYP_DEFINES="BUILD_S3SELECT=$BUILD_S3SELECT BUILD_S3SELECT_PARQUET=$BUILD_S3SELECT_PARQUET" npm run build
 
 ##############################################################

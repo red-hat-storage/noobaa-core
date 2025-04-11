@@ -8,6 +8,7 @@ const mocha = require('mocha');
 const assert = require('assert');
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 
 // keep me first - this is setting envs that should be set before other modules are required.
 const CORETEST = 'coretest';
@@ -26,6 +27,7 @@ config.test_mode = true;
 config.NODES_FREE_SPACE_RESERVE = 10 * 1024 * 1024;
 config.NSFS_VERSIONING_ENABLED = true;
 config.OBJECT_SDK_BUCKET_CACHE_EXPIRY_MS = 1;
+config.NSFS_CONTENT_DIRECTORY_VERSIONING_ENABLED = true;
 
 config.ROOT_KEY_MOUNT = '/tmp/noobaa-server/root_keys';
 
@@ -49,6 +51,9 @@ const system_store = require('../../server/system_services/system_store').get_in
 const MDStore = require('../../server/object_services/md_store').MDStore;
 const pool_server = require('../../server/system_services/pool_server');
 const pool_ctrls = require('../../server/system_services/pool_controllers');
+const { PersistentLogger } = require('../../util/persistent_logger');
+const os = require('os');
+const { TMP_PATH } = require('../system_tests/test_utils');
 
 // Set the pools server pool controller factory to create pools with
 // backed by in process agents.
@@ -132,11 +137,18 @@ function setup(options = {}) {
     _.each(server_rpc.rpc._services,
         (service, srv) => api_coverage.add(srv));
 
+    const notification_logger =
+        new PersistentLogger(path.join(TMP_PATH, 'test_notifications', 'notif_logs'),
+        process.env.NODE_NAME || os.hostname() + '_' + config.NOTIFICATION_LOG_NS, {
+            locking: 'SHARED',
+            poll_interval: config.NSFS_GLACIER_LOGS_POLL_INTERVAL,
+        });
+
     const object_io = new ObjectIO();
-    const endpoint_request_handler = endpoint.create_endpoint_handler(
-        endpoint.create_init_request_sdk(server_rpc.rpc, rpc_client, object_io), [], false);
-    const endpoint_request_handler_sts = endpoint.create_endpoint_handler(
-        endpoint.create_init_request_sdk(server_rpc.rpc, rpc_client, object_io), [], true);
+    const endpoint_request_handler = endpoint.create_endpoint_handler('S3',
+        endpoint.create_init_request_sdk(server_rpc.rpc, rpc_client, object_io), { virtual_hosts: [], notification_logger });
+    const endpoint_request_handler_sts = endpoint.create_endpoint_handler('STS',
+        endpoint.create_init_request_sdk(server_rpc.rpc, rpc_client, object_io), { virtual_hosts: [], notification_logger });
 
     async function announce(msg) {
         if (process.env.SUPPRESS_LOGS) return;
@@ -221,6 +233,7 @@ function setup(options = {}) {
         });
         rpc_client.options.auth_token = token;
         await overwrite_system_address(SYSTEM);
+        console.log('pools_to_create.length', pools_to_create.length);
         if (pools_to_create.length > 0) {
             await announce('setup_pools()');
             await setup_pools(pools_to_create);

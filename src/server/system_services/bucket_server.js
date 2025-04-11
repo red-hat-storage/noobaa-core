@@ -45,6 +45,7 @@ const VALID_BUCKET_NAME_REGEXP =
     /^(([a-z0-9]|[a-z0-9][a-z0-9-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9-]*[a-z0-9])$/;
 
 const EXTERNAL_BUCKET_LIST_TO = 30 * 1000; //30s
+const EXTERNAL_BUCKET_ENCRYPTION = 30 * 1000; //30s
 
 const trigger_properties = ['event_name', 'object_prefix', 'object_suffix'];
 
@@ -73,6 +74,12 @@ function new_bucket_defaults(name, system_id, tiering_policy_id, owner_account_i
         object_lock_configuration: config.WORM_ENABLED ? {
             object_lock_enabled: lock_enabled ? 'Enabled' : 'Disabled',
         } : undefined,
+        cors_configuration_rules: config.S3_CORS_DEFAULTS_ENABLED ? [{
+            allowed_origins: config.S3_CORS_ALLOW_ORIGIN,
+            allowed_methods: config.S3_CORS_ALLOW_METHODS,
+            allowed_headers: config.S3_CORS_ALLOW_HEADERS,
+            expose_headers: config.S3_CORS_EXPOSE_HEADERS,
+        }] : undefined,
     };
 }
 
@@ -279,8 +286,8 @@ async function create_bucket(req) {
             };
 
             // reorder read resources so that the write resource is the first in the list
-            const ordered_read_resources = write_resource ?
-                [write_resource].concat(read_resources.filter(rr => rr.resource !== write_resource.resource)) : read_resources;
+            const ordered_read_resources = write_resource ? [write_resource].concat(
+                read_resources.filter(rr => rr.resource !== write_resource.resource)) : read_resources;
 
             bucket.namespace = {
                 read_resources: ordered_read_resources,
@@ -443,9 +450,31 @@ async function delete_bucket_logging(req) {
 async function get_bucket_encryption(req) {
     dbg.log0('get_bucket_encryption:', req.rpc_params);
     const bucket = find_bucket(req);
-    return {
-        encryption: bucket.encryption,
-    };
+    // we will return default encryption for data buckets
+    const encryption = bucket.encryption || (bucket.tiering && { algorithm: "AES256" });
+    // bucket_key_enabled not supported yet - will default to false  
+    if (encryption) return { encryption: { ...encryption, bucket_key_enabled: false } };
+    const connection = bucket.namespace?.write_resource.resource.connection;
+    if (connection && (connection.endpoint_type === 'AWS' || connection.endpoint_type === 'AWSSTS' ||
+            connection.endpoint_type === 'S3_COMPATIBLE')) {
+        const s3 = await _get_s3_client(connection);
+        try {
+            const res = await P.timeout(EXTERNAL_BUCKET_ENCRYPTION,
+                s3.getBucketEncryption({ Bucket: connection.target_bucket }));
+            const enc = res.ServerSideEncryptionConfiguration.Rules[0];
+            return {
+                encryption: {
+                    algorithm: enc.ApplyServerSideEncryptionByDefault.SSEAlgorithm,
+                    kms_key_id: enc.ApplyServerSideEncryptionByDefault.KMSMasterKeyID,
+                    bucket_key_enabled: enc.BucketKeyEnabled
+                }
+            };
+        } catch (err) {
+            dbg.error('get_bucket_encryption: failed to get bucket encryption from external bucket',
+                err, 'returning default encryption');
+        }
+    } // for now - for the other namspace types we will return undefined
+    return { encryption: undefined };
 }
 
 
@@ -490,6 +519,15 @@ async function put_bucket_policy(req) {
     const bucket = find_bucket(req, req.rpc_params.name);
     await bucket_policy_utils.validate_s3_policy(req.rpc_params.policy, bucket.name,
         principal => system_store.get_account_by_email(principal));
+
+    if (
+        bucket.public_access_block?.block_public_policy &&
+        bucket_policy_utils.allows_public_access(req.rpc_params.policy)
+    ) {
+            // Should result in AccessDenied error
+            throw new RpcError('UNAUTHORIZED');
+    }
+
     await system_store.make_changes({
         update: {
             buckets: [{
@@ -548,6 +586,32 @@ async function delete_bucket_encryption(req) {
     });
 }
 
+/**
+ *
+ * NOTIFICATIONS
+ *
+ */
+async function put_bucket_notification(req) {
+    dbg.log0('put_bucket_notification:', req.rpc_params);
+    const bucket = find_bucket(req);
+    await system_store.make_changes({
+        update: {
+            buckets: [{
+                _id: bucket._id,
+                notifications: req.rpc_params.notifications
+            }]
+        }
+    });
+}
+
+
+async function get_bucket_notification(req) {
+    dbg.log0('get_bucket_notification:', req.rpc_params);
+    const bucket = find_bucket(req);
+    return {
+        notifications: bucket.notifications ? bucket.notifications : [],
+    };
+}
 
 /**
  *
@@ -567,6 +631,44 @@ async function delete_bucket_website(req) {
     });
 }
 
+/**
+ *
+ * CORS
+ *
+ */
+async function put_bucket_cors(req) {
+    dbg.log0('put_bucket_cors:', req.rpc_params);
+    const bucket = find_bucket(req);
+    await system_store.make_changes({
+        update: {
+            buckets: [{
+                _id: bucket._id,
+                cors_configuration_rules: req.rpc_params.cors_rules
+            }]
+        }
+    });
+}
+
+async function get_bucket_cors(req) {
+    dbg.log0('get_bucket_cors:', req.rpc_params);
+    const bucket = find_bucket(req, req.rpc_params.name);
+    return {
+        cors: bucket.cors_configuration_rules || [],
+    };
+}
+
+async function delete_bucket_cors(req) {
+    dbg.log0('delete_bucket_cors:', req.rpc_params);
+    const bucket = find_bucket(req, req.rpc_params.name);
+    await system_store.make_changes({
+        update: {
+            buckets: [{
+                _id: bucket._id,
+                $unset: { cors_configuration_rules: 1 }
+            }]
+        }
+    });
+}
 
 /**
  *
@@ -612,6 +714,8 @@ async function read_bucket_sdk_info(req) {
                 unused_refresh_tiering_alloc: bucket.tiering && node_allocator.refresh_tiering_alloc(bucket.tiering),
             })
             .then(get_bucket_info),
+        notifications: bucket.notifications,
+        cors_configuration_rules: bucket.cors_configuration_rules,
     };
 
     if (bucket.namespace) {
@@ -972,19 +1076,60 @@ async function delete_bucket_lifecycle(req) {
  * LIST_BUCKETS
  *
  */
+
 async function list_buckets(req) {
-    const buckets_by_name = _.filter(
-        req.system.buckets_by_name,
+
+    let next_index = 0;
+    let is_truncated = false;
+
+    let continuation_token = req.rpc_params?.continuation_token;
+    const max_buckets = req.rpc_params?.max_buckets;
+
+    const accessible_bucket_list = system_store.data.buckets.filter(
         async bucket => await req.has_s3_bucket_permission(bucket, "s3:ListBucket", req) && !bucket.deleting
     );
-    return {
-        buckets: _.map(buckets_by_name, function(bucket) {
-            return {
-                name: bucket.name,
-                creation_date: bucket._id.getTimestamp().getTime()
-            };
-        })
-    };
+
+    accessible_bucket_list.sort((a, b) => a.name.unwrap().localeCompare(b.name.unwrap()));
+
+    if (!max_buckets) {
+        const buckets = accessible_bucket_list.map(b => ({
+            name: b.name,
+            creation_date: b._id.getTimestamp().getTime()
+        }));
+        return {
+            buckets,
+        };
+    }
+
+    if (continuation_token) {
+        const index = accessible_bucket_list.findIndex(
+            bucket => bucket.name.unwrap().localeCompare(continuation_token.unwrap()) >= 0
+        );
+        if (index !== -1) {
+            next_index = index + 1;
+        }
+    }
+
+    const paged_bucket_list = accessible_bucket_list.slice(next_index, next_index + max_buckets);
+
+    const buckets = paged_bucket_list.map(bucket => ({
+        name: bucket.name,
+        creation_date: bucket._id.getTimestamp().getTime()
+    }));
+
+    is_truncated = accessible_bucket_list.length > next_index + max_buckets;
+    continuation_token = is_truncated ? accessible_bucket_list[next_index + max_buckets - 1].name : undefined;
+
+    if (continuation_token) {
+        return {
+            buckets,
+            continuation_token,
+        };
+    } else {
+        return {
+            buckets,
+        };
+    }
 }
 
 
@@ -1184,29 +1329,7 @@ async function get_cloud_buckets(req) {
                 .then(data => data[0].map(bucket =>
                     _inject_usage_to_cloud_bucket(bucket.name, connection.endpoint, used_cloud_buckets)));
         } else { // else if AWS(s3-compatible/aws/sts-aws)/Flashblade/IBM_COS
-            let access_key;
-            let secret_key;
-            if (connection.aws_sts_arn) {
-                const creds = await cloud_utils.generate_aws_sts_creds(connection, "get_cloud_buckets_session");
-                access_key = creds.accessKeyId;
-                secret_key = creds.secretAccessKey;
-                connection.sessionToken = creds.sessionToken;
-            } else {
-                access_key = connection.access_key.unwrap();
-                secret_key = connection.secret_key.unwrap();
-            }
-            const s3_params = {
-                endpoint: connection.endpoint,
-                credentials: {
-                    accessKeyId: access_key,
-                    secretAccessKey: secret_key,
-                    sessionToken: connection.sessionToken,
-                },
-                signatureVersion: cloud_utils.get_s3_endpoint_signature_ver(connection.endpoint, connection.auth_method),
-                requestHandler: noobaa_s3_client.get_requestHandler_with_suitable_agent(connection.endpoint),
-                region: connection.region || config.DEFAULT_REGION
-            };
-            const s3 = noobaa_s3_client.get_s3_client_v3_params(s3_params);
+            const s3 = await _get_s3_client(connection);
             const used_cloud_buckets = cloud_utils.get_used_cloud_targets(['AWS', 'AWSSTS', 'AWS_STS', 'S3_COMPATIBLE', 'FLASHBLADE', 'IBM_COS'],
                 system_store.data.buckets, system_store.data.pools, system_store.data.namespace_resources);
             const res = await P.timeout(EXTERNAL_BUCKET_LIST_TO, s3.listBuckets({}));
@@ -1330,6 +1453,46 @@ async function update_all_buckets_default_pool(req) {
     await system_store.make_changes({
         update: {
             tiers: updates
+        }
+    });
+}
+
+/**
+ * 
+ * PUBLIC_ACCESS_BLOCK
+ * 
+ */
+
+async function get_public_access_block(req) {
+    dbg.log0('get_public_access_block:', req.rpc_params);
+    const bucket = find_bucket(req, req.rpc_params.bucket_name);
+    return {
+        public_access_block: bucket.public_access_block,
+    };
+}
+
+async function put_public_access_block(req) {
+    dbg.log0('put_public_access_block:', req.rpc_params);
+    const bucket = find_bucket(req, req.rpc_params.bucket_name);
+    await system_store.make_changes({
+        update: {
+            buckets: [{
+                _id: bucket._id,
+                public_access_block: req.rpc_params.public_access_block,
+            }]
+        }
+    });
+}
+
+async function delete_public_access_block(req) {
+    dbg.log0('delete_public_access_block:', req.rpc_params);
+    const bucket = find_bucket(req, req.rpc_params.bucket_name);
+    await system_store.make_changes({
+        update: {
+            buckets: [{
+                _id: bucket._id,
+                $unset: { public_access_block: 1 }
+            }]
         }
     });
 }
@@ -1951,9 +2114,9 @@ async function validate_replication(req) {
                 if (_.isEqual(db_rules._id, dst_bucket.replication_policy_id)) {
                     const matching_rule = db_rules.rules.find(
                         db_rule =>
-                            _.isEqual(src_bucket._id, db_rule.destination_bucket) &&
-                            (!db_rule.filter || db_rule.filter.prefix.toString().startsWith(prefix) ||
-                             prefix.toString().startsWith(db_rule.filter.prefix.toString()))
+                        _.isEqual(src_bucket._id, db_rule.destination_bucket) &&
+                        (!db_rule.filter || db_rule.filter.prefix.toString().startsWith(prefix) ||
+                            prefix.toString().startsWith(db_rule.filter.prefix.toString()))
                     );
                     if (matching_rule) {
                         throw new RpcError('INVALID_REPLICATION_POLICY',
@@ -2021,6 +2184,32 @@ function normalize_replication(req) {
     return validated_replication;
 }
 
+async function _get_s3_client(connection) {
+    let access_key;
+    let secret_key;
+    if (connection.aws_sts_arn) {
+        const creds = await cloud_utils.generate_aws_sts_creds(connection, "get_cloud_buckets_session");
+        access_key = creds.accessKeyId;
+        secret_key = creds.secretAccessKey;
+        connection.sessionToken = creds.sessionToken;
+    } else {
+        access_key = connection.access_key.unwrap();
+        secret_key = connection.secret_key.unwrap();
+    }
+    const s3_params = {
+        endpoint: connection.endpoint,
+        credentials: {
+            accessKeyId: access_key,
+            secretAccessKey: secret_key,
+            sessionToken: connection.sessionToken,
+        },
+        signatureVersion: cloud_utils.get_s3_endpoint_signature_ver(connection.endpoint, connection.auth_method),
+        requestHandler: noobaa_s3_client.get_requestHandler_with_suitable_agent(connection.endpoint),
+        region: connection.region || config.DEFAULT_REGION
+    };
+    return noobaa_s3_client.get_s3_client_v3_params(s3_params);
+}
+
 // EXPORTS
 exports.new_bucket_defaults = new_bucket_defaults;
 exports.get_bucket_info = get_bucket_info;
@@ -2066,6 +2255,11 @@ exports.get_bucket_website = get_bucket_website;
 exports.delete_bucket_policy = delete_bucket_policy;
 exports.put_bucket_policy = put_bucket_policy;
 exports.get_bucket_policy = get_bucket_policy;
+exports.put_bucket_notification = put_bucket_notification;
+exports.get_bucket_notification = get_bucket_notification;
+exports.put_bucket_cors = put_bucket_cors;
+exports.get_bucket_cors = get_bucket_cors;
+exports.delete_bucket_cors = delete_bucket_cors;
 
 exports.update_all_buckets_default_pool = update_all_buckets_default_pool;
 
@@ -2076,3 +2270,7 @@ exports.put_bucket_replication = put_bucket_replication;
 exports.get_bucket_replication = get_bucket_replication;
 exports.delete_bucket_replication = delete_bucket_replication;
 exports.validate_replication = validate_replication;
+
+exports.get_public_access_block = get_public_access_block;
+exports.put_public_access_block = put_public_access_block;
+exports.delete_public_access_block = delete_public_access_block;

@@ -1,23 +1,15 @@
 /* Copyright (C) 2020 NooBaa */
 'use strict';
 
-const path = require('path');
-const config = require('../../config');
-const nb_native = require('../util/nb_native');
-const SensitiveString = require('../util/sensitive_string');
-const { S3Error } = require('../endpoint/s3/s3_errors');
-const RpcError = require('../rpc/rpc_error');
-const js_utils = require('../util/js_utils');
-const P = require('../util/promise');
-const BucketSpaceSimpleFS = require('./bucketspace_simple_fs');
 const _ = require('lodash');
 const util = require('util');
-const bucket_policy_utils = require('../endpoint/s3/s3_bucket_policy_utils');
-const nsfs_schema_utils = require('../manage_nsfs/nsfs_schema_utils');
-const nc_mkm = require('../manage_nsfs/nc_master_key_manager').get_instance();
-const { ConfigFS, JSON_SUFFIX, CONFIG_TYPES } = require('./config_fs');
+const path = require('path');
+const P = require('../util/promise');
+const config = require('../../config');
+const RpcError = require('../rpc/rpc_error');
+const js_utils = require('../util/js_utils');
+const nb_native = require('../util/nb_native');
 const mongo_utils = require('../util/mongo_utils');
-
 const KeysSemaphore = require('../util/keys_semaphore');
 const {
     get_umasked_mode,
@@ -28,9 +20,17 @@ const {
     translate_error_codes,
     get_process_fs_context
 } = require('../util/native_fs_utils');
-const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
+const { S3Error } = require('../endpoint/s3/s3_errors');
 const { anonymous_access_key } = require('./object_sdk');
 const s3_utils = require('../endpoint/s3/s3_utils');
+const { ConfigFS, JSON_SUFFIX } = require('./config_fs');
+const SensitiveString = require('../util/sensitive_string');
+const BucketSpaceSimpleFS = require('./bucketspace_simple_fs');
+const { account_id_cache } = require('../sdk/accountspace_fs');
+const nsfs_schema_utils = require('../manage_nsfs/nsfs_schema_utils');
+const bucket_policy_utils = require('../endpoint/s3/s3_bucket_policy_utils');
+const nc_mkm = require('../manage_nsfs/nc_master_key_manager').get_instance();
+const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
 
 const dbg = require('../util/debug_module')(__filename);
 const bucket_semaphore = new KeysSemaphore(1);
@@ -66,6 +66,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
         return fs_context;
     }
 
+    // TODO: account function should be handled in accountspace_fs 
     async read_account_by_access_key({ access_key }) {
         try {
             if (!access_key) throw new Error('no access key');
@@ -84,6 +85,12 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             }
             if (account.nsfs_account_config.distinguished_name) {
                 account.nsfs_account_config.distinguished_name = new SensitiveString(account.nsfs_account_config.distinguished_name);
+            }
+            try {
+                account.stat = await this.config_fs.stat_account_config_file(access_key);
+            } catch (err) {
+                dbg.warn(`BucketspaceFS.read_account_by_access_key could not stat_account_config_file` +
+                    `of account id: ${account._id} account name: ${account.name.unwrap()}`);
             }
             return account;
         } catch (err) {
@@ -104,9 +111,9 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             const bucket = await this.config_fs.get_bucket_by_name(name);
             nsfs_schema_utils.validate_bucket_schema(bucket);
 
-            const is_valid = await this.check_bucket_config(bucket);
+            const is_valid = await this.check_stat_bucket_storage_path(bucket.path);
             if (!is_valid) {
-                dbg.warn('BucketSpaceFS: one or more bucket config check is failed for bucket : ', name);
+                dbg.warn('BucketSpaceFS: invalid storage path for bucket : ', name);
             }
 
             const nsr = {
@@ -128,14 +135,12 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             };
 
             bucket.name = new SensitiveString(bucket.name);
-            const account_config = await this.config_fs.get_identity_by_id(
-                bucket.owner_account,
-                CONFIG_TYPES.ACCOUNT,
-                { silent_if_missing: true }
-            );
 
-            if (!account_config) {
-                dbg.warn(`Bucket Owner does not exist ${bucket.owner_account}`);
+            let account_config;
+            try {
+                account_config = await account_id_cache.get_with_cache({ _id: bucket.owner_account, config_fs: this.config_fs });
+            } catch (err) {
+                dbg.warn(`BucketspaceFS.read_bucket_sdk_info could not find bucket owner by id ${bucket.owner_account}`);
             }
             bucket.bucket_owner = new SensitiveString(account_config?.name);
             bucket.owner_account = {
@@ -157,6 +162,11 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
                     }
                 }
             }
+            try {
+                bucket.stat = await this.config_fs.stat_bucket_config_file(bucket.name.unwrap());
+            } catch (err) {
+                dbg.warn(`BucketspaceFS.read_bucket_sdk_info could not stat_bucket_config_file ${bucket.name.unwrap()}`);
+            }
             return bucket;
         } catch (err) {
             const rpc_error = translate_error_codes(err, entity_enum.BUCKET);
@@ -166,17 +176,58 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
         }
     }
 
-    async check_bucket_config(bucket) {
-        const bucket_storage_path = bucket.path;
+    /**
+     * check_stat_bucket_storage_path will return the true
+     * if there is stat output on the bucket storage path
+     * (in case the stat throws an error it would return false)
+     * @param {string} bucket_storage_path
+     * @returns {Promise<boolean>}
+     */
+    async check_stat_bucket_storage_path(bucket_storage_path) {
         try {
             await nb_native().fs.stat(this.fs_context, bucket_storage_path);
-            //TODO: Bucket owner check
             return true;
         } catch (err) {
             return false;
         }
     }
 
+    /**
+     * check_same_stat_bucket will return true the config file was not changed
+     * in case we had any issue (for example error during stat) the returned value will be undefined
+     * @param {string} bucket_name
+     * @param {nb.NativeFSStats} bucket_stat
+     * @returns Promise<{boolean|undefined>}
+     */
+    async check_same_stat_bucket(bucket_name, bucket_stat) {
+        try {
+            const current_stat = await this.config_fs.stat_bucket_config_file(bucket_name);
+            if (current_stat) {
+                return current_stat.ino === bucket_stat.ino && current_stat.mtimeNsBigint === bucket_stat.mtimeNsBigint;
+            }
+        } catch (err) {
+            dbg.warn('check_same_stat_bucket: current_stat got an error', err, 'ignoring...');
+        }
+    }
+
+    /**
+     * check_same_stat_account will return true the config file was not changed
+     * in case we had any issue (for example error during stat) the returned value will be undefined
+     * @param {Symbol|string} access_key
+     * @param {nb.NativeFSStats} account_stat
+     * @returns Promise<{boolean|undefined>}
+     */
+    // TODO: account function should be handled in accountspace_fs 
+    async check_same_stat_account(access_key, account_stat) {
+        try {
+            const current_stat = await this.config_fs.stat_account_config_file(access_key);
+            if (current_stat) {
+                return current_stat.ino === account_stat.ino && current_stat.mtimeNsBigint === account_stat.mtimeNsBigint;
+            }
+        } catch (err) {
+            dbg.warn('check_same_stat_account: current_stat got an error', err, 'ignoring...');
+        }
+    }
 
     ////////////
     // BUCKET //
@@ -194,7 +245,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
      * @param {nb.ObjectSDK} object_sdk
      * @returns {Promise<object>}
      */
-    async list_buckets(object_sdk) {
+    async list_buckets(params, object_sdk) {
         let bucket_names;
         try {
             bucket_names = await this.config_fs.list_buckets();
@@ -243,11 +294,6 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             if (!sdk.requesting_account.allow_bucket_creation) {
                 throw new RpcError('UNAUTHORIZED', 'Not allowed to create new buckets');
             }
-            // currently we do not allow IAM account to create a bucket (temporary)
-            if (sdk.requesting_account.owner !== undefined) {
-                dbg.warn('create_bucket: account is IAM account (currently not allowed to create buckets)');
-                throw new RpcError('UNAUTHORIZED', 'Not allowed to create new buckets');
-            }
             if (!sdk.requesting_account.nsfs_account_config || !sdk.requesting_account.nsfs_account_config.new_buckets_path) {
                 throw new RpcError('MISSING_NSFS_ACCOUNT_CONFIGURATION');
             }
@@ -294,7 +340,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             _id: mongo_utils.mongoObjectId(),
             name,
             tag: js_utils.default_value(tag, undefined),
-            owner_account: account._id,
+            owner_account: account.owner ? account.owner : account._id, // The account is the owner of the buckets that were created by it or by its users.
             creator: account._id,
             versioning: config.NSFS_VERSIONING_ENABLED && lock_enabled ? 'ENABLED' : 'DISABLED',
             object_lock_configuration: config.WORM_ENABLED ? {
@@ -304,7 +350,14 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             force_md5_etag: force_md5_etag,
             path: bucket_storage_path,
             should_create_underlying_storage: create_uls,
-            fs_backend: account.nsfs_account_config.fs_backend
+            fs_backend: account.nsfs_account_config.fs_backend,
+            cors_configuration_rules: config.S3_CORS_DEFAULTS_ENABLED ? [{
+                allowed_origins: config.S3_CORS_ALLOW_ORIGIN,
+                allowed_methods: config.S3_CORS_ALLOW_METHODS,
+                allowed_headers: config.S3_CORS_ALLOW_HEADERS,
+                expose_headers: config.S3_CORS_EXPOSE_HEADERS,
+
+            }] : undefined,
         };
     }
 
@@ -612,6 +665,14 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             const { name, policy } = params;
             dbg.log0('BucketSpaceFS.put_bucket_policy: Bucket name, policy', name, policy);
             const bucket = await this.config_fs.get_bucket_by_name(name);
+
+            if (
+                bucket.public_access_block?.block_public_policy &&
+                bucket_policy_utils.allows_public_access(policy)
+            ) {
+                throw new S3Error(S3Error.AccessDenied);
+            }
+
             bucket.s3_policy = policy;
             // We need to validate bucket schema here as well for checking the policy schema
             nsfs_schema_utils.validate_bucket_schema(_.omitBy(bucket, _.isUndefined));
@@ -644,6 +705,115 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             return { policy: bucket_policy_info.s3_policy };
         } catch (err) {
             throw translate_error_codes(err, entity_enum.BUCKET);
+        }
+    }
+
+    /////////////////////////
+    // BUCKET NOTIFICATION //
+    /////////////////////////
+
+    async put_bucket_notification(params) {
+        try {
+            const { bucket_name, notifications } = params;
+            dbg.log0('BucketSpaceFS.put_bucket_notification: Bucket name', bucket_name, ", notifications ", notifications);
+            const bucket = await this.config_fs.get_bucket_by_name(bucket_name);
+            bucket.notifications = notifications;
+            await this.config_fs.update_bucket_config_file(bucket);
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    async get_bucket_notification(params) {
+        try {
+            const { bucket_name } = params;
+            dbg.log0('BucketSpaceFS.get_bucket_notification: Bucket name', bucket_name);
+            const bucket = await this.config_fs.get_bucket_by_name(bucket_name);
+            return { notifications: bucket.notifications || [] };
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    ////////////////////
+    // BUCKET CORS //
+    ////////////////////
+
+    async put_bucket_cors(params) {
+        try {
+            const { name, cors_rules } = params;
+            dbg.log0('BucketSpaceFS.put_bucket_cors: Bucket name', name, ", cors configuration ", cors_rules);
+            const bucket = await this.config_fs.get_bucket_by_name(name);
+            bucket.cors_configuration_rules = cors_rules;
+            await this.config_fs.update_bucket_config_file(bucket);
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    async delete_bucket_cors(params) {
+        try {
+            const { name } = params;
+            dbg.log0('BucketSpaceFS.delete_bucket_cors: Bucket name', name);
+            const bucket = await this.config_fs.get_bucket_by_name(name);
+            delete bucket.cors_configuration_rules;
+            await this.config_fs.update_bucket_config_file(bucket);
+        } catch (err) {
+            throw translate_error_codes(err, entity_enum.BUCKET);
+        }
+    }
+
+    async get_bucket_cors(params) {
+        try {
+            const { name } = params;
+            dbg.log0('BucketSpaceFS.get_bucket_cors: Bucket name', name);
+            const bucket = await this.config_fs.get_bucket_by_name(name);
+            return {
+                cors: bucket.cors_configuration_rules || [],
+            };
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    /////////////////////////
+    // PUBLIC ACCESS BLOCK //
+    /////////////////////////
+
+    async get_public_access_block(params, object_sdk) {
+        try {
+            const { bucket_name } = params;
+            dbg.log0('BucketSpaceFS.get_public_access_block: Bucket name', bucket_name);
+            const bucket = await this.config_fs.get_bucket_by_name(bucket_name);
+            return {
+                public_access_block: bucket.public_access_block,
+            };
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    async put_public_access_block(params, object_sdk) {
+        try {
+            const { bucket_name, public_access_block } = params;
+            dbg.log0('BucketSpaceFS.put_public_access_block: Bucket name', bucket_name, ", public_access_block ", public_access_block);
+            const bucket = await this.config_fs.get_bucket_by_name(bucket_name);
+            bucket.public_access_block = public_access_block;
+            await this.config_fs.update_bucket_config_file(bucket);
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    async delete_public_access_block(params, object_sdk) {
+        try {
+            const { bucket_name } = params;
+            dbg.log0('BucketSpaceFS.delete_public_access_block: Bucket name', bucket_name);
+            const bucket = await this.config_fs.get_bucket_by_name(bucket_name);
+            delete bucket.public_access_block;
+            await this.config_fs.update_bucket_config_file(bucket);
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
         }
     }
 
@@ -686,28 +856,30 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             throw new Error('has_bucket_action_permission: action is required');
         }
 
-        let permission;
-        permission = await bucket_policy_utils.has_bucket_policy_permission(
+        let permission_by_name;
+        const permission_by_id = await bucket_policy_utils.has_bucket_policy_permission(
             bucket_policy,
             account._id,
             action,
             `arn:aws:s3:::${bucket.name.unwrap()}${bucket_path}`,
-            undefined
+            undefined,
+            bucket.public_access_block?.restrict_public_buckets,
         );
+        if (permission_by_id === "DENY") return false;
         // we (currently) allow account identified to be both id and name,
         // so if by-id failed, try also name
-        if (permission === 'IMPLICIT_DENY') {
-            permission = await bucket_policy_utils.has_bucket_policy_permission(
+        if (account.owner === undefined) {
+            permission_by_name = await bucket_policy_utils.has_bucket_policy_permission(
                 bucket_policy,
                 account.name.unwrap(),
                 action,
                 `arn:aws:s3:::${bucket.name.unwrap()}${bucket_path}`,
-                undefined
+                undefined,
+                bucket.public_access_block?.restrict_public_buckets,
             );
         }
-
-        if (permission === 'DENY') return false;
-        return is_owner || permission === 'ALLOW';
+        if (permission_by_name === 'DENY') return false;
+        return is_owner || (permission_by_id === 'ALLOW' || permission_by_name === 'ALLOW');
     }
 
     async validate_fs_bucket_access(bucket, object_sdk) {

@@ -46,6 +46,13 @@
 #define GPFS_XATTR_PREFIX "gpfs"
 #define GPFS_DOT_ENCRYPTION_EA "Encryption"
 #define GPFS_ENCRYPTION_XATTR_NAME GPFS_XATTR_PREFIX "." GPFS_DOT_ENCRYPTION_EA
+#define GPFS_DMAPI_XATTR_PREFIX "dmapi"
+#define GPFS_DMAPI_DOT_IBMOBJ_EA "IBMObj"
+#define GPFS_DMAPI_DOT_IBMPMIG_EA "IBMPMig"
+#define GPFS_DMAPI_DOT_IBMTPS_EA "IBMTPS"
+#define GPFS_DMAPI_XATTR_TAPE_INDICATOR GPFS_DMAPI_XATTR_PREFIX "." GPFS_DMAPI_DOT_IBMOBJ_EA
+#define GPFS_DMAPI_XATTR_TAPE_PREMIG GPFS_DMAPI_XATTR_PREFIX "." GPFS_DMAPI_DOT_IBMPMIG_EA
+#define GPFS_DMAPI_XATTR_TAPE_TPS GPFS_DMAPI_XATTR_PREFIX "." GPFS_DMAPI_DOT_IBMTPS_EA
 
 // This macro should be used after openning a file
 // it will autoclose the file using AutoCloser and will throw an error in case of failures
@@ -244,6 +251,11 @@ parse_open_flags(std::string flags)
 }
 
 const static std::vector<std::string> GPFS_XATTRS{ GPFS_ENCRYPTION_XATTR_NAME };
+const static std::vector<std::string> GPFS_DMAPI_XATTRS{
+    GPFS_DMAPI_XATTR_TAPE_INDICATOR,
+    GPFS_DMAPI_XATTR_TAPE_PREMIG,
+    GPFS_DMAPI_XATTR_TAPE_TPS,
+};
 const static std::vector<std::string> USER_XATTRS{
     "user.content_type",
     "user.content_md5",
@@ -286,8 +298,7 @@ build_gpfs_get_ea_request(gpfsRequest_t* reqP, std::string key)
     reqP->payload.structLen = reqP->header.totalLength - sizeof(reqP->header);
     reqP->payload.structType = GPFS_FCNTL_GET_XATTR;
     reqP->payload.nameLen = nameLen;
-    // bufferLen is the size of buffer - roundingup of the attribute name to 8 chars
-    reqP->payload.bufferLen = bufLen - ROUNDUP(nameLen, 8);
+    reqP->payload.bufferLen = bufLen - nameLen;
     reqP->payload.flags = GPFS_FCNTL_XATTRFLAG_NONE;
     memcpy(&reqP->payload.buffer[0], key.c_str(), nameLen);
 }
@@ -461,9 +472,14 @@ get_fd_xattr(int fd, XattrMap& xattr, const std::vector<std::string>& xattr_keys
 }
 
 static int
-get_fd_gpfs_xattr(int fd, XattrMap& xattr, int& gpfs_error)
+get_fd_gpfs_xattr(int fd, XattrMap& xattr, int& gpfs_error, bool use_dmapi)
 {
-    for (auto const& key : GPFS_XATTRS) {
+    auto gpfs_xattrs { GPFS_XATTRS };
+    if (use_dmapi) {
+        gpfs_xattrs.insert(gpfs_xattrs.end(), GPFS_DMAPI_XATTRS.begin(), GPFS_DMAPI_XATTRS.end());
+    }
+
+    for (auto const& key : gpfs_xattrs) {
         gpfsRequest_t gpfsGetXattrRequest;
         build_gpfs_get_ea_request(&gpfsGetXattrRequest, key);
         int r = dlsym_gpfs_fcntl(fd, &gpfsGetXattrRequest);
@@ -472,7 +488,7 @@ get_fd_gpfs_xattr(int fd, XattrMap& xattr, int& gpfs_error)
         if (gpfs_error == GPFS_FCNTL_ERR_NONE) {
             int name_len = gpfsGetXattrRequest.payload.nameLen;
             int buffer_len = gpfsGetXattrRequest.payload.bufferLen;
-            xattr[key] = std::string(gpfsGetXattrRequest.buffer[ROUNDUP(name_len, 8)], buffer_len);
+            xattr[key] = std::string((char*)gpfsGetXattrRequest.buffer + name_len, buffer_len);
         } else if (gpfs_error != GPFS_FCNTL_ERR_NO_ATTR) {
             LOG("get_fd_gpfs_xattr: get GPFS xattr with fcntl failed with error." << DVAL(gpfs_error));
             return gpfs_error;
@@ -538,6 +554,43 @@ load_xattr_get_keys(Napi::Object& options, std::vector<std::string>& _xattr_get_
 }
 
 /**
+* converts Napi::Array of numbers to std::vector
+* typename T - type of the vector to convert to (e.g int, uint, gid_t)
+* warning: function will only work on vector with numeric types. should not be used with other types
+*/
+template<typename T>
+static std::vector<T>
+convert_napi_number_array_to_number_vector(const Napi::Array& arr) {
+    std::vector<T> new_vector;
+    const std::size_t arr_length = arr.Length();
+    for (std::size_t i = 0; i < arr_length; ++i) {
+        new_vector.push_back(static_cast<Napi::Value>(arr[i]).ToNumber());
+    }
+    return new_vector;
+}
+
+/**
+ * converts std::vector to comma seperated string so it can be printed to logs
+ */
+template<typename T>
+static std::string
+stringfy_vector(std::vector<T>& vec) {
+    std::stringstream ss;
+    std::size_t size = vec.size();
+    for(std::size_t i = 0; i < size; ++i) {
+        if (i > 0) ss << ',';
+        ss << vec[i];
+    }
+    return ss.str();
+}
+
+
+static std::string get_groups_as_string() {
+    std::vector<gid_t> groups = ThreadScope::get_process_groups();
+    return stringfy_vector(groups);
+}
+
+/**
  * FSWorker is a general async worker for our fs operations
  */
 struct FSWorker : public Napi::AsyncWorker
@@ -559,10 +612,14 @@ struct FSWorker : public Napi::AsyncWorker
     int _warn_threshold_ms;
     double _took_time;
     Napi::FunctionReference _report_fs_stats;
+    bool _should_add_thread_capabilities;
+    std::vector<gid_t> _supplemental_groups;
 
     // executes the ctime check in the stat and read file fuctions
     // NOTE: If _do_ctime_check = false, then some functions will fallback to using mtime check
     bool _do_ctime_check;
+
+    bool _use_dmapi;
 
     FSWorker(const Napi::CallbackInfo& info)
         : AsyncWorker(info.Env())
@@ -574,7 +631,10 @@ struct FSWorker : public Napi::AsyncWorker
         , _errno(0)
         , _warn_threshold_ms(0)
         , _took_time(0)
+        , _should_add_thread_capabilities(false)
+        , _supplemental_groups()
         , _do_ctime_check(false)
+        , _use_dmapi(false)
     {
         for (int i = 0; i < (int)info.Length(); ++i) _args_ref.Set(i, info[i]);
         if (info[0].ToBoolean()) {
@@ -584,6 +644,9 @@ struct FSWorker : public Napi::AsyncWorker
             if (fs_context.Get("backend").ToBoolean()) {
                 _backend = fs_context.Get("backend").ToString();
             }
+            if (fs_context.Has("supplemental_groups")) {
+                _supplemental_groups = convert_napi_number_array_to_number_vector<gid_t>(fs_context.Get("supplemental_groups").As<Napi::Array>());
+            }
             if (fs_context.Get("warn_threshold_ms").ToBoolean()) {
                 _warn_threshold_ms = fs_context.Get("warn_threshold_ms").ToNumber();
             }
@@ -591,6 +654,7 @@ struct FSWorker : public Napi::AsyncWorker
                 _report_fs_stats = Napi::Persistent(fs_context.Get("report_fs_stats").As<Napi::Function>());
             }
             _do_ctime_check = fs_context.Get("do_ctime_check").ToBoolean();
+            _use_dmapi = fs_context.Get("use_dmapi").ToBoolean();
         }
     }
     void Begin(std::string desc)
@@ -602,11 +666,16 @@ struct FSWorker : public Napi::AsyncWorker
     virtual void Work() = 0;
     void Execute() override
     {
-        DBG1("FS::FSWorker::Execute: " << _desc << DVAL(_uid) << DVAL(_gid) << DVAL(_backend));
+        const std::string supplemental_groups = stringfy_vector(_supplemental_groups);
+        DBG1("FS::FSWorker::Execute: " << _desc << DVAL(_uid) << DVAL(_gid) << DVAL(_backend) << DVAL(supplemental_groups));
         ThreadScope tx;
-        tx.set_user(_uid, _gid);
-        DBG1("FS::FSWorker::Execute: " << _desc << DVAL(_uid) << DVAL(_gid) << DVAL(geteuid()) << DVAL(getegid()) << DVAL(getuid()) << DVAL(getgid()));
+        tx.set_user(_uid, _gid, _supplemental_groups);
+        std::string new_supplemental_groups = get_groups_as_string();
+        DBG1("FS::FSWorker::Execute: " << _desc << DVAL(_uid) << DVAL(_gid) << DVAL(geteuid()) << DVAL(getegid()) << DVAL(getuid()) << DVAL(getgid()) << DVAL(new_supplemental_groups));
 
+        if(_should_add_thread_capabilities) {
+            tx.add_thread_capabilities();
+        }
         auto start_time = std::chrono::high_resolution_clock::now();
         Work();
         auto end_time = std::chrono::high_resolution_clock::now();
@@ -640,6 +709,9 @@ struct FSWorker : public Napi::AsyncWorker
     bool use_gpfs_lib()
     {
         return gpfs_dl_path != NULL && gpfs_lib_file_exists > -1 && _backend == GPFS_BACKEND;
+    }
+    void AddThreadCapabilities() {
+        _should_add_thread_capabilities = true;
     }
     virtual void OnOK() override
     {
@@ -700,6 +772,11 @@ struct FSWrapWorker : public FSWorker
 
 /**
  * Stat is an fs op
+ * 
+ * Note: this stat operation contains the system call of open.
+ *       Currently, we use it in list objects, but might want to create a different stat call
+ *       (or add changes inside this) to avoid permission check during list objects
+ *       while we stat each file (to avoid EACCES error)
  */
 struct Stat : public FSWorker
 {
@@ -741,7 +818,7 @@ struct Stat : public FSWorker
         if (!_use_lstat) {
             SYSCALL_OR_RETURN(get_fd_xattr(fd, _xattr, _xattr_get_keys));
             if (use_gpfs_lib()) {
-                GPFS_FCNTL_OR_RETURN(get_fd_gpfs_xattr(fd, _xattr, gpfs_error));
+                GPFS_FCNTL_OR_RETURN(get_fd_gpfs_xattr(fd, _xattr, gpfs_error, _use_dmapi));
             }
         }
 
@@ -1169,7 +1246,7 @@ struct Readfile : public FSWorker
         if (_read_xattr) {
             SYSCALL_OR_RETURN(get_fd_xattr(fd, _xattr, _xattr_get_keys));
             if (use_gpfs_lib()) {
-                GPFS_FCNTL_OR_RETURN(get_fd_gpfs_xattr(fd, _xattr, gpfs_error));
+                GPFS_FCNTL_OR_RETURN(get_fd_gpfs_xattr(fd, _xattr, gpfs_error, _use_dmapi));
             }
         }
 
@@ -1619,15 +1696,24 @@ struct LinkFileAt : public FSWrapWorker<FileWrap>
 {
     std::string _filepath;
     int _replace_fd;
+    bool _should_not_override;
     LinkFileAt(const Napi::CallbackInfo& info)
         : FSWrapWorker<FileWrap>(info)
         , _replace_fd(-1)
+        , _should_not_override(false)
     {
         _filepath = info[1].As<Napi::String>();
         if (info.Length() > 2 && !info[2].IsUndefined()) {
             _replace_fd = info[2].As<Napi::Number>();
         }
-        Begin(XSTR() << "LinkFileAt " << DVAL(_wrap->_path) << DVAL(_wrap->_fd) << DVAL(_filepath));
+        if (info.Length() > 3 && !info[3].IsUndefined()) {
+            _should_not_override = info[3].As<Napi::Boolean>();
+        }
+        if(_replace_fd < 0  && _should_not_override) {
+            //set thread capabilities to allow linkat from user other than root.
+            AddThreadCapabilities();
+        }
+        Begin(XSTR() << "LinkFileAt " << DVAL(_wrap->_path) << DVAL(_wrap->_fd) << DVAL(_filepath) << DVAL(_should_not_override));
     }
     virtual void Work()
     {
@@ -1638,6 +1724,8 @@ struct LinkFileAt : public FSWrapWorker<FileWrap>
         // Linux will fail the linkat() if the file already exist and we want to replace it if it existed.
         if (_replace_fd >= 0) {
             SYSCALL_OR_RETURN(dlsym_gpfs_linkatif(fd, "", AT_FDCWD, _filepath.c_str(), AT_EMPTY_PATH, _replace_fd));
+        } else if (_should_not_override){
+            SYSCALL_OR_RETURN(linkat(fd, "", AT_FDCWD, _filepath.c_str(), AT_EMPTY_PATH));
         } else {
             SYSCALL_OR_RETURN(dlsym_gpfs_linkat(fd, "", AT_FDCWD, _filepath.c_str(), AT_EMPTY_PATH));
         }
@@ -1689,7 +1777,7 @@ struct FileStat : public FSWrapWorker<FileWrap>
         SYSCALL_OR_RETURN(fstat(fd, &_stat_res));
         SYSCALL_OR_RETURN(get_fd_xattr(fd, _xattr, _xattr_get_keys));
         if (use_gpfs_lib()) {
-            GPFS_FCNTL_OR_RETURN(get_fd_gpfs_xattr(fd, _xattr, gpfs_error));
+            GPFS_FCNTL_OR_RETURN(get_fd_gpfs_xattr(fd, _xattr, gpfs_error, _use_dmapi));
         }
 
         if (_do_ctime_check) {

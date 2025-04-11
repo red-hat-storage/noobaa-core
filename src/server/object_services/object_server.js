@@ -1,5 +1,5 @@
 /* Copyright (C) 2016 NooBaa */
-/*eslint max-lines: ["error", 2200]*/
+/*eslint max-lines: ["error", 2300]*/
 'use strict';
 
 require('../../util/fips');
@@ -7,7 +7,7 @@ require('../../util/fips');
 const _ = require('lodash');
 const os = require('os');
 const util = require('util');
-const mime = require('mime');
+const mime = require('mime-types');
 const crypto = require('crypto');
 const assert = require('assert');
 const glob_to_regexp = require('glob-to-regexp');
@@ -69,7 +69,7 @@ async function create_object_upload(req) {
         bucket: req.bucket._id,
         key: req.rpc_params.key,
         content_type: req.rpc_params.content_type ||
-            mime.getType(req.rpc_params.key) ||
+            mime.lookup(req.rpc_params.key) ||
             'application/octet-stream',
         tagging: req.rpc_params.tagging,
         storage_class: req.rpc_params.storage_class,
@@ -462,6 +462,7 @@ async function complete_object_upload(req) {
         encryption: obj.encryption,
         size: set_updates.size,
         content_type: obj.content_type,
+        seq: set_updates.version_seq,
     };
 }
 
@@ -697,7 +698,7 @@ async function read_object_mapping(req) {
     const obj = await find_object_md(req);
 
     // Check if the requesting account is authorized to read the object
-    if (!await req.has_s3_bucket_permission(req.bucket, 's3:GetObject', '/' + obj.key)) {
+    if (!await req.has_s3_bucket_permission(req.bucket, 's3:GetObject', '/' + obj.key, undefined)) {
         throw new RpcError('UNAUTHORIZED', 'requesting account is not authorized to read the object');
     }
 
@@ -770,26 +771,49 @@ async function read_node_mapping(req) {
 }
 
 /**
+ * Converts RPC parameters to a bucket policy request query.
+ * Extracts the version ID (if present) to construct a query object.
+ * @param {object} rpc_params - The RPC parameters object.
+ * @returns {object|null} A query object or null.
+ */
+
+function _convert_rpc_params_to_bucket_policy_req(rpc_params) {
+
+    let req_query = null;
+    if (rpc_params && rpc_params.version_id) {
+        req_query = {
+            query: {
+                versionId: rpc_params.version_id
+            }
+        };
+    }
+    return req_query;
+}
+
+/**
  *
  * READ_OBJECT_MD
  *
  */
 async function read_object_md(req) {
     dbg.log1('object_server.read_object_md:', req.rpc_params);
-    const { bucket, key, md_conditions, adminfo, encryption } = req.rpc_params;
+    const { bucket, key, md_conditions, adminfo, encryption, version_id } = req.rpc_params;
 
     if (adminfo && req.role !== 'admin') {
         throw new RpcError('UNAUTHORIZED', 'read_object_md: role should be admin');
     }
 
+    const req_query = _convert_rpc_params_to_bucket_policy_req(req.rpc_params);
     const obj = await find_object_md(req);
 
     // Check if the requesting account is authorized to read the object
-    if (!await req.has_s3_bucket_permission(req.bucket, 's3:GetObject', '/' + obj.key)) {
+    const action = version_id ? 's3:GetObjectVersion' : 's3:GetObject';
+
+    if (!await req.has_s3_bucket_permission(req.bucket, action, '/' + obj.key, req_query)) {
         throw new RpcError('UNAUTHORIZED', 'requesting account is not authorized to read the object');
     }
 
-    check_md_conditions(md_conditions, obj);
+    http_utils.check_md_conditions(md_conditions, obj);
     const info = get_object_info(obj, { role: req.role });
     _check_encryption_permissions(obj.encryption, encryption);
 
@@ -881,6 +905,7 @@ async function delete_object(req) {
     if (obj) {
         dbg.log1(`${obj.key} was deleted by ${req.account && req.account.email.unwrap()}`);
     }
+    reply.seq = await MDStore.instance().alloc_object_version_seq();
     return reply;
 }
 
@@ -946,12 +971,14 @@ async function delete_multiple_objects_by_filter(req) {
     dbg.log1(`delete_multiple_objects_by_filter: bucket=${req.bucket.name} filter=${util.inspect(req.rpc_params)}`);
     const key = new RegExp('^' + _.escapeRegExp(req.rpc_params.prefix));
     const bucket_id = req.bucket._id;
+    const reply_objects = req.rpc_params.reply_objects;
     // TODO: change it to perform changes in batch. Won't scale.
     const query = {
         bucket_id,
         key,
         max_create_time: req.rpc_params.create_time,
         tagging: req.rpc_params.tags,
+        latest_versions: req.rpc_params.latest_versions,
         filter_delete_markers: req.rpc_params.filter_delete_markers,
         max_size: req.rpc_params.size_less,
         min_size: req.rpc_params.size_greater,
@@ -960,16 +987,36 @@ async function delete_multiple_objects_by_filter(req) {
 
     const { objects } = await MDStore.instance().find_objects(query);
 
-    await delete_multiple_objects(_.assign(req, {
+    const delete_results = await delete_multiple_objects(_.assign(req, {
         rpc_params: {
             bucket: req.bucket.name,
             objects: _.map(objects, obj => ({
                 key: obj.key,
-                version_id: MDStore.instance().get_object_version_id(obj),
+                version_id: req.rpc_params.delete_version ? MDStore.instance().get_object_version_id(obj) : '',
             }))
         }
     }));
-    return { num_objects_deleted: objects.length };
+
+    const reply = { num_objects_deleted: objects.length };
+    if (reply_objects) {
+        //reply needs to include deleted objects
+        //(this is used for LifecycleExpiratoin event notifications)
+        //so map the md into (api friendly) object info,
+        //or incude the error if deletion failed
+        reply.deleted_objects = [];
+        for (let i = 0; i < objects.length; ++i) {
+             if (delete_results[i].err_code) {
+                reply.deleted_objects[i] = {
+                    err_code: delete_results[i].err_code,
+                    err_message: delete_results[i].err_message
+                };
+             } else {
+                reply.deleted_objects[i] = get_object_info(objects[i]);
+             }
+        }
+    }
+
+    return reply;
 }
 
 /**
@@ -1005,6 +1052,58 @@ async function delete_multiple_objects_unordered(req) {
     return { is_empty: !bucket_has_objects };
 }
 
+// Sets the "deleted" field for all Object MDs with `upload_started: { $exists: true } and create_time < expiration threshold
+async function delete_incomplete_multiparts(req) {
+    load_bucket(req);
+    dbg.log1(`[delete_incomplete_multiparts] LIFECYCLE from ${req.bucket.name} with days_after_initiation: ${req.rpc_params.days_after_initiation}`);
+    const delete_count = await MDStore.instance().remove_pending_multiparts({
+        bucket_id: req.bucket._id,
+        days_after_initiation: req.rpc_params.days_after_initiation,
+        prefix: req.rpc_params.prefix,
+        limit: req.rpc_params.limit,
+        size_less: req.rpc_params.size_less,
+        size_greater: req.rpc_params.size_greater,
+    });
+    dbg.log1(`[delete_incomplete_multiparts] LIFECYCLE multipart deleted ${delete_count}`);
+
+    const reply = { num_objects_deleted: delete_count };
+    return reply;
+}
+
+async function delete_noncurrent_versions(req) {
+    load_bucket(req);
+    dbg.log1(`[delete_noncurrent_versions] LIFECYCLE from ${req.bucket.name} with params: ${req.rpc_params}`);
+    const delete_count = await MDStore.instance().remove_noncurrent_versions({
+        bucket_id: req.bucket._id,
+        noncurrent_days: req.rpc_params.noncurrent_days,
+        newer_noncurrent_versions: req.rpc_params.newer_noncurrent_versions,
+        prefix: req.rpc_params.prefix,
+        limit: req.rpc_params.limit,
+        size_less: req.rpc_params.size_less,
+        size_greater: req.rpc_params.size_greater,
+        tags: req.rpc_params.tags
+    });
+    dbg.log1(`[delete_noncurrent_versions] LIFECYCLE deleted ${delete_count}`);
+
+    const reply = { num_objects_deleted: delete_count };
+    return reply;
+}
+
+async function delete_expired_delete_markers(req) {
+    load_bucket(req);
+    dbg.log1(`[delete_expired_delete_markers] LIFECYCLE from ${req.bucket.name} with params: ${req.rpc_params}`);
+    const delete_count = await MDStore.instance().delete_orphaned_delete_marker({
+        bucket_id: req.bucket._id,
+        prefix: req.rpc_params.prefix,
+        limit: req.rpc_params.limit,
+        size_less: req.rpc_params.size_less,
+        size_greater: req.rpc_params.size_greater,
+    });
+    dbg.log1(`[delete_expired_delete_markers] LIFECYCLE deleted ${delete_count}`);
+
+    const reply = { num_objects_deleted: delete_count };
+    return reply;
+}
 
 // async function delete_all_objects(req) {
 //     dbg.log1('delete_all_objects. limit =', req.params.limit);
@@ -1152,7 +1251,6 @@ async function list_uploads(req) {
         is_truncated: false,
         done: false,
     };
-
     while (!state.done) {
         const results = await MDStore.instance().list_uploads(state);
         _list_add_results(state, results);
@@ -1580,51 +1678,6 @@ function check_object_mode(req, obj, rpc_code) {
     return obj;
 }
 
-function check_md_conditions(conditions, obj) {
-    if (!conditions) return;
-    if (!conditions.if_match_etag &&
-        !conditions.if_none_match_etag &&
-        !conditions.if_modified_since &&
-        !conditions.if_unmodified_since) return;
-
-    const data = obj ? {
-        etag: obj.etag,
-        last_modified: obj.create_time ?
-            obj.create_time.getTime() : obj._id.getTimestamp().getTime(),
-    } : {
-        etag: '',
-        last_modified: 0,
-    };
-
-    // See http://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectHEAD.html#req-header-consideration-1
-    // See https://tools.ietf.org/html/rfc7232 (HTTP Conditional Requests)
-    let matched = false;
-    let unmatched = false;
-
-    if (conditions.if_match_etag) {
-        if (!(obj && http_utils.match_etag(conditions.if_match_etag, data.etag))) {
-            throw new RpcError('IF_MATCH_ETAG', 'check_md_conditions failed', data);
-        }
-        matched = true;
-    }
-    if (conditions.if_none_match_etag) {
-        if (obj && http_utils.match_etag(conditions.if_none_match_etag, data.etag)) {
-            throw new RpcError('IF_NONE_MATCH_ETAG', 'check_md_conditions failed', data);
-        }
-        unmatched = true;
-    }
-    if (conditions.if_modified_since) {
-        if (!unmatched && (!obj || conditions.if_modified_since > data.last_modified)) {
-            throw new RpcError('IF_MODIFIED_SINCE', 'check_md_conditions failed', data);
-        }
-    }
-    if (conditions.if_unmodified_since) {
-        if (!matched && (!obj || conditions.if_unmodified_since < data.last_modified)) {
-            throw new RpcError('IF_UNMODIFIED_SINCE', 'check_md_conditions failed', data);
-        }
-    }
-}
-
 /**
  * Return the etag ("Entity tag") for the given entity.
  * Entity can be ObjectMD or ObjectMultipart or an updates for one of those.
@@ -1648,19 +1701,19 @@ function check_md_conditions(conditions, obj) {
  * @returns {string}
  */
 function get_etag(entity, updates) {
-   const etag = updates?.etag || entity.etag;
-   if (etag) return etag;
+    const etag = updates?.etag || entity.etag;
+    if (etag) return etag;
 
-   const md5_b64 = updates?.md5_b64 || entity.md5_b64;
-   if (md5_b64) return Buffer.from(md5_b64, 'base64').toString('hex');
+    const md5_b64 = updates?.md5_b64 || entity.md5_b64;
+    if (md5_b64) return Buffer.from(md5_b64, 'base64').toString('hex');
 
-   const sha256_b64 = updates?.sha256_b64 || entity.sha256_b64;
-   if (sha256_b64) return 'sha256-' + Buffer.from(sha256_b64, 'base64').toString('hex');
+    const sha256_b64 = updates?.sha256_b64 || entity.sha256_b64;
+    if (sha256_b64) return 'sha256-' + Buffer.from(sha256_b64, 'base64').toString('hex');
 
-   const id = updates?._id || entity._id;
-   if (id) return 'id-' + id.toHexString();
+    const id = updates?._id || entity._id;
+    if (id) return 'id-' + id.toHexString();
 
-   return '';
+    return '';
 }
 
 function throw_if_maintenance(req) {
@@ -1687,7 +1740,7 @@ function check_quota(bucket) {
     if (major_messages.length > 0) {
         const message = major_messages.join();
         dbg.error(message);
-        throw new RpcError('INVALID_BUCKET_STATE', message);
+        throw new RpcError('OBJECT_QUOTA_EXCEEDED', message);
     }
 }
 
@@ -1723,8 +1776,8 @@ async function _put_object_handle_latest({ req, put_obj, set_updates, unset_upda
 
     if (bucket_versioning === 'DISABLED') {
         const obj = await MDStore.instance().find_object_null_version(req.bucket._id, put_obj.key);
+        http_utils.check_md_conditions(req.rpc_params.md_conditions, obj);
         if (obj) {
-            check_md_conditions(req.rpc_params.md_conditions, obj);
             // 2, 3, 6, 7
             await MDStore.instance().complete_object_upload_latest_mark_remove_current_and_delete({
                 unmark_obj: obj,
@@ -1741,8 +1794,8 @@ async function _put_object_handle_latest({ req, put_obj, set_updates, unset_upda
 
     if (bucket_versioning === 'ENABLED') {
         const obj = await MDStore.instance().find_object_latest(req.bucket._id, put_obj.key);
+        http_utils.check_md_conditions(req.rpc_params.md_conditions, obj);
         if (obj) {
-            check_md_conditions(req.rpc_params.md_conditions, obj);
             // 3, 6
             await MDStore.instance().complete_object_upload_latest_mark_remove_current({
                 unmark_obj: obj,
@@ -1760,12 +1813,11 @@ async function _put_object_handle_latest({ req, put_obj, set_updates, unset_upda
     if (bucket_versioning === 'SUSPENDED') {
         const obj = await MDStore.instance().find_object_null_version(req.bucket._id, put_obj.key);
         if (obj) {
-            check_md_conditions(req.rpc_params.md_conditions, obj);
             // 2, 3, 6, 7
             if (obj.version_past) {
                 const latest_obj = await MDStore.instance().find_object_latest(req.bucket._id, put_obj.key);
+                http_utils.check_md_conditions(req.rpc_params.md_conditions, latest_obj);
                 if (latest_obj) {
-                    check_md_conditions(req.rpc_params.md_conditions, latest_obj);
                     // 2, 3, 6, 7
                     await MDStore.instance().complete_object_upload_latest_mark_remove_current_and_delete({
                         delete_obj: obj,
@@ -1779,6 +1831,7 @@ async function _put_object_handle_latest({ req, put_obj, set_updates, unset_upda
                     await MDStore.instance().update_object_by_id(put_obj._id, set_updates, unset_updates);
                 }
             } else {
+                http_utils.check_md_conditions(req.rpc_params.md_conditions, obj);
                 await MDStore.instance().complete_object_upload_latest_mark_remove_current_and_delete({
                     unmark_obj: obj,
                     put_obj,
@@ -1788,8 +1841,8 @@ async function _put_object_handle_latest({ req, put_obj, set_updates, unset_upda
             }
         } else {
             const latest_obj = await MDStore.instance().find_object_latest(req.bucket._id, put_obj.key);
+            http_utils.check_md_conditions(req.rpc_params.md_conditions, latest_obj);
             if (latest_obj) {
-                check_md_conditions(req.rpc_params.md_conditions, latest_obj);
                 // 3, 6
                 await MDStore.instance().complete_object_upload_latest_mark_remove_current({
                     unmark_obj: latest_obj,
@@ -1815,10 +1868,10 @@ async function _delete_object_version(req) {
 
     if (bucket_versioning === 'DISABLED') {
         const obj = version_id === 'null' && await MDStore.instance().find_object_or_upload_null_version(req.bucket._id, req.rpc_params.key);
+        http_utils.check_md_conditions(req.rpc_params.md_conditions, obj);
 
         if (!obj) return { reply: {} };
         if (obj.delete_marker) dbg.error('versioning disabled bucket null objects should not have delete_markers', obj);
-        check_md_conditions(req.rpc_params.md_conditions, obj);
         // 2, 3, 8
         await MDStore.instance().remove_object_and_unset_latest(obj);
         return { obj, reply: _get_delete_obj_reply(obj) };
@@ -1828,6 +1881,7 @@ async function _delete_object_version(req) {
         const obj = version_id === 'null' ?
             await MDStore.instance().find_object_or_upload_null_version(req.bucket._id, req.rpc_params.key) :
             await MDStore.instance().find_object_by_version(req.bucket._id, req.rpc_params.key, version_seq);
+        http_utils.check_md_conditions(req.rpc_params.md_conditions, obj);
         if (!obj) return { reply: {} };
 
         if (config.WORM_ENABLED && obj.lock_settings) {
@@ -1850,7 +1904,6 @@ async function _delete_object_version(req) {
                 }
             }
         }
-        check_md_conditions(req.rpc_params.md_conditions, obj);
         if (obj.version_past) {
             // 2, 8
             await MDStore.instance().delete_object_by_id(obj._id);
@@ -1860,7 +1913,6 @@ async function _delete_object_version(req) {
             // we need to find the previous and make it the new latest
             const prev_version = await MDStore.instance().find_object_prev_version(req.bucket._id, req.rpc_params.key);
             if (prev_version) {
-                check_md_conditions(req.rpc_params.md_conditions, prev_version);
                 // 2, 3, 4, 8
                 await MDStore.instance().remove_object_move_latest(obj, prev_version);
                 return { obj, reply: _get_delete_obj_reply(obj) };
@@ -1878,8 +1930,8 @@ async function _delete_object_only_key(req) {
 
     if (bucket_versioning === 'DISABLED') {
         const obj = await MDStore.instance().find_object_latest(req.bucket._id, req.rpc_params.key);
+        http_utils.check_md_conditions(req.rpc_params.md_conditions, obj);
         if (!obj) return { reply: {} };
-        check_md_conditions(req.rpc_params.md_conditions, obj);
         if (obj.delete_marker) dbg.error('versioning disabled bucket null objects should not have delete_markers', obj);
         // 2, 3, 8
         await MDStore.instance().remove_object_and_unset_latest(obj);
@@ -1888,8 +1940,8 @@ async function _delete_object_only_key(req) {
 
     if (bucket_versioning === 'ENABLED') {
         const obj = await MDStore.instance().find_object_latest(req.bucket._id, req.rpc_params.key);
+        http_utils.check_md_conditions(req.rpc_params.md_conditions, obj);
         if (obj) {
-            check_md_conditions(req.rpc_params.md_conditions, obj);
             // 3, 5
             const delete_marker = await MDStore.instance().insert_object_delete_marker_move_latest(
                 obj, /* version_enabled: */ true);
@@ -1909,12 +1961,11 @@ async function _delete_object_only_key(req) {
     if (bucket_versioning === 'SUSPENDED') {
         const obj = await MDStore.instance().find_object_null_version(req.bucket._id, req.rpc_params.key);
         if (obj) {
-            check_md_conditions(req.rpc_params.md_conditions, obj);
             if (obj.version_past) {
                 const latest_obj = await MDStore.instance().find_object_latest(req.bucket._id, req.rpc_params.key);
                 if (latest_obj) {
-                    check_md_conditions(req.rpc_params.md_conditions, latest_obj);
                     // 3, 5
+                    http_utils.check_md_conditions(req.rpc_params.md_conditions, latest_obj);
                     const delete_marker = await MDStore.instance().insert_object_delete_marker_move_latest_with_delete(obj, latest_obj);
                     return { obj, reply: _get_delete_obj_reply(obj, delete_marker) };
                 } else {
@@ -1923,13 +1974,14 @@ async function _delete_object_only_key(req) {
                 }
             } else {
                 // 2, 3, 5
+                http_utils.check_md_conditions(req.rpc_params.md_conditions, obj);
                 const delete_marker = await MDStore.instance().insert_object_delete_marker_move_latest_with_delete(obj);
                 return { obj, reply: _get_delete_obj_reply(obj, delete_marker) };
             }
         } else {
             const latest_obj = await MDStore.instance().find_object_latest(req.bucket._id, req.rpc_params.key);
+            http_utils.check_md_conditions(req.rpc_params.md_conditions, latest_obj);
             if (latest_obj) {
-                check_md_conditions(req.rpc_params.md_conditions, latest_obj);
                 // 3, 5
                 const delete_marker = await MDStore.instance().insert_object_delete_marker_move_latest(latest_obj);
                 return { reply: _get_delete_obj_reply(null, delete_marker) };
@@ -2125,6 +2177,9 @@ exports.update_object_md = update_object_md;
 // deletion
 exports.delete_object = delete_object;
 exports.delete_multiple_objects = delete_multiple_objects;
+exports.delete_incomplete_multiparts = delete_incomplete_multiparts;
+exports.delete_noncurrent_versions = delete_noncurrent_versions;
+exports.delete_expired_delete_markers = delete_expired_delete_markers;
 exports.delete_multiple_objects_by_filter = delete_multiple_objects_by_filter;
 exports.delete_multiple_objects_unordered = delete_multiple_objects_unordered;
 // listing
