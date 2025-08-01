@@ -78,5 +78,17 @@ module.exports = {
         lifecycle_configuration_rules: {
             $ref: 'common_api#/definitions/bucket_lifecycle_configuration',
         },
+        notifications: {
+            type: 'array',
+            items: {
+                $ref: 'common_api#/definitions/bucket_notification'
+            }
+        },
+        cors_configuration_rules: {
+            $ref: 'common_api#/definitions/bucket_cors_configuration'
+        },
+        public_access_block: {
+            $ref: 'common_api#/definitions/public_access_block',
+        }
     }
 };

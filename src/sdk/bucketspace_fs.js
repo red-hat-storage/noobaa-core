@@ -1,23 +1,16 @@
 /* Copyright (C) 2020 NooBaa */
 'use strict';
 
-const path = require('path');
-const config = require('../../config');
-const nb_native = require('../util/nb_native');
-const SensitiveString = require('../util/sensitive_string');
-const { S3Error } = require('../endpoint/s3/s3_errors');
-const RpcError = require('../rpc/rpc_error');
-const js_utils = require('../util/js_utils');
-const P = require('../util/promise');
-const BucketSpaceSimpleFS = require('./bucketspace_simple_fs');
 const _ = require('lodash');
 const util = require('util');
-const bucket_policy_utils = require('../endpoint/s3/s3_bucket_policy_utils');
-const nsfs_schema_utils = require('../manage_nsfs/nsfs_schema_utils');
-const nc_mkm = require('../manage_nsfs/nc_master_key_manager').get_instance();
-const { ConfigFS, JSON_SUFFIX, CONFIG_TYPES } = require('./config_fs');
+const path = require('path');
+const { default: Ajv } = require('ajv');
+const P = require('../util/promise');
+const config = require('../../config');
+const RpcError = require('../rpc/rpc_error');
+const js_utils = require('../util/js_utils');
+const nb_native = require('../util/nb_native');
 const mongo_utils = require('../util/mongo_utils');
-
 const KeysSemaphore = require('../util/keys_semaphore');
 const {
     get_umasked_mode,
@@ -28,13 +21,23 @@ const {
     translate_error_codes,
     get_process_fs_context
 } = require('../util/native_fs_utils');
-const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
+const { S3Error } = require('../endpoint/s3/s3_errors');
 const { anonymous_access_key } = require('./object_sdk');
 const s3_utils = require('../endpoint/s3/s3_utils');
+const { ConfigFS, JSON_SUFFIX } = require('./config_fs');
+const SensitiveString = require('../util/sensitive_string');
+const BucketSpaceSimpleFS = require('./bucketspace_simple_fs');
+const { account_id_cache } = require('../sdk/accountspace_fs');
+const nsfs_schema_utils = require('../manage_nsfs/nsfs_schema_utils');
+const bucket_policy_utils = require('../endpoint/s3/s3_bucket_policy_utils');
+const nc_mkm = require('../manage_nsfs/nc_master_key_manager').get_instance();
+const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
+const native_fs_utils = require('../util/native_fs_utils');
 
 const dbg = require('../util/debug_module')(__filename);
 const bucket_semaphore = new KeysSemaphore(1);
 
+const ajv = new Ajv();
 
 class BucketSpaceFS extends BucketSpaceSimpleFS {
     constructor({ config_root }, stats) {
@@ -66,6 +69,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
         return fs_context;
     }
 
+    // TODO: account function should be handled in accountspace_fs 
     async read_account_by_access_key({ access_key }) {
         try {
             if (!access_key) throw new Error('no access key');
@@ -84,6 +88,12 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             }
             if (account.nsfs_account_config.distinguished_name) {
                 account.nsfs_account_config.distinguished_name = new SensitiveString(account.nsfs_account_config.distinguished_name);
+            }
+            try {
+                account.stat = await this.config_fs.stat_account_config_file(access_key);
+            } catch (err) {
+                dbg.warn(`BucketspaceFS.read_account_by_access_key could not stat_account_config_file` +
+                    `of account id: ${account._id} account name: ${account.name.unwrap()}`);
             }
             return account;
         } catch (err) {
@@ -104,9 +114,9 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             const bucket = await this.config_fs.get_bucket_by_name(name);
             nsfs_schema_utils.validate_bucket_schema(bucket);
 
-            const is_valid = await this.check_bucket_config(bucket);
+            const is_valid = await this.check_stat_bucket_storage_path(bucket.path);
             if (!is_valid) {
-                dbg.warn('BucketSpaceFS: one or more bucket config check is failed for bucket : ', name);
+                dbg.warn('BucketSpaceFS: invalid storage path for bucket : ', name);
             }
 
             const nsr = {
@@ -128,14 +138,12 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             };
 
             bucket.name = new SensitiveString(bucket.name);
-            const account_config = await this.config_fs.get_identity_by_id(
-                bucket.owner_account,
-                CONFIG_TYPES.ACCOUNT,
-                { silent_if_missing: true }
-            );
 
-            if (!account_config) {
-                dbg.warn(`Bucket Owner does not exist ${bucket.owner_account}`);
+            let account_config;
+            try {
+                account_config = await account_id_cache.get_with_cache({ _id: bucket.owner_account, config_fs: this.config_fs });
+            } catch (err) {
+                dbg.warn(`BucketspaceFS.read_bucket_sdk_info could not find bucket owner by id ${bucket.owner_account}`);
             }
             bucket.bucket_owner = new SensitiveString(account_config?.name);
             bucket.owner_account = {
@@ -157,6 +165,11 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
                     }
                 }
             }
+            try {
+                bucket.stat = await this.config_fs.stat_bucket_config_file(bucket.name.unwrap());
+            } catch (err) {
+                dbg.warn(`BucketspaceFS.read_bucket_sdk_info could not stat_bucket_config_file ${bucket.name.unwrap()}`);
+            }
             return bucket;
         } catch (err) {
             const rpc_error = translate_error_codes(err, entity_enum.BUCKET);
@@ -166,17 +179,58 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
         }
     }
 
-    async check_bucket_config(bucket) {
-        const bucket_storage_path = bucket.path;
+    /**
+     * check_stat_bucket_storage_path will return the true
+     * if there is stat output on the bucket storage path
+     * (in case the stat throws an error it would return false)
+     * @param {string} bucket_storage_path
+     * @returns {Promise<boolean>}
+     */
+    async check_stat_bucket_storage_path(bucket_storage_path) {
         try {
             await nb_native().fs.stat(this.fs_context, bucket_storage_path);
-            //TODO: Bucket owner check
             return true;
         } catch (err) {
             return false;
         }
     }
 
+    /**
+     * check_same_stat_bucket will return true the config file was not changed
+     * in case we had any issue (for example error during stat) the returned value will be undefined
+     * @param {string} bucket_name
+     * @param {nb.NativeFSStats} bucket_stat
+     * @returns Promise<{boolean|undefined>}
+     */
+    async check_same_stat_bucket(bucket_name, bucket_stat) {
+        try {
+            const current_stat = await this.config_fs.stat_bucket_config_file(bucket_name);
+            if (current_stat) {
+                return current_stat.ino === bucket_stat.ino && current_stat.mtimeNsBigint === bucket_stat.mtimeNsBigint;
+            }
+        } catch (err) {
+            dbg.warn('check_same_stat_bucket: current_stat got an error', err, 'ignoring...');
+        }
+    }
+
+    /**
+     * check_same_stat_account will return true the config file was not changed
+     * in case we had any issue (for example error during stat) the returned value will be undefined
+     * @param {Symbol|string} access_key
+     * @param {nb.NativeFSStats} account_stat
+     * @returns Promise<{boolean|undefined>}
+     */
+    // TODO: account function should be handled in accountspace_fs 
+    async check_same_stat_account(access_key, account_stat) {
+        try {
+            const current_stat = await this.config_fs.stat_account_config_file(access_key);
+            if (current_stat) {
+                return current_stat.ino === account_stat.ino && current_stat.mtimeNsBigint === account_stat.mtimeNsBigint;
+            }
+        } catch (err) {
+            dbg.warn('check_same_stat_account: current_stat got an error', err, 'ignoring...');
+        }
+    }
 
     ////////////
     // BUCKET //
@@ -194,7 +248,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
      * @param {nb.ObjectSDK} object_sdk
      * @returns {Promise<object>}
      */
-    async list_buckets(object_sdk) {
+    async list_buckets(params, object_sdk) {
         let bucket_names;
         try {
             bucket_names = await this.config_fs.list_buckets();
@@ -243,11 +297,6 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             if (!sdk.requesting_account.allow_bucket_creation) {
                 throw new RpcError('UNAUTHORIZED', 'Not allowed to create new buckets');
             }
-            // currently we do not allow IAM account to create a bucket (temporary)
-            if (sdk.requesting_account.owner !== undefined) {
-                dbg.warn('create_bucket: account is IAM account (currently not allowed to create buckets)');
-                throw new RpcError('UNAUTHORIZED', 'Not allowed to create new buckets');
-            }
             if (!sdk.requesting_account.nsfs_account_config || !sdk.requesting_account.nsfs_account_config.new_buckets_path) {
                 throw new RpcError('MISSING_NSFS_ACCOUNT_CONFIGURATION');
             }
@@ -275,16 +324,16 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             }
 
             // create bucket's underlying storage directory
-            try {
-                await nb_native().fs.mkdir(fs_context, bucket_storage_path, get_umasked_mode(config.BASE_MODE_DIR));
-                new NoobaaEvent(NoobaaEvent.BUCKET_CREATED).create_event(name, { bucket_name: name });
-            } catch (err) {
-                dbg.error('BucketSpaceFS: create_bucket could not create underlying directory - nsfs, deleting bucket', err);
-                new NoobaaEvent(NoobaaEvent.BUCKET_DIR_CREATION_FAILED)
-                    .create_event(name, { bucket: name, path: bucket_storage_path }, err);
-                await nb_native().fs.unlink(this.fs_context, bucket_config_path);
-                throw translate_error_codes(err, entity_enum.BUCKET);
-            }
+            await BucketSpaceFS._create_uls(this.fs_context, fs_context, name, bucket_storage_path, bucket_config_path);
+            const reserved_tag_event_args = Object.keys(config.NSFS_GLACIER_RESERVED_BUCKET_TAGS).reduce((curr, tag) => {
+                const tag_info = config.NSFS_GLACIER_RESERVED_BUCKET_TAGS[tag];
+                if (tag_info.event) return Object.assign(curr, { [tag]: tag_info.default });
+                return curr;
+            }, {});
+
+            new NoobaaEvent(NoobaaEvent.BUCKET_CREATED).create_event(name, {
+                ...reserved_tag_event_args, bucket_name: name, account: sdk.requesting_account.name
+            });
         });
     }
 
@@ -293,8 +342,8 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
         return {
             _id: mongo_utils.mongoObjectId(),
             name,
-            tag: js_utils.default_value(tag, undefined),
-            owner_account: account._id,
+            tag: js_utils.default_value(tag, BucketSpaceFS._default_bucket_tags()),
+            owner_account: account.owner ? account.owner : account._id, // The account is the owner of the buckets that were created by it or by its users.
             creator: account._id,
             versioning: config.NSFS_VERSIONING_ENABLED && lock_enabled ? 'ENABLED' : 'DISABLED',
             object_lock_configuration: config.WORM_ENABLED ? {
@@ -304,7 +353,14 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             force_md5_etag: force_md5_etag,
             path: bucket_storage_path,
             should_create_underlying_storage: create_uls,
-            fs_backend: account.nsfs_account_config.fs_backend
+            fs_backend: account.nsfs_account_config.fs_backend,
+            cors_configuration_rules: config.S3_CORS_DEFAULTS_ENABLED ? [{
+                allowed_origins: config.S3_CORS_ALLOW_ORIGIN,
+                allowed_methods: config.S3_CORS_ALLOW_METHODS,
+                allowed_headers: config.S3_CORS_ALLOW_HEADERS,
+                expose_headers: config.S3_CORS_EXPOSE_HEADERS,
+
+            }] : undefined,
         };
     }
 
@@ -432,13 +488,39 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
     // BUCKET TAGGING //
     ////////////////////
 
-    async put_bucket_tagging(params) {
+    /**
+     * @param {*} params 
+     * @param {nb.ObjectSDK} object_sdk 
+     */
+    async put_bucket_tagging(params, object_sdk) {
         try {
             const { name, tagging } = params;
             dbg.log0('BucketSpaceFS.put_bucket_tagging: Bucket name, tagging', name, tagging);
-            const bucket = await this.config_fs.get_bucket_by_name(name);
-            bucket.tag = tagging;
-            await this.config_fs.update_bucket_config_file(bucket);
+            const bucket_path = this.config_fs.get_bucket_path_by_name(name);
+
+            const bucket_lock_file = `${bucket_path}.lock`;
+            await native_fs_utils.lock_and_run(this.fs_context, bucket_lock_file, async () => {
+                const bucket = await this.config_fs.get_bucket_by_name(name);
+                const { ns } = await object_sdk.read_bucket_full_info(name);
+                const is_bucket_empty = await BucketSpaceFS._is_bucket_empty(name, null, ns, object_sdk);
+
+                const tagging_object = BucketSpaceFS._objectify_tagging_arr(bucket.tag);
+                const merged_tags = BucketSpaceFS._merge_reserved_tags(
+                    bucket.tag || BucketSpaceFS._default_bucket_tags(), tagging, is_bucket_empty
+                );
+
+                const [
+                    reserved_tag_event_args,
+                    reserved_tag_modified,
+                ] = BucketSpaceFS._generate_reserved_tag_event_args(tagging_object, merged_tags);
+
+                bucket.tag = merged_tags;
+                await this.config_fs.update_bucket_config_file(bucket);
+                if (reserved_tag_modified) {
+                    new NoobaaEvent(NoobaaEvent.BUCKET_RESERVED_TAG_MODIFIED)
+                        .create_event(undefined, { ...reserved_tag_event_args, bucket_name: name });
+                }
+            });
         } catch (error) {
             throw translate_error_codes(error, entity_enum.BUCKET);
         }
@@ -449,7 +531,16 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             const { name } = params;
             dbg.log0('BucketSpaceFS.delete_bucket_tagging: Bucket name', name);
             const bucket = await this.config_fs.get_bucket_by_name(name);
-            delete bucket.tag;
+
+            const preserved_tags = [];
+            for (const tag of bucket.tag) {
+                const tag_info = config.NSFS_GLACIER_RESERVED_BUCKET_TAGS[tag.key];
+                if (tag_info?.immutable) {
+                    preserved_tags.push(tag);
+                }
+            }
+
+            bucket.tag = preserved_tags;
             await this.config_fs.update_bucket_config_file(bucket);
         } catch (error) {
             throw translate_error_codes(error, entity_enum.BUCKET);
@@ -465,6 +556,56 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
         } catch (error) {
             throw translate_error_codes(error, entity_enum.BUCKET);
         }
+    }
+
+    /**
+     * _default_bucket_tags returns the default bucket tags (primarily reserved tags)
+     * in the AWS tagging format
+     *
+     * @returns {Array<{key: string, value: string}>}
+     */
+    static _default_bucket_tags() {
+        return Object.keys(
+            config.NSFS_GLACIER_RESERVED_BUCKET_TAGS
+        ).map(key => ({ key, value: config.NSFS_GLACIER_RESERVED_BUCKET_TAGS[key].default }));
+    }
+
+    /**
+     * _merge_reserved_tags takes original tags, new_tags and a boolean indicating whether
+     * the bucket is empty or not and returns an array of merged tags based on the rules
+     * of reserved tags.
+     *
+     * @param {Array<{key: string, value: string}>} new_tags 
+     * @param {Array<{key: string, value: string}>} original_tags 
+     * @param {boolean} is_bucket_empty 
+     * @returns {Array<{key: string, value: string}>}
+     */
+    static _merge_reserved_tags(original_tags, new_tags, is_bucket_empty) {
+        const merged_tags = original_tags.reduce((curr, tag) => {
+            if (!config.NSFS_GLACIER_RESERVED_BUCKET_TAGS[tag.key]) return curr;
+            return Object.assign(curr, { [tag.key]: tag.value });
+        }, {});
+
+        for (const tag of new_tags) {
+            const tag_info = config.NSFS_GLACIER_RESERVED_BUCKET_TAGS[tag.key];
+            if (!tag_info) {
+                merged_tags[tag.key] = tag.value;
+                continue;
+            }
+            if (!tag_info.immutable || (tag_info.immutable === 'if-data' && is_bucket_empty)) {
+                let validator = ajv.getSchema(tag_info.schema.$id);
+                if (!validator) {
+                    ajv.addSchema(tag_info.schema);
+                    validator = ajv.getSchema(tag_info.schema.$id);
+                }
+
+                if (validator(tag.value)) {
+                    merged_tags[tag.key] = tag.value;
+                }
+            }
+        }
+
+        return Object.keys(merged_tags).map(key => ({ key, value: merged_tags[key] }));
     }
 
     ////////////////////
@@ -541,7 +682,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             const { name } = params;
             dbg.log0('BucketSpaceFS.get_bucket_encryption: Bucket name', name);
             const bucket = await this.config_fs.get_bucket_by_name(name);
-            return bucket.encryption;
+            return { encryption: bucket.encryption };
         } catch (err) {
             throw translate_error_codes(err, entity_enum.BUCKET);
         }
@@ -612,6 +753,14 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             const { name, policy } = params;
             dbg.log0('BucketSpaceFS.put_bucket_policy: Bucket name, policy', name, policy);
             const bucket = await this.config_fs.get_bucket_by_name(name);
+
+            if (
+                bucket.public_access_block?.block_public_policy &&
+                bucket_policy_utils.allows_public_access(policy)
+            ) {
+                throw new S3Error(S3Error.AccessDenied);
+            }
+
             bucket.s3_policy = policy;
             // We need to validate bucket schema here as well for checking the policy schema
             nsfs_schema_utils.validate_bucket_schema(_.omitBy(bucket, _.isUndefined));
@@ -644,6 +793,115 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             return { policy: bucket_policy_info.s3_policy };
         } catch (err) {
             throw translate_error_codes(err, entity_enum.BUCKET);
+        }
+    }
+
+    /////////////////////////
+    // BUCKET NOTIFICATION //
+    /////////////////////////
+
+    async put_bucket_notification(params) {
+        try {
+            const { bucket_name, notifications } = params;
+            dbg.log0('BucketSpaceFS.put_bucket_notification: Bucket name', bucket_name, ", notifications ", notifications);
+            const bucket = await this.config_fs.get_bucket_by_name(bucket_name);
+            bucket.notifications = notifications;
+            await this.config_fs.update_bucket_config_file(bucket);
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    async get_bucket_notification(params) {
+        try {
+            const { bucket_name } = params;
+            dbg.log0('BucketSpaceFS.get_bucket_notification: Bucket name', bucket_name);
+            const bucket = await this.config_fs.get_bucket_by_name(bucket_name);
+            return { notifications: bucket.notifications || [] };
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    ////////////////////
+    // BUCKET CORS //
+    ////////////////////
+
+    async put_bucket_cors(params) {
+        try {
+            const { name, cors_rules } = params;
+            dbg.log0('BucketSpaceFS.put_bucket_cors: Bucket name', name, ", cors configuration ", cors_rules);
+            const bucket = await this.config_fs.get_bucket_by_name(name);
+            bucket.cors_configuration_rules = cors_rules;
+            await this.config_fs.update_bucket_config_file(bucket);
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    async delete_bucket_cors(params) {
+        try {
+            const { name } = params;
+            dbg.log0('BucketSpaceFS.delete_bucket_cors: Bucket name', name);
+            const bucket = await this.config_fs.get_bucket_by_name(name);
+            delete bucket.cors_configuration_rules;
+            await this.config_fs.update_bucket_config_file(bucket);
+        } catch (err) {
+            throw translate_error_codes(err, entity_enum.BUCKET);
+        }
+    }
+
+    async get_bucket_cors(params) {
+        try {
+            const { name } = params;
+            dbg.log0('BucketSpaceFS.get_bucket_cors: Bucket name', name);
+            const bucket = await this.config_fs.get_bucket_by_name(name);
+            return {
+                cors: bucket.cors_configuration_rules || [],
+            };
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    /////////////////////////
+    // PUBLIC ACCESS BLOCK //
+    /////////////////////////
+
+    async get_public_access_block(params, object_sdk) {
+        try {
+            const { bucket_name } = params;
+            dbg.log0('BucketSpaceFS.get_public_access_block: Bucket name', bucket_name);
+            const bucket = await this.config_fs.get_bucket_by_name(bucket_name);
+            return {
+                public_access_block: bucket.public_access_block,
+            };
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    async put_public_access_block(params, object_sdk) {
+        try {
+            const { bucket_name, public_access_block } = params;
+            dbg.log0('BucketSpaceFS.put_public_access_block: Bucket name', bucket_name, ", public_access_block ", public_access_block);
+            const bucket = await this.config_fs.get_bucket_by_name(bucket_name);
+            bucket.public_access_block = public_access_block;
+            await this.config_fs.update_bucket_config_file(bucket);
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
+    }
+
+    async delete_public_access_block(params, object_sdk) {
+        try {
+            const { bucket_name } = params;
+            dbg.log0('BucketSpaceFS.delete_public_access_block: Bucket name', bucket_name);
+            const bucket = await this.config_fs.get_bucket_by_name(bucket_name);
+            delete bucket.public_access_block;
+            await this.config_fs.update_bucket_config_file(bucket);
+        } catch (error) {
+            throw translate_error_codes(error, entity_enum.BUCKET);
         }
     }
 
@@ -686,28 +944,30 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             throw new Error('has_bucket_action_permission: action is required');
         }
 
-        let permission;
-        permission = await bucket_policy_utils.has_bucket_policy_permission(
+        let permission_by_name;
+        const permission_by_id = await bucket_policy_utils.has_bucket_policy_permission(
             bucket_policy,
             account._id,
             action,
             `arn:aws:s3:::${bucket.name.unwrap()}${bucket_path}`,
-            undefined
+            undefined,
+            bucket.public_access_block?.restrict_public_buckets,
         );
+        if (permission_by_id === "DENY") return false;
         // we (currently) allow account identified to be both id and name,
         // so if by-id failed, try also name
-        if (permission === 'IMPLICIT_DENY') {
-            permission = await bucket_policy_utils.has_bucket_policy_permission(
+        if (account.owner === undefined) {
+            permission_by_name = await bucket_policy_utils.has_bucket_policy_permission(
                 bucket_policy,
                 account.name.unwrap(),
                 action,
                 `arn:aws:s3:::${bucket.name.unwrap()}${bucket_path}`,
-                undefined
+                undefined,
+                bucket.public_access_block?.restrict_public_buckets,
             );
         }
-
-        if (permission === 'DENY') return false;
-        return is_owner || permission === 'ALLOW';
+        if (permission_by_name === 'DENY') return false;
+        return is_owner || (permission_by_id === 'ALLOW' || permission_by_name === 'ALLOW');
     }
 
     async validate_fs_bucket_access(bucket, object_sdk) {
@@ -760,6 +1020,91 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
         }
 
         return storage_classes;
+    }
+
+    /**
+     * _is_bucket_empty returns true if the given bucket is empty
+     *
+     * @param {*} ns 
+     * @param {*} params 
+     * @param {string} name 
+     * @param {nb.ObjectSDK} object_sdk 
+     *
+     * @returns {Promise<boolean>}
+     */
+    static async _is_bucket_empty(name, params, ns, object_sdk) {
+        params = params || {};
+
+        let list;
+        try {
+            if (ns._is_versioning_disabled()) {
+                list = await ns.list_objects({ ...params, bucket: name, limit: 1 }, object_sdk);
+            } else {
+                list = await ns.list_object_versions({ ...params, bucket: name, limit: 1 }, object_sdk);
+            }
+        } catch (err) {
+            dbg.warn('_is_bucket_empty: bucket name', name, 'got an error while trying to list_objects', err);
+            // in case the ULS was deleted - we will continue
+            if (err.rpc_code !== 'NO_SUCH_BUCKET') throw err;
+        }
+
+        return !(list && list.objects && list.objects.length > 0);
+    }
+
+    /**
+     * _generate_reserved_tag_event_args returns the list of reserved
+     * bucket tags which have been modified and also returns a variable
+     * indicating if there has been any modifications at all.
+     * @param {Record<string, string>} prev_tags_objectified 
+     * @param {Array<{key: string, value: string}>} new_tags 
+     */
+    static _generate_reserved_tag_event_args(prev_tags_objectified, new_tags) {
+        let reserved_tag_modified = false;
+        const reserved_tag_event_args = new_tags?.reduce((curr, tag) => {
+            const tag_info = config.NSFS_GLACIER_RESERVED_BUCKET_TAGS[tag.key];
+
+            // If not a reserved tag - skip
+            if (!tag_info) return curr;
+
+            // If no event is requested - skip
+            if (!tag_info.event) return curr;
+
+            // If value didn't change - skip
+            if (_.isEqual(prev_tags_objectified[tag.key], tag.value)) return curr;
+
+            reserved_tag_modified = true;
+            return Object.assign(curr, { [tag.key]: tag.value });
+        }, {});
+
+        return [reserved_tag_event_args, reserved_tag_modified];
+    }
+
+    /**
+     * @param {Array<{key: string, value: string}>} tagging 
+     * @returns {Record<string, string>}
+     */
+    static _objectify_tagging_arr(tagging) {
+        return (tagging || []).reduce((curr, tag) => Object.assign(curr, { [tag.key]: tag.value }), {});
+    }
+
+    /**
+     * _create_uls creates underylying storage at the given storage_path
+     * @param {*} fs_context - root fs_context 
+     * @param {*} acc_fs_context - fs_context associated with the performing account
+     * @param {*} name - bucket name
+     * @param {*} storage_path - bucket's storage path
+     * @param {*} cfg_path - bucket's configuration path
+     */
+    static async _create_uls(fs_context, acc_fs_context, name, storage_path, cfg_path) {
+        try {
+            await nb_native().fs.mkdir(acc_fs_context, storage_path, get_umasked_mode(config.BASE_MODE_DIR));
+        } catch (error) {
+            dbg.error('BucketSpaceFS: _create_uls could not create underlying directory - nsfs, deleting bucket', error);
+            new NoobaaEvent(NoobaaEvent.BUCKET_DIR_CREATION_FAILED)
+                .create_event(name, { bucket: name, path: storage_path }, error);
+            await nb_native().fs.unlink(fs_context, cfg_path);
+            throw translate_error_codes(error, entity_enum.BUCKET);
+        }
     }
 }
 

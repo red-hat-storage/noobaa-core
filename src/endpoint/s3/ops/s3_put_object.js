@@ -5,7 +5,7 @@ const dbg = require('../../../util/debug_module')(__filename);
 const s3_utils = require('../s3_utils');
 const S3Error = require('../s3_errors').S3Error;
 const http_utils = require('../../../util/http_utils');
-const mime = require('mime');
+const mime = require('mime-types');
 const config = require('../../../../config');
 
 const s3_error_options = {
@@ -34,12 +34,14 @@ async function put_object(req, res) {
 
     dbg.log0('PUT OBJECT', req.params.bucket, req.params.key,
         req.headers['x-amz-copy-source'] || '', encryption || '');
+    //for copy, use correct s3_event_method. otherwise, just use default (req.method)
+    req.s3_event_method = copy_source ? 'Copy' : undefined;
 
     const source_stream = req.chunked_content ? s3_utils.decode_chunked_upload(req) : req;
     const reply = await req.object_sdk.upload_object({
         bucket: req.params.bucket,
         key: req.params.key,
-        content_type: req.headers['content-type'] || (copy_source ? undefined : (mime.getType(req.params.key) || 'application/octet-stream')),
+        content_type: req.headers['content-type'] || (copy_source ? undefined : (mime.lookup(req.params.key) || 'application/octet-stream')),
         content_encoding: req.headers['content-encoding'],
         copy_source,
         source_stream,
@@ -63,6 +65,8 @@ async function put_object(req, res) {
     }
     s3_utils.set_encryption_response_headers(req, res, reply.encryption);
 
+    res.size_for_notif = size || reply.size;
+
     if (copy_source) {
         // TODO: This needs to be checked regarding copy between diff namespaces
         // In that case we do not have the copy_source property and just read and upload the stream
@@ -76,6 +80,19 @@ async function put_object(req, res) {
         };
     }
     res.setHeader('ETag', `"${reply.etag}"`);
+
+    const object_info = {
+        key: req.params.key,
+        create_time: new Date().getTime(),
+        size: size,
+        tagging: tagging,
+    };
+    await http_utils.set_expiration_header(req, res, object_info); // setting expiration header for bucket lifecycle
+
+    if (reply.seq) {
+        res.seq = reply.seq;
+        delete reply.seq;
+    }
 }
 
 

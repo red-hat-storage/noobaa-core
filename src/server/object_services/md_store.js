@@ -1,4 +1,5 @@
 /* Copyright (C) 2016 NooBaa */
+/*eslint max-lines: ["error", 2200]*/
 'use strict';
 
 /** @typedef {typeof import('../../sdk/nb')} nb */
@@ -7,7 +8,7 @@ const _ = require('lodash');
 const assert = require('assert');
 const moment = require('moment');
 const mongodb = require('mongodb');
-const mime = require('mime');
+const mime = require('mime-types');
 
 const P = require('../../util/promise');
 const dbg = require('../../util/debug_module')(__filename);
@@ -27,36 +28,47 @@ const data_block_indexes = require('./schemas/data_block_indexes');
 const config = require('../../../config');
 
 
+// const sql_or_conditions = (...conditions) => conditions.filter(Boolean).join(' OR ');
+const sql_and_conditions = (...conditions) => conditions.filter(Boolean).join(' AND ');
+
 class MDStore {
 
     constructor(test_suffix = '') {
+        const postgres_pool = 'md';
+
         this._objects = db_client.instance().define_collection({
             name: 'objectmds' + test_suffix,
             schema: object_md_schema,
             db_indexes: object_md_indexes,
+            postgres_pool,
         });
         this._multiparts = db_client.instance().define_collection({
             name: 'objectmultiparts' + test_suffix,
             schema: object_multipart_schema,
             db_indexes: object_multipart_indexes,
+            postgres_pool,
         });
         this._parts = db_client.instance().define_collection({
             name: 'objectparts' + test_suffix,
             schema: object_part_schema,
             db_indexes: object_part_indexes,
+            postgres_pool,
         });
         this._chunks = db_client.instance().define_collection({
             name: 'datachunks' + test_suffix,
             schema: data_chunk_schema,
             db_indexes: data_chunk_indexes,
+            postgres_pool,
         });
         this._blocks = db_client.instance().define_collection({
             name: 'datablocks' + test_suffix,
             schema: data_block_schema,
             db_indexes: data_block_indexes,
+            postgres_pool,
         });
         this._sequences = db_client.instance().define_sequence({
             name: 'mdsequences' + test_suffix,
+            postgres_pool,
         });
     }
 
@@ -248,19 +260,201 @@ class MDStore {
     async remove_objects_and_unset_latest(objs) {
         if (!objs || !objs.length) return;
 
-        await this._objects.updateMany(
-            {
-                _id: {
-                    $in: objs.map(obj => obj._id),
-                }
-            },
-            {
-                $set: {
-                    deleted: new Date(),
-                    version_past: true,
-                },
+        await this._objects.updateMany({
+            _id: {
+                $in: objs.map(obj => obj._id),
             }
-        );
+        }, {
+            $set: {
+                deleted: new Date(),
+                version_past: true,
+            },
+        });
+    }
+
+    /**
+     *
+     * @param {{
+     *  bucket_id: string,
+     *  prefix?: string,
+     *  days_after_initiation: number,
+     *  size_less?: number,
+     *  size_greater?: number,
+     *  tags?: Array<string>,
+     *  limit: number
+     * }} config
+     */
+    async remove_pending_multiparts({
+        bucket_id,
+        prefix,
+        days_after_initiation,
+        size_less,
+        size_greater,
+        tags,
+        limit,
+    }) {
+        const table_name = this._objects.name;
+
+        function convert_mongoid_to_timestamp_sql(field) {
+            return `(('x' || substring(${field} FROM 1 FOR 8))::bit(32)::bigint)`;
+        }
+
+        const sql_condition0 = prefix ? `data->>'key' LIKE '${prefix}%'` : "";
+        const sql_condition1 = size_less === undefined ? "" : `data->>'size' < ${size_less}`;
+        const sql_condition2 = size_greater === undefined ? "" : `data->>'size' > ${size_greater}`;
+        const sql_condition3 = tags && tags.length ? `ranked.tags @> '${JSON.stringify(tags)}'::jsonb` : "";
+
+        const query = `
+            UPDATE ${table_name}
+            SET data = jsonb_set(data, '{deleted}', to_jsonb($1::text), true)
+            WHERE
+                ${sql_and_conditions(
+                    `data->>'bucket' = '${bucket_id}'`,
+                    `data->>'deleted' IS NULL`,
+                    `data->>'upload_started' IS NOT NULL`,
+                    `(EXTRACT(EPOCH FROM NOW()) - ${convert_mongoid_to_timestamp_sql("data->>'upload_started'")}) / 86400 > ${days_after_initiation}`,
+                    sql_condition0, sql_condition1, sql_condition2, sql_condition3,
+                )};`;
+
+        dbg.log1('[remove_pending_multiparts] generated query:', query);
+        const result = await this._objects.executeSQL(query, [new Date()]);
+        return result.rowCount;
+    }
+
+    /**
+     *
+     * @param {{
+     *  bucket_id: string,
+     *  noncurrent_days: number,
+     *  prefix?: string,
+     *  newer_noncurrent_versions?: number,
+     *  size_less?: number,
+     *  size_greater?: number,
+     *  tags?: Array<string>,
+     *  limit: number
+     * }} config
+     */
+    async remove_noncurrent_versions({
+        bucket_id,
+        noncurrent_days,
+        prefix,
+        newer_noncurrent_versions,
+        size_less,
+        size_greater,
+        tags,
+        limit,
+    }) {
+        const table_name = this._objects.name;
+
+        if (noncurrent_days === undefined) throw new Error('noncurrent_days is required');
+
+        const sql_condition0 = prefix ? `data->>'key' LIKE '${prefix}%'` : "";
+        const sql_condition1 = `(successor_time IS NOT NULL AND (CURRENT_TIMESTAMP - successor_time) >= interval '${noncurrent_days} days')`;
+        const sql_condition2 = newer_noncurrent_versions ? `(rn > (${newer_noncurrent_versions} + 1))` : "";
+
+        const sql_condition3 = size_less === undefined ? "" : `data->>'size' < ${size_less}`;
+        const sql_condition4 = size_greater === undefined ? "" : `data->>'size' > ${size_greater}`;
+        const sql_condition5 = tags && tags.length ? `ranked.tags @> '${JSON.stringify(tags)}'::jsonb` : "";
+
+        const sql_limit = limit === undefined ? "" : `LIMIT ${limit}`;
+
+        const query = `
+            WITH ranked AS (
+                SELECT
+                    _id,
+                    (data->>'size')::BIGINT AS size,
+                    data->'tagging' AS tags,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY data->>'key'
+                        ORDER BY (data->>'version_seq')::BIGINT DESC
+                    ) AS rn,
+                    LEAD((data->>'create_time')::timestamptz) OVER (
+                        PARTITION BY data->>'key'
+                        ORDER BY (data->>'version_seq')::BIGINT
+                    ) AS successor_time
+                FROM objectmds
+                WHERE
+                    ${sql_and_conditions(
+                        `data->>'bucket' = '${bucket_id}'`,
+                        sql_condition0,
+                        `data->>'deleted' IS NULL`
+                    )}
+            )
+            UPDATE ${table_name}
+            SET data = jsonb_set(data, '{deleted}', to_jsonb($1::text), true)
+            WHERE _id IN (
+                SELECT ranked._id FROM ranked
+                WHERE
+                    ${sql_and_conditions(
+                        sql_condition1, sql_condition2,
+                        sql_condition3, sql_condition4, sql_condition5,
+                    )}
+                ${sql_limit}
+            );`;
+
+        dbg.log1('[remove_noncurrent_versions] generated query:', query);
+        const result = await this._objects.executeSQL(query, [new Date()]);
+        return result.rowCount;
+    }
+
+    /**
+     *
+     * @param {{
+     *  bucket_id: string,
+     *  prefix?: string,
+     *  size_less?: number,
+     *  size_greater?: number,
+     *  tags?: Array<string>,
+     *  limit: number
+     * }} config
+     *
+     * @returns {Promise<number>}
+     */
+    async delete_orphaned_delete_marker({
+        bucket_id,
+        prefix,
+        size_less,
+        size_greater,
+        tags,
+        limit,
+    }) {
+        const table_name = this._objects.name;
+
+        const sql_condition0 = prefix ? `data->>'key' LIKE '${prefix}%'` : "";
+        const sql_condition1 = size_less === undefined ? "" : `data->>'size' < ${size_less}`;
+        const sql_condition2 = size_greater === undefined ? "" : `data->>'size' > ${size_greater}`;
+        const sql_condition3 = tags && tags.length ? `data->'tagging' @> '${JSON.stringify(tags)}'::jsonb` : "";
+
+        const sql_limit = limit === undefined ? "" : `LIMIT ${limit}`;
+
+        const query = `
+        DELETE FROM ${table_name}
+        WHERE ctid in (
+            SELECT ctid
+            FROM ${table_name} t1
+            WHERE ${sql_and_conditions(
+                `t1.data->>'bucket' = '${bucket_id}'`,
+                `t1.data->>'deleted' IS NULL`,
+                `t1.data->>'delete_marker' IS NOT NULL`,
+                `t1.data->>'version_past' IS NULL`,
+                `NOT EXISTS (
+                    SELECT 1
+                    FROM ${table_name} t2
+                    WHERE t2.data->>'key' = t1.data->>'key'
+                        AND t2._id <> t1._id
+                        AND (
+                            t2.data->>'deleted' IS NULL -- is not deleted
+                            OR t2.data->>'delete_marker' IS NOT NULL -- is a delete marker
+                        )
+                )`,
+                sql_condition0, sql_condition1, sql_condition2, sql_condition3
+            )}
+            ${sql_limit}
+        );`;
+
+        dbg.log1('[delete_orphaned_delete_marker] generated query:', query);
+        const result = await this._objects.executeSQL(query, []);
+        return result.rowCount;
     }
 
     // 2, 3, 4
@@ -285,7 +479,7 @@ class MDStore {
             system: obj.system,
             bucket: obj.bucket,
             key: obj.key,
-            content_type: obj.content_type || mime.getType(obj.key) || 'application/octet-stream',
+            content_type: obj.content_type || mime.lookup(obj.key) || 'application/octet-stream',
             delete_marker: true,
             create_time: new Date(),
             version_seq,
@@ -437,12 +631,7 @@ class MDStore {
      * @property {1|-1} [order]
      * @property {boolean} [pagination]
      *
-     * @typedef {Object} FindObjectsReply
-     * @property {nb.ObjectMD[]} objects
-     * @property {{ non_paginated: Object, by_mode: Object }} counters
-     *
-     * @param {FindObjectsParams} params
-     * @returns {Promise<FindObjectsReply>}
+     * @returns  {nb.ObjectMD[]}
      */
     async find_objects({
         bucket_id,
@@ -476,7 +665,7 @@ class MDStore {
                 $lt: new Date(moment.unix(max_create_time).toISOString()),
                 $exists: true
             } : undefined,
-            tagging: tagging ? {
+            tagging: (tagging?.length > 0) ? {
                 $all: tagging,
             } : undefined,
             size: (max_size || min_size) ?
@@ -497,31 +686,13 @@ class MDStore {
         const uploading_query = _.omit(query, 'upload_started');
         uploading_query.upload_started = { $exists: true };
 
-        const [objects, non_paginated, completed, uploading] = await Promise.all([
-            this._objects.find(query, {
-                limit: Math.min(limit, 1000),
-                skip: skip,
-                sort: sort ? {
-                    [sort]: (order === -1 ? -1 : 1)
-                } : undefined
-            }),
-            pagination ? this._objects.countDocuments(query) : undefined,
-            // completed uploads count
-            this._objects.countDocuments(completed_query),
-            // uploading count
-            this._objects.countDocuments(uploading_query)
-        ]);
-
-        return {
-            objects,
-            counters: {
-                non_paginated,
-                by_mode: {
-                    completed,
-                    uploading
-                }
-            }
-        };
+        return this._objects.find(query, {
+            limit: Math.min(limit, 1000),
+            skip: skip,
+            sort: sort ? {
+                [sort]: (order === -1 ? -1 : 1)
+            } : undefined
+        });
     }
 
     async find_unreclaimed_objects(limit) {
@@ -1362,7 +1533,7 @@ class MDStore {
     }
 
     /**
-     * 
+     *
      * @param {{
      *  tier: nb.ID,
      *  limit: number,
@@ -1387,14 +1558,14 @@ class MDStore {
         }
 
         return this._chunks
-          .find(selectors, {
-            projection: { _id: 1 },
-            hint: "tiering_index",
-            sort,
-            limit,
-          })
+            .find(selectors, {
+                projection: { _id: 1 },
+                hint: "tiering_index",
+                sort,
+                limit,
+            })
 
-          .then(chunks => db_client.instance().uniq_ids(chunks, "_id"));
+            .then(chunks => db_client.instance().uniq_ids(chunks, "_id"));
     }
 
 
@@ -1775,8 +1946,7 @@ class MDStore {
     find_deleted_blocks(max_delete_time, limit) {
         const query = {
             deleted: {
-                $lt: new Date(max_delete_time),
-                $exists: true // Force index usage
+                $lt: new Date(max_delete_time)
             },
         };
         return this._blocks.find(query, {

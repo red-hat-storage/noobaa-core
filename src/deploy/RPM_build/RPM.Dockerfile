@@ -36,6 +36,10 @@ COPY ./src/deploy/standalone/noobaa_rsyslog.conf ./src/deploy/standalone/noobaa_
 COPY ./src/deploy/standalone/noobaa_syslog.conf ./src/deploy/standalone/noobaa_syslog.conf
 COPY ./src/deploy/standalone/noobaa-logrotate ./src/deploy/standalone/noobaa-logrotate
 COPY ./src/manage_nsfs ./src/manage_nsfs
+COPY ./src/nc ./src/nc
+
+# Install GCC11 toolchain on Centos8 to match the default toolchain of Centos9
+RUN if [ "$CENTOS_VER" == "8" ];then dnf install -y -q gcc-toolset-11; fi
 
 WORKDIR /build
 
@@ -52,4 +56,6 @@ ENV BUILD_S3SELECT=${BUILD_S3SELECT}
 ENV BUILD_S3SELECT_PARQUET=${BUILD_S3SELECT_PARQUET}
 ENV CENTOS_VER=${CENTOS_VER}
 ENV SRPM_ONLY=${SRPM_ONLY}
-CMD ./packagerpm.sh /export /build
+RUN mkdir -p /export
+# Set GCC Toolset in path - won't exist in RHEL9 but that's OK
+CMD PATH=/opt/rh/gcc-toolset-11/root/bin:$PATH ./packagerpm.sh /export /build

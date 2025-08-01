@@ -17,7 +17,6 @@ const pkg = require('../../package.json');
 const DebugLogger = require('../util/debug_module');
 const diag = require('./agent_diagnostics');
 const config = require('../../config');
-const FuncNode = require('./func_services/func_node');
 const os_utils = require('../util/os_utils');
 const js_utils = require('../util/js_utils');
 const net_utils = require('../util/net_utils');
@@ -150,11 +149,6 @@ class Agent {
             this.block_store = new BlockStoreMem(block_store_options);
         }
 
-        this.func_node = new FuncNode({
-            rpc_client: this.client,
-            storage_path: this.storage_path,
-        });
-
         // AGENT API methods - bind to self
         // (rpc registration requires bound functions)
         js_utils.self_bind(this, [
@@ -164,7 +158,6 @@ class Agent {
             'update_create_node_token',
             'update_rpc_config',
             'n2n_signal',
-            'test_store_perf',
             'test_store_validity',
             'test_network_perf',
             'test_network_perf_to_peer',
@@ -191,12 +184,6 @@ class Agent {
                 }
             );
         }
-        this.rpc.register_service(
-            this.rpc.schema.func_node_api,
-            this.func_node, {
-                middleware: [req => this._authenticate_agent_api(req)]
-            }
-        );
 
         // register rpc n2n
         this.n2n_agent = this.rpc.register_n2n_agent((...args) => this.client.node.n2n_signal(...args));
@@ -603,8 +590,7 @@ class Agent {
 
         // agent_api requests allowed only on server connection
         if (!req.method_api.auth?.n2n &&
-            req.api !== this.rpc.schema.block_store_api &&
-            req.api !== this.rpc.schema.func_node_api
+            req.api !== this.rpc.schema.block_store_api
         ) {
             // delayed close the connection to give a chance to send the thrown error response
             setTimeout(() => req.connection.close(), 1000);
@@ -955,11 +941,6 @@ class Agent {
 
     n2n_signal(req) {
         return this.rpc.accept_n2n_signal(req.rpc_params);
-    }
-
-    async test_store_perf(req) {
-        if (!this.block_store) return {};
-        return this.block_store.test_store_perf(req.rpc_params);
     }
 
     async test_store_validity(req) {

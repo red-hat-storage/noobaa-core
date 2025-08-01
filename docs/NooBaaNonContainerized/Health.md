@@ -34,6 +34,18 @@ For more details about NooBaa RPM installation, see - [Getting Started](./Gettin
     - Iterating buckets under the config directory.
     - Confirming the existence of the bucket's configuration file and its validity as a JSON file.
     - Verifying that the underlying storage path of a bucket exists.
+  - `Config directory health`
+    - checks if config system and directory data exists
+    - returns the config directory status 
+  - `Config directory upgrade health`
+    - checks if config system and directory data exists
+    - checks if there is ongoing upgrade
+    - returns error if there is no ongoing upgrade, but the config directory phase is locked
+    - returns message if there is no ongoing upgrade and the config directory is unlocked
+  - `Bucket event notifications connections health`
+    - Sends out a test notification for each connection.
+  - `Lifecycle worker last run health`
+    - checks if the previous run of the lifecycle worker finished successfully.
 
 * Health CLI requires root permissions.
 
@@ -45,7 +57,7 @@ The `health` command is used to analyze NooBaa health with customizable options.
 
 ```sh
 noobaa-cli diagnose health [--deployment_type][--https_port]
-[--all_account_details][--all_bucket_details][--config_root][--debug]
+[--all_account_details][--all_bucket_details][--all_connection_details][--notif_storage_threshold][--lifecycle][--config_root][--debug]
 ```
 ### Flags -
 
@@ -67,7 +79,22 @@ noobaa-cli diagnose health [--deployment_type][--https_port]
 - `all_bucket_details`
     - Type: Boolean
     - Default: false
-    - Description: Indicates if health output should contain valid buckets.  
+    - Description: Indicates if health output should contain valid buckets.
+
+- `all_connection_details`
+    - Type: Boolean
+    - Default: false
+    - Description: Indicates if health output should contain connection test result.
+
+- `notif_storage_threshold`
+    - Type: Boolean
+    - Default: false
+    - Description: Whether health ouput should check if notification storage FS is below threshold.
+
+- `lifecycle`
+    - Type: Boolean
+    - Default: false
+    - Description: Indicates if health output should contain lifecycle test result.
 
 - `config_root`
     - Type: String
@@ -135,6 +162,10 @@ The output of the Health CLI is a JSON object containing the following propertie
     2. The account doesn't have RW access to its `new_buckets_path` or having invalid config JSON file.
     3. The account has an invalid config JSON file.
 
+- `invalid connections`:
+  - Type: [{ "name": "connection_name", "config_path": "/connection/file/path", "code": String }]
+  - Description: Array of connections that failed test notification.
+
 - `valid_accounts`
   - Type: [{ "name": account_name, "storage_path": "/path/to/accounts/new_buckets_path" }]
   - Description: Array of all the valid accounts. If the all_account_details flag is set to true, valid_accounts will be included in the Health response.
@@ -143,12 +174,38 @@ The output of the Health CLI is a JSON object containing the following propertie
   - Type: [{ "name": bucket_name, "storage_path": "/path/to/bucket/path" }]
   - Description: Array of all the valid buckets. If the all_bucket_details flag is set to true, valid_buckets will be included in the Health response.
 
+- `valid_connections`:
+  - Type: [{ "name": "connection_name", "config_path": "/connection/file/path" }]
+  - Description: Array of all connections to which test notification was send successfully.
+
 - `error_type`
   - Type: String
   - Enum: 'PERSISTENT' | 'TEMPORARY'
   - Description: For TEMPORARY error types, NooBaa attempts multiple retries before updating the status to reflect an error. Currently, TEMPORARY error types are only observed in checks for invalid NooBaa endpoints.
  
+- `config_directory`
+  - Type: Object {"phase": "CONFIG_DIR_UNLOCKED" | "CONFIG_DIR_LOCKED","config_dir_version": String,
+  "upgrade_package_version": String, "upgrade_status": Object, "error": Object }.
+  - Description: An object that consists config directory information, config directory upgrade information etc.
+  - Example: { "phase": "CONFIG_DIR_UNLOCKED", "config_dir_version": "1.0.0", "upgrade_package_version": "5.18.0", "upgrade_status": { "message": "there is no in-progress upgrade" }}
 
+- `latest_lifecycle_run_status`
+   - Type: Object { <br>
+    "total_stats": { "num_objects_deleted": number, "num_objects_delete_failed": number, "objects_delete_errors": array, "num_mpu_aborted": number, "num_mpu_abort_failed": number, "mpu_abort_errors": array  <br>},  <br>
+   "lifecycle_run_times": Object {
+    "run_lifecycle_start_time": number,
+    "list_buckets_start_time": number,
+    "list_buckets_end_time": number,
+    "list_buckets_took_ms": number,
+    "process_buckets_start_time": number,
+    "process_buckets_end_time": number,
+    "process_buckets_took_ms": number,
+    "run_lifecycle_end_time": number,
+    "run_lifecycle_took_ms": number <br>
+   },<br>
+  "errors": array <br> }.
+  - Description: An object that consists total_stats information, lifecycle_run_times information and errors.
+  - Example: see in [Health Output Example](./Lifecycle.md#health-cli)
 ## Example 
 ```sh
 noobaa-cli diagnose health --all_account_details --all_bucket_details
@@ -225,6 +282,34 @@ Output:
         }
       ],
       "error_type": "PERSISTENT"
+    },
+    "connectoins_status": {
+      "invalid_connections": [
+        {
+          "name": "notif_invalid",
+          "config_path": "/etc/noobaa.conf.d/connections/notif_invalid.json",
+          "code": "ECONNREFUSED"
+        }
+      ],
+      "valid_connections": [
+        {
+          "name": "notif_valid",
+          "config_path": "/etc/noobaa.conf.d/connections/notif_valid.json"
+        }
+      ]
+    },
+    "notif_storage_threshold_details": {
+      "threshold": 0.2,
+      "ratio": 0.9,
+      "result": "above threshold"
+    }
+    "config_directory": {
+      "phase": "CONFIG_DIR_UNLOCKED",
+      "config_dir_version": "1.0.0",
+      "upgrade_package_version": "5.18.0",
+      "upgrade_status": {
+        "message": "there is no in-progress upgrade"
+      }
     }
   }
 }
@@ -243,7 +328,8 @@ Output:
   - The config file of bucket1 is invalid. Therefore, NooBaa health reports INVALID_CONFIG.
   - The underlying file system directory of bucket3 is missing. Therefore, NooBaa health reports STORAGE_NOT_EXIST.
 
-
+- config_directory: 
+  - the config directory phase is unlocked, config directory version is "1.0.0", matching source code/package version is "5.18.0" and there is no ongoing upgrade.
 
 
 ## Health Errors
@@ -351,3 +437,30 @@ The following error codes will be associated with a specific Bucket or Account s
   - Resolutions:
     - Check for FS user on the host running the Health CLI.
 
+#### 6. Bucket with invalid account owner
+  - Error code: `INVALID_ACCOUNT_OWNER`
+  - Error message: Bucket account owner is invalid
+  - Reasons:
+    - The bucket owner account is invalid.
+  - Resolutions:
+    - Compare bucket account owner and account ids in account dir.
+
+#### 7. Bucket missing account owner
+  - Error code: `MISSING_ACCOUNT_OWNER`
+  - Error message: Bucket account owner not found
+  - Reasons:
+    - Bucket missing owner account.
+  - Resolutions:
+    - Check for owner_account property in bucket config file.
+
+#### 8. Config Directory is invalid
+  - Error code: `INVALID_CONFIG_DIR`
+  - Error message: Config directory is invalid
+  - Reasons:
+    - System.json is missing - NooBaa was never started
+    - Config directory property is missing in system.json - the user didn't run config directory upgrade when upgrading from 5.17.z to 5.18.0
+    - Config directory upgrade error.
+  - Resolutions:
+    - Start NooBaa service
+    - Run `noobaa-cli upgrade`
+    - Check the in_progress_upgrade the exact reason for the failure.

@@ -22,7 +22,6 @@ const auth_server = require('../common_services/auth_server');
 const HistoryDataStore = require('../analytic_services/history_data_store').HistoryDataStore;
 const IoStatsStore = require('../analytic_services/io_stats_store').IoStatsStore;
 const pool_ctrls = require('./pool_controllers');
-const func_store = require('../func_services/func_store');
 const { KubeStore } = require('../kube-store.js');
 
 
@@ -92,6 +91,10 @@ function set_pool_controller_factory(pool_controller_factory) {
 // and only allows deletion in case that the owner is also the requester of the deletion
 function check_deletion_ownership(req, resource_owner_id) {
     if (config.RESTRICT_RESOURCE_DELETION) {
+        if (!resource_owner_id) {
+            dbg.error('check_deletion_ownership: pool has no owner');
+            throw new RpcError('INTERNAL_ERROR', 'The pool has no owner, and thus cannot be deleted');
+        }
         const requester_is_sys_owner = String(req.account._id) === String(req.system.owner._id);
         if (!requester_is_sys_owner && String(resource_owner_id) !== String(req.account._id)) {
             dbg.error('check_deletion_ownership: requester (', req.account._id, ') is not the owner (', resource_owner_id, ') of the resource');
@@ -652,7 +655,9 @@ async function update_hosts_pool(req) {
 
 function delete_pool(req) {
     const pool = find_pool_by_name(req);
-    check_deletion_ownership(req, pool.owner_id);
+    // rebuild_object_links() resolves the pool's owner_id to the account object
+    // which is why we have to access ._id to get the actual ID
+    check_deletion_ownership(req, pool.owner_id?._id);
     if (pool.hosts_pool_info) {
         return delete_hosts_pool(req, pool);
     } else {
@@ -662,7 +667,7 @@ function delete_pool(req) {
 
 function delete_namespace_resource(req) {
     const ns = find_namespace_resource_by_name(req);
-    check_deletion_ownership(req, ns.account);
+    check_deletion_ownership(req, ns.account._id);
     dbg.log0('Deleting namespace resource', ns.name);
     return P.resolve()
         .then(() => {
@@ -733,13 +738,6 @@ async function delete_hosts_pool(req, pool) {
             pool: pool._id,
             desc: `${pool.name} was emptyed and deleted`,
         });
-        const related_funcs = await func_store.instance().list_funcs_by_pool(req.system._id, pool._id);
-        for (const func of related_funcs) {
-            const new_pools_arr = func.pools.filter(function(obj) {
-                return obj.toString() !== (pool._id).toString();
-            });
-            await func_store.instance().update_func(func._id, { 'pools': new_pools_arr });
-        }
     }
 }
 
@@ -1127,10 +1125,12 @@ function calc_namespace_resource_mode(namespace_resource) {
     if (!map_issues_and_monitoring_report.has(namespace_resource_id)) {
         map_issues_and_monitoring_report.set(namespace_resource_id, { last_monitoring: undefined, issues: [] });
     }
-    const issues_report = map_issues_and_monitoring_report.get(namespace_resource_id).issues;
+
+    const nsr_report = map_issues_and_monitoring_report.get(namespace_resource_id);
+    const issues_report = nsr_report.issues;
     const errors_count = _.reduce(issues_report, (acc, issue) => {
         // skip if error timestamp is before of the latest monitoring
-        if (issue.time < namespace_resource.last_monitoring) {
+        if (issue.time < nsr_report.last_monitoring) {
             return acc;
         }
         const err_type = map_err_to_type_count[issue.error_code] || 'io_errors';

@@ -1,7 +1,6 @@
 /* Copyright (C) 2016 NooBaa */
 "use strict";
 
-const _ = require('lodash');
 const fs = require('fs');
 const crypto = require('crypto');
 const P = require('../../util/promise');
@@ -82,35 +81,31 @@ function download_file(ip, path) {
         });
 }
 
-function verify_upload_download(ip, path) {
+async function verify_upload_download(ip, path) {
     let orig_md5;
     const down_path = path + '_download';
-    return P.resolve(calc_md5(path))
-        .then(function(md5) {
-            orig_md5 = md5;
-            return upload_file(ip, path);
-        })
-        .catch(function(err) {
-            console.warn('Failed to upload file', path, 'with err', err, err.stack);
-        })
-        .then(function() {
-            return download_file(ip, down_path);
-        })
-        .catch(function(err) {
-            console.warn('Failed to download file with err', err, err.stack);
-        })
-        .then(function() {
-            return P.resolve(calc_md5(down_path));
-        })
-        .then(function(md5) {
-            if (md5 === orig_md5) {
-                console.log('Original and downloaded file MDs are the same');
-                return P.resolve();
-            } else {
-                console.warn('Original and downloaded file MDs are different');
-                return P.reject();
-            }
-        });
+    try {
+        orig_md5 = await calc_md5(path);
+        await upload_file(ip, path);
+
+    } catch (err) {
+        console.warn('Failed to upload file', path, 'with err', err, err.stack);
+    }
+
+    try {
+        await download_file(ip, down_path);
+    } catch (err) {
+        console.warn('Failed to download file with err', err, err.stack);
+    }
+
+    const md5 = await calc_md5(down_path);
+    if (md5 === orig_md5) {
+        console.log('Original and downloaded file MDs are the same');
+        return P.resolve();
+    } else {
+        console.warn('Original and downloaded file MDs are different');
+        throw new Error('MD5 mismatch');
+    }
 }
 
 
@@ -143,7 +138,7 @@ function get_rpc_client(ip) {
     return client;
 }
 
-function wait_on_agents_upgrade(ip) {
+async function wait_on_agents_upgrade(ip) {
     const client = get_rpc_client(ip);
     let sys_ver;
 
@@ -165,40 +160,34 @@ function wait_on_agents_upgrade(ip) {
             console.warn('Failed with', error, error.stack);
             throw error;
         })
-        .then(function() {
+        .then(async () => {
             //Loop on list_agents until all agents version was updated
             //Timeout at 10 minutes
             let old_agents = true;
             let wait_time = 0;
-            return P.delay(5000).then(function() {
-                return P.pwhile(
-                    function() {
-                        return old_agents;
-                    },
-                    function() {
-                        return P.resolve(client.node.list_nodes({
-                                query: {
-                                    online: true,
-                                }
-                            }))
-                            .then(function(res) {
-                                old_agents = false;
-                                _.each(res.nodes, function(n) {
-                                    if (n.version !== sys_ver) {
-                                        old_agents = true;
-                                    }
-                                });
-                                if (old_agents) {
-                                    if (wait_time >= 120) {
-                                        throw new Error('Timeout while waiting for agents to upgrade');
-                                    }
-                                    console.log('waiting for agents to upgrade');
-                                    wait_time += 5;
-                                    return P.delay(5000);
-                                }
-                            });
-                    });
-            });
+            await P.delay(5000);
+            while (old_agents) {
+                const res = await client.node.list_nodes({
+                    query: {
+                        online: true,
+                    }
+                });
+                old_agents = false;
+                //Check if all agents are on the same version
+                for (let i = 0; i < res.nodes.length; ++i) {
+                    if (res.nodes[i].version !== sys_ver) {
+                        old_agents = true;
+                    }
+                }
+                if (old_agents) {
+                    if (wait_time >= 120) {
+                        throw new Error('Timeout while waiting for agents to upgrade');
+                    }
+                    console.log('waiting for agents to upgrade');
+                    wait_time += 5;
+                    await P.delay(5000);
+                }
+            }
         });
 }
 

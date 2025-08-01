@@ -13,11 +13,11 @@ const P = require('../../util/promise');
 const api = require('../../api');
 const ops = require('../utils/basic_server_ops');
 const dotenv = require('../../util/dotenv');
-const { v4: uuid } = require('uuid');
+const crypto = require('crypto');
 dotenv.load();
 
 
-const suffix = uuid().split('-')[0];
+const suffix = crypto.randomUUID().split('-')[0];
 
 const {
     mgmt_ip = 'localhost',
@@ -231,22 +231,20 @@ function test_node_fail_replicate() {
         }));
 }
 
-function run_test() {
-    return P.resolve()
-        .then(authenticate)
-        .then(setup)
-        .then(upload_file)
-        .then(read_mappings)
-        .then(test_node_fail_replicate)
-        .then(remove_agents)
-        .then(() => {
-            console.log('test_node_failure PASSED');
-        })
-        .catch(err => {
-            remove_agents();
-            console.log('test_node_failure failed. err =', err);
-            throw err;
-        });
+async function run_test() {
+    try {
+        await authenticate();
+        await setup();
+        await upload_file();
+        await read_mappings();
+        await test_node_fail_replicate();
+        await remove_agents();
+        console.log('test_node_failure PASSED');
+    } catch (err) {
+        await remove_agents();
+        console.log('test_node_failure failed. err =', err);
+        throw err;
+    }
 }
 
 

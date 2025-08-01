@@ -17,24 +17,49 @@ class NewlineReaderFilePathEntry {
 
 class NewlineReader {
     /**
-     * NewlineReader allows to read a file line by line while at max holding one line + 4096 bytes
-     * in memory.
+     * Newline character code
+     */
+    static NL_CODE = 10;
+
+    /**
+     * NewlineReader allows to read a file line by line.
      * @param {nb.NativeFSContext} fs_context 
      * @param {string} filepath 
-     * @param {'EXCLUSIVE' | 'SHARED'} [lock]
-     */
-    constructor(fs_context, filepath, lock) {
+     * @param {{
+     *  lock?: 'EXCLUSIVE' | 'SHARED'
+     *  bufsize?: number;
+     *  skip_leftover_line?: boolean;
+     *  skip_overflow_lines?: boolean;
+     *  read_file_offset?: number;
+     * }} [cfg]
+     **/
+    constructor(fs_context, filepath, cfg) {
         this.path = filepath;
-        this.lock = lock;
-        this.buf = Buffer.alloc(4096);
+        this.lock = cfg?.lock;
+        this.skip_leftover_line = Boolean(cfg?.skip_leftover_line);
+        this.skip_overflow_lines = Boolean(cfg?.skip_overflow_lines);
 
         this.fs_context = fs_context;
         this.fh = null;
-
-        this.readoffset = 0;
-        this.readresults = [];
-        this._partialread = "";
         this.eof = false;
+        this.read_file_offset = cfg?.read_file_offset || 0;
+
+        this.buf = Buffer.alloc(cfg?.bufsize || 64 * 1024);
+        this.start = 0;
+        this.end = 0;
+        this.overflow_state = false;
+        this.next_line_file_offset = cfg?.read_file_offset || 0;
+    }
+
+    info() {
+        return {
+            path: this.path,
+            read_offset: this.read_file_offset,
+            overflow_state: this.overflow_state,
+            start: this.start,
+            end: this.end,
+            eof: this.eof,
+        };
     }
 
     /**
@@ -44,29 +69,71 @@ class NewlineReader {
     async nextline() {
         if (!this.fh) await this.init();
 
-        if (this.readresults.length) return this.readresults.shift();
-        if (this.eof) return null;
-
-        // Will keep reading till we find at least one new line character
-        while (!this._partialread.includes('\n')) {
-            const read = await this.fh.read(this.fs_context, this.buf, 0, this.buf.length, this.readoffset);
-            if (read === 0) {
-                this.eof = true;
-                return null;
+        // TODO - in case more data will be appended to the file - after each read the reader must set reader.eof = false if someone will keep on reading from a file while it is being written.
+        while (!this.eof) {
+            // extract next line if terminated in current buffer
+            if (this.start < this.end) {
+                const term_idx = this.buf.subarray(this.start, this.end).indexOf(NewlineReader.NL_CODE);
+                if (term_idx >= 0) {
+                    if (this.overflow_state) {
+                        console.warn('line too long finally terminated:', this.info());
+                        this.overflow_state = false;
+                        this.start += term_idx + 1;
+                        continue;
+                    }
+                    const line = this.buf.toString('utf8', this.start, this.start + term_idx);
+                    this.start += term_idx + 1;
+                    this.next_line_file_offset = this.read_file_offset - (this.end - this.start);
+                    return line;
+                }
             }
 
-            this.readoffset += read;
+            // relocate existing data to offset 0 in buf
+            if (this.start > 0) {
+                const n = this.buf.copy(this.buf, 0, this.start, this.end);
+                this.start = 0;
+                this.end = n;
+            }
 
-            this._partialread += this.buf.subarray(0, read).toString('utf-8');
+            // check limits
+            if (this.buf.length <= this.end) {
+                if (!this.skip_overflow_lines) {
+                    throw new Error("line too long or non terminated");
+                }
+
+                console.warn('line too long or non terminated:', this.info());
+                this.end = 0;
+                this.start = 0;
+                this.overflow_state = true;
+            }
+
+            // read from file
+            const avail = this.buf.length - this.end;
+            const read = await this.fh.read(this.fs_context, this.buf, this.end, avail, this.read_file_offset);
+            if (!read) {
+                this.eof = true;
+
+                // what to do with the leftover in the buffer on eof
+                if (this.end > this.start) {
+                    if (this.skip_leftover_line) {
+                        console.warn("leftover at eof:", this.info());
+                    } else if (this.overflow_state) {
+                        console.warn('line too long finally terminated at eof:', this.info());
+                    } else {
+                        const line = this.buf.toString('utf8', this.start, this.end);
+                        this.start = this.end;
+                        this.next_line_file_offset = this.read_file_offset;
+                        return line;
+                    }
+                }
+
+                return null;
+            }
+            this.read_file_offset += read;
+            this.end += read;
         }
 
-        // readresults will contain >= 1 result or else we would have kept looping above
-        this.readresults = this._partialread.split('\n').slice(0, -1);
-
-        const lastnewlineidx = this._partialread.lastIndexOf('\n');
-        this._partialread = this._partialread.substring(lastnewlineidx + 1);
-
-        return this.readresults.shift();
+        return null;
     }
 
     /**
@@ -106,10 +173,11 @@ class NewlineReader {
     // the beginning again, this does not reopens the file so if the file
     // was moved, this will still keep on reading from the previous FD.
     reset() {
-        this.readresults = [];
-        this._partialread = "";
         this.eof = false;
-        this.readoffset = 0;
+        this.read_file_offset = 0;
+        this.start = 0;
+        this.end = 0;
+        this.overflow_state = false;
     }
 
     async init() {

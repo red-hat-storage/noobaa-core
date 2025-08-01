@@ -1,7 +1,7 @@
 /* Copyright (C) 2016 NooBaa */
 'use strict';
 
-const { v4: uuid } = require('uuid');
+const crypto = require('crypto');
 const path = require('path');
 const util = require('util');
 const fs = require('fs');
@@ -79,8 +79,9 @@ class HostedAgents {
     }
 
 
-    _monitor_stats() {
-        P.pwhile(() => true, () => {
+    async _monitor_stats() {
+        /* eslint-disable no-constant-condition */
+        while (true) {
             const cpu_usage = process.cpuUsage(this.cpu_usage); //usage since last sample
             const mem_usage = process.memoryUsage();
             dbg.log0(`hosted_agent_stats_titles - process: cpu_usage_user, cpu_usage_sys, mem_usage_rss`);
@@ -94,11 +95,9 @@ class HostedAgents {
                 }
             }
             this.cpu_usage = cpu_usage;
-            return P.delay(60000);
-        });
+            await P.delay(60000);
+        }
     }
-
-
 
     async _start_pool_agent(pool) {
         if (!this._started) return;
@@ -197,7 +196,7 @@ class HostedAgents {
     start_local_agent(params) {
         if (!this._started) return;
 
-        const host_id = uuid();
+        const host_id = crypto.randomUUID();
         const node_name = 'noobaa-internal-agent-' + params.name;
         const storage_path = path.join(process.cwd(), 'noobaa_storage', node_name);
 

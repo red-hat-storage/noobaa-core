@@ -5,8 +5,9 @@ import * as mongodb from 'mongodb';
 import { EventEmitter } from 'events';
 import { Readable, Writable } from 'stream';
 import { IncomingMessage, ServerResponse } from 'http';
+import { ObjectPart, Checksum} from '@aws-sdk/client-s3';
 
-type Semaphore = import('../util/semaphore');
+type Semaphore = import('../util/semaphore').Semaphore;
 type KeysSemaphore = import('../util/keys_semaphore');
 type SensitiveString = import('../util/sensitive_string');
 
@@ -195,7 +196,6 @@ interface Bucket extends Base {
         last_update: number;
     };
     lifecycle_configuration_rules?: object;
-    lambda_triggers?: object;
     master_key_id: ID;
 }
 
@@ -438,7 +438,10 @@ interface ObjectInfo {
     content_range?: string;
     ns?: Namespace;
     storage_class?: StorageClass;
-    restore_status?: { ongoing?: boolean; expiry_time?: Date; };
+    restore_status?: RestoreStatus;
+    checksum?: Checksum;
+    object_parts?: GetObjectAttributesParts;
+    nc_noncurrent_time ?: number;
 }
 
 
@@ -734,6 +737,11 @@ interface DBSequence {
     nextsequence(): Promise<number>;
 }
 
+interface sqlResult<T> {
+    rows: T[],
+    rowCount: number | null,
+}
+
 interface DBCollection {
     find(query?: object, options?: object): Promise<DBDoc[]>;
     findOne(query?: object, options?: object): Promise<DBDoc>;
@@ -758,6 +766,9 @@ interface DBCollection {
     stats(): Promise<mongodb.CollStats>;
 
     validate(doc: object, warn?: 'warn'): object;
+
+    executeSQL<T>(query: string, params: Array<any>, options?: { query_name?: string }): Promise<sqlResult<T>>;
+    name: any;
 }
 
 type DBDoc = any;
@@ -814,14 +825,17 @@ interface Namespace {
     get_blob_block_lists(params: object, object_sdk: ObjectSDK): Promise<any>;
 
     restore_object(params: object, object_sdk: ObjectSDK): Promise<any>;
+    get_object_attributes(params: object, object_sdk: ObjectSDK): Promise<any>;
 }
 
 interface BucketSpace {
 
     read_account_by_access_key({ access_key: string }): Promise<any>;
     read_bucket_sdk_info({ name: string }): Promise<any>;
+    check_same_stat_bucket(bucket_name: string, bucket_stat:  nb.NativeFSStats); // only implemented in bucketspace_fs
+    check_same_stat_account(account_name: string|Symbol, account_stat:  nb.NativeFSStats); // only implemented in bucketspace_fs
 
-    list_buckets(object_sdk: ObjectSDK): Promise<any>;
+    list_buckets(params: object, object_sdk: ObjectSDK): Promise<any>;
     read_bucket(params: object): Promise<any>;
     create_bucket(params: object, object_sdk: ObjectSDK): Promise<any>;
     delete_bucket(params: object, object_sdk: ObjectSDK): Promise<any>;
@@ -832,7 +846,7 @@ interface BucketSpace {
 
     set_bucket_versioning(params: object, object_sdk: ObjectSDK): Promise<any>;
 
-    put_bucket_tagging(params: object): Promise<any>;
+    put_bucket_tagging(params: object, object_sdk: ObjectSDK): Promise<any>;
     delete_bucket_tagging(params: object): Promise<any>;
     get_bucket_tagging(params: object): Promise<any>;
 
@@ -852,11 +866,22 @@ interface BucketSpace {
     delete_bucket_policy(params: object): Promise<any>;
     get_bucket_policy(params: object, object_sdk: ObjectSDK): Promise<any>;
 
+    put_bucket_notification(params: object): Promise<any>;
+    get_bucket_notification(params: object): Promise<any>;
+
+    put_bucket_cors(params: object): Promise<any>;
+    delete_bucket_cors(params: object): Promise<any>;
+    get_bucket_cors(params: object): Promise<any>;
+
     get_object_lock_configuration(params: object, object_sdk: ObjectSDK): Promise<any>;
     put_object_lock_configuration(params: object, object_sdk: ObjectSDK): Promise<any>;
 
     is_nsfs_containerized_user_anonymous(token: string): boolean;
     is_nsfs_non_containerized_user_anonymous(token: string): boolean;
+
+    get_public_access_block({ bucket_name }): Promise<any>;
+    put_public_access_block({ bucket_name , public_access_block }): Promise<any>;
+    delete_public_access_block({ bucket_name }): Promise<any>;
 }
 
 /**********************************************************
@@ -1000,7 +1025,7 @@ interface NativeFile {
     write(fs_context: NativeFSContext, buffer: Buffer, len: number, offset?: number): Promise<void>;
     writev(fs_context: NativeFSContext, buffers: Buffer[], offset?: number): Promise<void>;
     replacexattr(fs_context: NativeFSContext, xattr: NativeFSXattr, clear_prefix?: string): Promise<void>;
-    linkfileat(fs_context: NativeFSContext, path: string, fd?: number): Promise<void>;
+    linkfileat(fs_context: NativeFSContext, path: string, fd?: number, should_not_override?: boolean): Promise<void>;
     fsync(fs_context: NativeFSContext): Promise<void>;
     fd: number;
     flock(fs_context: NativeFSContext, operation: "EXCLUSIVE" | "SHARED" | "UNLOCK"): Promise<void>;
@@ -1019,9 +1044,11 @@ interface NativeFSContext {
     uid?: number;
     gid?: number;
     backend?: string;
+    supplemental_groups?: number[];
     warn_threshold_ms?: number;
     report_fs_stats?: Function;
     do_ctime_check?: boolean;
+    use_dmapi?: boolean,
 }
 
 type GPFSNooBaaArgs = {
@@ -1096,7 +1123,7 @@ interface X509Name {
     O: string;
 }
 
-type select_input_format =  'CSV' | 'JSON' | 'Parquet';
+type select_input_format = 'CSV' | 'JSON' | 'Parquet';
 interface S3SelectOptions {
     query: string;
     input_format: select_input_format;
@@ -1122,7 +1149,32 @@ type NodeCallback<T = void> = (err: Error | null, res?: T) => void;
 type RestoreState = 'CAN_RESTORE' | 'ONGOING' | 'RESTORED';
 
 interface RestoreStatus {
-  state: nb.RestoreState;
-  ongoing?: boolean;
-  expiry_time?: Date;
+    state: nb.RestoreState;
+    ongoing?: boolean;
+    expiry_time?: Date;
+
+    tape_info?: TapeInfo[];
 }
+
+interface TapeInfo {
+    volser: string;
+    poolid: string;
+    libid: string;
+}
+
+/**********************************************************
+ *
+ * OTHER - S3 Structure
+ *
+ **********************************************************/
+
+// Since the interface is a bit different between the SDKs
+// we couldn't import and reuse
+interface GetObjectAttributesParts {
+    TotalPartsCount?: number;
+    PartNumberMarker?: string; // in AWS SDK V2 it is number
+    NextPartNumberMarker?: string; // in AWS SDK V2 it is number
+    MaxParts?: number;
+    IsTruncated?: boolean;
+    Parts?: ObjectPart[];
+  }

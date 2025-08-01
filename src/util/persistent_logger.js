@@ -5,7 +5,7 @@ const path = require('path');
 const nb_native = require('./nb_native');
 const native_fs_utils = require('./native_fs_utils');
 const P = require('./promise');
-const Semaphore = require('./semaphore');
+const semaphore = require('./semaphore');
 const { NewlineReader } = require('./file_reader');
 const dbg = require('./debug_module')(__filename);
 
@@ -41,7 +41,7 @@ class PersistentLogger {
         this.fh_stat = null;
         this.local_size = 0;
 
-        this.init_lock = new Semaphore(1);
+        this.init_lock = new semaphore.Semaphore(1);
 
         if (cfg.poll_interval) this._poll_active_file_change(cfg.poll_interval);
     }
@@ -178,8 +178,7 @@ class PersistentLogger {
             // This logger is getting opened only so that we can process all the process the entries
             failure_log = new PersistentLogger(
                 this.dir,
-                `${this.namespace}.failure`,
-                { locking: 'EXCLUSIVE' },
+                `${this.namespace}.failure`, { locking: 'EXCLUSIVE' },
             );
 
             try {
@@ -199,7 +198,7 @@ class PersistentLogger {
 
             try {
                 // Finally replace the current active so as to consume them in the next iteration
-                await failure_log._replace_active();
+                await failure_log._replace_active(!result);
             } catch (error) {
                 dbg.error('failed to replace active failure log:', error, 'log_namespace:', this.namespace);
             }
@@ -209,14 +208,16 @@ class PersistentLogger {
         }
     }
 
-    async _replace_active() {
+    async _replace_active(log_noent) {
         const inactive_file = `${this.namespace}.${Date.now()}.log`;
         const inactive_file_path = path.join(this.dir, inactive_file);
 
         try {
             await nb_native().fs.rename(this.fs_context, this.active_path, inactive_file_path);
         } catch (error) {
-            dbg.warn('failed to rename active file:', error);
+            if (log_noent || error.code !== 'ENOENT') {
+                dbg.warn('failed to rename active file:', error);
+            }
         }
     }
 
@@ -284,11 +285,13 @@ class LogFile {
         try {
             filtered_log = new PersistentLogger(
                 path.dirname(this.log_path),
-                `tmp_consume_${Date.now().toString()}`,
-                { locking: 'EXCLUSIVE'}
+                `tmp_consume_${Date.now().toString()}`, { locking: 'EXCLUSIVE' }
             );
 
-            log_reader = new NewlineReader(this.fs_context, this.log_path, 'EXCLUSIVE');
+            log_reader = new NewlineReader(
+                this.fs_context,
+                this.log_path, { lock: 'EXCLUSIVE', skip_overflow_lines: true, skip_leftover_line: true },
+            );
             await log_reader.forEach(async entry => {
                 await collect(entry, filtered_log.append.bind(filtered_log));
                 return true;

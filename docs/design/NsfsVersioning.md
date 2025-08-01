@@ -54,6 +54,36 @@ In the figure, each original directory contains a hidden .versions/ sub- directo
 * When A delete marker is the latest version of an object, it indicates that the object is deleted.
 * A unique version ID will be allocated to the delete marker as for regular versions.
 
+### Directory Object / Content Directory Versioning
+Versioning related xattr - 
+1. `user.noobaa.version_id` - stores the version_id string.
+2. `user.noobaa.delete_marker` - boolean.
+3. `user.noobaa.content_dir` - stores the size of the directory object.
+
+Directory object / content directory filesystem structure has two modes - 
+
+1. versioning disabled mode - 
+On this mode, the object body and the xattr (extended attributes) are splitted. The data of the directory object will be stored in `<dir_path>/.folder`, while the xattr of the directory object will be stored on the directory itself - <dir_path>. `<dir_path>/.folder` file is created only if the object's data size > 0. When size = 0, only the xattr will be stored in `<dir_path>`.
+```
+bucket
+└── dir <= directory object (dir/), includes xattr
+    └──.folder <= file containing dir/ object body
+```
+2. versioning enabled / suspended mode -
+ On this mode we always create `.folder` file. xatrr are located at the `.folder` file. the transition between the disable and enabled/disabled is lazy. meaning that we only change the key structure after a put operation for that key. non-latest versions and delete markers are saved in the directories .versions directory as `.folder-<version-id>`. versioning handling is the same as for non-directory objects. only that the object file used is the  `.folder` file
+example bucket tree:
+```
+bucket
+└── dir
+    ├── .folder <= contains both body (can be empty) and xattr - dir/
+    ├── key1 <= nested object - dir/key1
+    └── .versions
+        ├── .folder_mtime-dzdz6vlnbzblk-ino-4hbc <= version of dir/
+        ├── .folder_mtime-dzdz5vlasfsaw-ino-4hia
+        ├── key1_mtime-d6u6vlnbzklc-ino-3ehc <= version of dir/key1
+        └── key1_mtime-d6u6vnztsiyo-ino-3eik
+```   
+
 ### Posix safe rename
 
 #### In the following cases NooBaa will move files between a directory and its .versions/ directory:
@@ -88,6 +118,12 @@ In order to support best effort on scale of these scenarios, for POSIX file syst
     4.2. retry
 5. else - unlink unique_tmp_path
 ```
+
+### Multipart upload version order
+According to AWS specifications, multipart upload version time should be calculated based on multipart upload creation time rather than completion time (see [AWS Documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html#distributedmpupload)).   
+On the other hand, for directory buckets, the object creation time is the completion date of the multipart upload  (see [AWS Documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-using-multipart-upload.html#s3-express-distributedmpupload)).
+There are performance issues for calculating the latest version after complete multipart whe using creation time.  
+In our design, due to the performance issues and to be aligned with AWS directory buckets, the version-id time is calculated based on completion time.
 
 ## OUT OF SCOPE
 ### TODO

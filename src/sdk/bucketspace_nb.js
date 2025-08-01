@@ -32,8 +32,9 @@ class BucketSpaceNB {
     // BUCKET //
     ////////////
 
-    async list_buckets(object_sdk) {
-        const { buckets } = (await this.rpc_client.bucket.list_buckets());
+    async list_buckets(params, object_sdk) {
+        const { buckets, continuation_token } = (await this.rpc_client.bucket.list_buckets(params));
+
         const has_access_buckets = (await P.all(_.map(
             buckets,
             async bucket => {
@@ -43,7 +44,7 @@ class BucketSpaceNB {
                     object_sdk.has_non_nsfs_bucket_access(object_sdk.requesting_account, ns);
                 return has_access_to_bucket && bucket;
             }))).filter(bucket => bucket);
-        return { buckets: has_access_buckets };
+        return { buckets: has_access_buckets, continuation_token };
     }
 
     async read_bucket(params) {
@@ -230,6 +231,46 @@ class BucketSpaceNB {
     }
 
     /////////////////////////
+    // BUCKET NOTIFICATION //
+    /////////////////////////
+
+    async put_bucket_notification(params) {
+        return this.rpc_client.bucket.put_bucket_notification({
+            name: params.bucket_name,
+            notifications: params.notifications
+        });
+    }
+
+    async get_bucket_notification(params) {
+        return this.rpc_client.bucket.get_bucket_notification({
+            name: params.bucket_name
+        });
+    }
+
+    ////////////////////
+    // BUCKET CORS //
+    ////////////////////
+
+    async put_bucket_cors(params) {
+        return this.rpc_client.bucket.put_bucket_cors({
+            name: params.name,
+            cors_rules: params.cors_rules
+        });
+    }
+
+    async delete_bucket_cors(params) {
+        return this.rpc_client.bucket.delete_bucket_cors({
+            name: params.name
+        });
+    }
+
+    async get_bucket_cors(params) {
+        return this.rpc_client.bucket.get_bucket_cors({
+            name: params.name
+        });
+    }
+
+    /////////////////////////
     // DEFAULT OBJECT LOCK //
     /////////////////////////
 
@@ -239,6 +280,22 @@ class BucketSpaceNB {
 
     async put_object_lock_configuration(params, object_sdk) {
         return this.rpc_client.bucket.put_object_lock_configuration(params);
+    }
+
+    /////////////////////////
+    // PUBLIC ACCESS BLOCK //
+    /////////////////////////
+
+    async get_public_access_block(params, object_sdk) {
+        return this.rpc_client.bucket.get_public_access_block(params);
+    }
+
+    async put_public_access_block(params, object_sdk) {
+        return this.rpc_client.bucket.put_public_access_block(params);
+    }
+
+    async delete_public_access_block(params, object_sdk) {
+        return this.rpc_client.bucket.delete_public_access_block(params);
     }
 
     //  nsfs
