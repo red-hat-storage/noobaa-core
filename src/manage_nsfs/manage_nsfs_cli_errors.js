@@ -3,6 +3,7 @@
 
 const config = require('../../config');
 const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
+const { TYPES } = require('../manage_nsfs/manage_nsfs_constants');
 
 // by default NC_DISABLE_POSIX_MODE_ACCESS_CHECK=true, therefore CLI access check of account/bucket will be based on stat (open file)
 // which checks only read permissions. 
@@ -92,9 +93,15 @@ ManageCLIError.InvalidArgumentType = Object.freeze({
     http_code: 400,
 });
 
+ManageCLIError.UnsetArgumentIsInvalid = Object.freeze({
+    code: 'UnsetArgumentIsInvalid',
+    message: 'Argument can not be unset or it was unset incorrectly, its value must be set or unset correctly or check there are no leading spaces',
+    http_code: 400,
+});
+
 ManageCLIError.InvalidType = Object.freeze({
     code: 'InvalidType',
-    message: 'Invalid type, available types are account, bucket, logging, whitelist or upgrade',
+    message: `Invalid type, valid types are ${Object.values(TYPES).join(', ')}.`,
     http_code: 400,
 });
 
@@ -346,6 +353,11 @@ ManageCLIError.InvalidGlacierOperation = Object.freeze({
     message: 'only "migrate", "restore" and "expiry" subcommands are supported',
     http_code: 400,
 });
+ManageCLIError.InvalidSupplementalGroupsList = Object.freeze({
+    code: 'InvalidSupplementalGroupsList',
+    message: 'supplemental groups must be a list of group ids (group id is zero or a positive integer)',
+    http_code: 400,
+});
 
 
 ////////////////////////
@@ -461,6 +473,12 @@ ManageCLIError.InvalidUpgradeAction = Object.freeze({
     http_code: 400,
 });
 
+ManageCLIError.MissingExpectedVersionFlag = Object.freeze({
+    code: 'MissingExpectedVersionFlag',
+    message: 'Expected version is mandatory, please use the --expected_version flag',
+    http_code: 400,
+});
+
 ManageCLIError.UpgradeFailed = Object.freeze({
     code: 'UpgradeFailed',
     message: 'Upgrade request failed',
@@ -477,6 +495,62 @@ ManageCLIError.UpgradeHistoryFailed = Object.freeze({
     code: 'UpgradeHistoryFailed',
     message: 'Upgrade history request failed',
     http_code: 500,
+});
+
+ManageCLIError.ConfigDirUpdateBlocked = Object.freeze({
+    code: 'ConfigDirUpdateBlocked',
+    message: 'Config directory updates are not allowed on mismatch of the config directory version mentioned in system.json and the config directory version of the source code',
+    http_code: 500,
+});
+
+///////////////////////////////
+//     CONNECTION ERRORS     //
+///////////////////////////////
+
+ManageCLIError.MissingCliParam = Object.freeze({
+    code: 'MissingCliParam',
+    message: 'Required cli parameter is missing.',
+    http_code: 400,
+});
+
+ManageCLIError.ConnectionAlreadyExists = Object.freeze({
+    code: 'ConnectionAlreadyExists',
+    message: 'The requested connection name is not available. Please select a different name and try again.',
+    http_code: 409,
+});
+
+ManageCLIError.NoSuchConnection = Object.freeze({
+    code: 'NoSuchConnection',
+    message: 'Connection does not exist.',
+    http_code: 404,
+});
+
+//////////////////////////////
+//     LIFECYCLE ERRORS     //
+//////////////////////////////
+
+ManageCLIError.SystemJsonIsMissing = Object.freeze({
+    code: 'SystemJsonIsMissing',
+    message: 'Lifecycle worker can not run when system.json is missing.',
+    http_code: 400,
+});
+
+ManageCLIError.NooBaaServiceIsNotActive = Object.freeze({
+    code: 'NooBaaServiceIsNotActive',
+    message: 'Lifecycle worker can not run when NooBaa service is not active.',
+    http_code: 400,
+});
+
+ManageCLIError.LifecycleFailed = Object.freeze({
+    code: 'LifecycleFailed',
+    message: 'Lifecycle worker run failed.',
+    http_code: 400,
+});
+
+ManageCLIError.LifecycleWorkerReachedTimeout = Object.freeze({
+    code: 'LifecycleWorkerReachedTimeout',
+    message: `Lifecycle worker reached timeout - configured timeout is ${config.NC_LIFECYCLE_TIMEOUT_MS} ms`,
+    http_code: 400,
 });
 
 ///////////////////////////////
@@ -500,7 +574,9 @@ ManageCLIError.RPC_ERROR_TO_MANAGE = Object.freeze({
     INVALID_SCHEMA: ManageCLIError.InvalidSchema,
     NO_SUCH_USER: ManageCLIError.InvalidAccountDistinguishedName,
     INVALID_MASTER_KEY: ManageCLIError.InvalidMasterKey,
-    INVALID_BUCKET_NAME: ManageCLIError.InvalidBucketName
+    INVALID_BUCKET_NAME: ManageCLIError.InvalidBucketName,
+    CONFIG_DIR_VERSION_MISMATCH: ManageCLIError.ConfigDirUpdateBlocked,
+    LIFECYCLE_WORKER_TIMEOUT: ManageCLIError.LifecycleWorkerReachedTimeout
 });
 
 const NSFS_CLI_ERROR_EVENT_MAP = {
@@ -510,9 +586,13 @@ const NSFS_CLI_ERROR_EVENT_MAP = {
     AccountNameAlreadyExists: NoobaaEvent.ACCOUNT_ALREADY_EXISTS,
     AccountDeleteForbiddenHasBuckets: NoobaaEvent.ACCOUNT_DELETE_FORBIDDEN,
     BucketAlreadyExists: NoobaaEvent.BUCKET_ALREADY_EXISTS,
-    BucketSetForbiddenBucketOwnerNotExists: NoobaaEvent.UNAUTHORIZED, // GAP - add event
-    BucketSetForbiddenBucketOwnerIsIAMAccount: NoobaaEvent.UNAUTHORIZED, // // GAP - add event
+    BucketSetForbiddenBucketOwnerNotExists: NoobaaEvent.BUCKET_OWNER_NOT_EXISTS,
+    BucketSetForbiddenBucketOwnerIsIAMAccount: NoobaaEvent.BUCKET_OWNER_IS_IAM_ACCOUNT,
     LoggingExportFailed: NoobaaEvent.LOGGING_FAILED,
+    UpgradeFailed: NoobaaEvent.CONFIG_DIR_UPGRADE_FAILED,
+    LifecycleFailed: NoobaaEvent.LIFECYCLE_FAILED,
+    LifecycleWorkerReachedTimeout: NoobaaEvent.LIFECYCLE_TIMEOUT,
+    InternalError: NoobaaEvent.INTERNAL_ERROR
 };
 
 exports.ManageCLIError = ManageCLIError;

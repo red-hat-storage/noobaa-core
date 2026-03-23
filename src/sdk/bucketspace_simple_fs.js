@@ -40,7 +40,7 @@ class BucketSpaceSimpleFS {
     * @param {nb.ObjectSDK} object_sdk
     * @returns {Promise<object>}
     */
-    async list_buckets(object_sdk) {
+    async list_buckets(params, object_sdk) {
         try {
             const entries = await nb_native().fs.readdir(this.fs_context, this.fs_root);
             const dirs_only = entries.filter(entree => native_fs_utils.isDirectory(entree));
@@ -168,7 +168,12 @@ class BucketSpaceSimpleFS {
     // BUCKET TAGGING //
     ////////////////////
 
-    async put_bucket_tagging(params) {
+    /**
+     * 
+     * @param {*} params 
+     * @param {nb.ObjectSDK} object_sdk
+     */
+    async put_bucket_tagging(params, object_sdk) {
         // TODO
     }
 

@@ -7,7 +7,7 @@ const dbg = require('../../util/debug_module')(__filename);
 const system_utils = require('../utils/system_utils');
 const config = require('../../../config');
 const P = require('../../util/promise');
-const Semaphore = require('../../util/semaphore');
+const semaphore = require('../../util/semaphore');
 const replication_store = require('../system_services/replication_store').instance();
 const cloud_utils = require('../../util/cloud_utils');
 const replication_utils = require('../utils/replication_utils');
@@ -24,7 +24,7 @@ class ReplicationScanner {
     constructor({ name, client }) {
         this.name = name;
         this.client = client;
-        this.scanner_semaphore = new Semaphore(config.REPLICATION_SEMAPHORE_CAP, {
+        this.scanner_semaphore = new semaphore.Semaphore(config.REPLICATION_SEMAPHORE_CAP, {
             timeout: config.REPLICATION_SEMAPHORE_TIMEOUT,
             timeout_error_code: 'REPLICATION_ITEM_TIMEOUT',
             verbose: true
@@ -86,6 +86,7 @@ class ReplicationScanner {
                 for_replication: config.BUCKET_DIFF_FOR_REPLICATION
             });
             dbg.log1(`scan:: cur_src_cont_token: ${cur_src_cont_token},cur_dst_cont_token: ${cur_dst_cont_token}`);
+
             const {
                 keys_diff_map,
                 first_bucket_cont_token: src_cont_token,
@@ -126,9 +127,10 @@ class ReplicationScanner {
 
             // update the prometheus metrics only if we have diff
             if (Object.keys(keys_diff_map).length) {
-                const replication_status = replication_utils.get_rule_status(rule.rule_id, src_cont_token, keys_diff_map, copy_res);
+                const {rule_status, bucket_status} = replication_utils.get_rule_and_bucket_status(
+                    rule.rule_id, src_cont_token, keys_diff_map, copy_res);
 
-                replication_utils.update_replication_prom_report(src_bucket.name, replication_id, replication_status);
+                replication_utils.update_replication_prom_report(src_bucket.name, replication_id, rule_status, bucket_status);
             }
         }));
     }

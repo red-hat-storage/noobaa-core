@@ -176,6 +176,7 @@ module.exports = {
                     content_type: { type: 'string' },
                     content_encoding: { type: 'string' },
                     size: { type: 'integer' },
+                    seq: { type: 'integer' },
                 }
             },
             auth: { system: ['admin', 'user'] }
@@ -609,26 +610,6 @@ module.exports = {
             auth: { system: ['admin', 'user'] }
         },
 
-        dispatch_triggers: {
-            method: 'PUT',
-            params: {
-                type: 'object',
-                required: [
-                    'bucket',
-                    'obj',
-                    'event_name'
-                ],
-                properties: {
-                    bucket: { $ref: 'common_api#/definitions/bucket_name' },
-                    obj: {
-                        $ref: '#/definitions/object_info'
-                    },
-                    event_name: { $ref: 'common_api#/definitions/bucket_trigger_event' }
-                }
-            },
-            auth: { system: ['admin', 'user'] }
-        },
-
         delete_object: {
             method: 'DELETE',
             params: {
@@ -653,6 +634,7 @@ module.exports = {
                     deleted_delete_marker: { type: 'boolean' },
                     created_version_id: { type: 'string' },
                     created_delete_marker: { type: 'boolean' },
+                    seq: { type: 'integer' },
                 }
             },
             auth: { system: ['admin', 'user'] }
@@ -690,6 +672,7 @@ module.exports = {
                         deleted_delete_marker: { type: 'boolean' },
                         created_version_id: { type: 'string' },
                         created_delete_marker: { type: 'boolean' },
+                        seq: { type: 'integer' },
                         err_code: {
                             type: 'string',
                             enum: ['AccessDenied', 'InternalError']
@@ -918,25 +901,6 @@ module.exports = {
                 type: 'object',
                 required: ['objects'],
                 properties: {
-                    counters: {
-                        type: 'object',
-                        properties: {
-                            by_mode: {
-                                type: 'object',
-                                properties: {
-                                    completed: {
-                                        type: 'integer'
-                                    },
-                                    uploading: {
-                                        type: 'integer'
-                                    },
-                                }
-                            },
-                            non_paginated: {
-                                type: 'integer'
-                            },
-                        }
-                    },
                     objects: {
                         type: 'array',
                         items: {
@@ -1137,6 +1101,9 @@ module.exports = {
                     filter_delete_markers: {
                         type: 'boolean',
                     },
+                    latest_versions: {
+                        type: 'boolean',
+                    },
                     size_less: {
                         type: 'integer'
                     },
@@ -1148,6 +1115,12 @@ module.exports = {
                     },
                     limit: {
                         type: 'integer'
+                    },
+                    delete_version: {
+                        type: 'boolean'
+                    },
+                    reply_objects: {
+                        type: 'boolean'
                     }
                 }
             },
@@ -1156,7 +1129,26 @@ module.exports = {
                 properties: {
                     num_objects_deleted: {
                         type: 'integer'
-                    }
+                    },
+                    deleted_objects: {
+                        type: 'array',
+                        items: {
+                            oneOf: [{
+                                    $ref: '#/definitions/object_info',
+                                },
+                                {
+                                    type: 'object',
+                                    properties: {
+                                        err_code: {
+                                            type: 'string',
+                                            enum: ['AccessDenied', 'InternalError']
+                                        },
+                                        err_message: { type: 'string' }
+                                    }
+                                }
+                            ]
+                        }
+                    },
                 }
             },
             auth: { system: 'admin' }
@@ -1398,6 +1390,130 @@ module.exports = {
             auth: { system: ['admin', 'user'] }
         },
 
+        delete_incomplete_multiparts: {
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: [
+                    'bucket',
+                    'days_after_initiation',
+                ],
+                properties: {
+                    bucket: { $ref: 'common_api#/definitions/bucket_name' },
+                    days_after_initiation: {
+                        type: 'integer',
+                    },
+                    prefix: {
+                        type: 'string',
+                    },
+                    size_less: {
+                        type: 'integer'
+                    },
+                    size_greater: {
+                        type: 'integer'
+                    },
+                    limit: {
+                        type: 'integer'
+                    },
+                    reply_objects: {
+                        type: 'boolean'
+                    }
+                },
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    num_objects_deleted: {
+                        type: 'integer'
+                    }
+                }
+            },
+            auth: { system: ['admin', 'user'] }
+        },
+
+        delete_noncurrent_versions: {
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: [
+                    'bucket',
+                    'noncurrent_days'
+                ],
+                properties: {
+                    bucket: { $ref: 'common_api#/definitions/bucket_name' },
+                    noncurrent_days: {
+                        type: 'integer',
+                    },
+                    newer_noncurrent_versions: {
+                        type: 'integer',
+                    },
+                    prefix: {
+                        type: 'string',
+                    },
+                    size_less: {
+                        type: 'integer'
+                    },
+                    size_greater: {
+                        type: 'integer'
+                    },
+                    tags: {
+                        $ref: 'common_api#/definitions/tagging'
+                    },
+                    limit: {
+                        type: 'integer'
+                    },
+                    reply_objects: {
+                        type: 'boolean'
+                    }
+                },
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    num_objects_deleted: {
+                        type: 'integer'
+                    }
+                }
+            },
+            auth: { system: ['admin', 'user'] }
+        },
+
+        delete_expired_delete_markers: {
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: [
+                    'bucket',
+                ],
+                properties: {
+                    bucket: { $ref: 'common_api#/definitions/bucket_name' },
+                    prefix: {
+                        type: 'string',
+                    },
+                    size_less: {
+                        type: 'integer'
+                    },
+                    size_greater: {
+                        type: 'integer'
+                    },
+                    limit: {
+                        type: 'integer'
+                    },
+                    reply_objects: {
+                        type: 'boolean'
+                    }
+                },
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    num_objects_deleted: {
+                        type: 'integer'
+                    }
+                }
+            },
+            auth: { system: ['admin', 'user'] }
+        },
     },
 
     definitions: {
@@ -1450,8 +1566,7 @@ module.exports = {
                 // currently no properties for the object as there is no implementation
                 object_owner: {
                     type: 'object',
-                    properties: {
-                    }
+                    properties: {}
                 },
             }
         },
@@ -1550,7 +1665,6 @@ module.exports = {
                         mount: { type: 'string' },
                         online: { type: 'boolean' },
                         in_cloud_pool: { type: 'boolean' },
-                        in_mongo_pool: { type: 'boolean' },
                     }
                 }
             }

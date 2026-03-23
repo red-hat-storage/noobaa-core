@@ -16,9 +16,12 @@ class S3Error extends Error {
 
     /**
      * @param {S3ErrorSpec} error_spec 
+     * @param {string} [message_override] if provided, this will be used as the message instead of the default one from error_spec, but the code and http_code will still be from error_spec. 
+     * This is needed for some cases like MalformedPolicy where AWS returns the same error code but with different messages depending on the exact error in the policy document, 
+     * and we want to preserve the exact message from AWS for better compatibility with s3-tests.  
      */
-    constructor({ code, message, http_code, detail }) {
-        super(message); // sets this.message
+    constructor({ code, message, http_code, detail }, message_override) {
+        super(message_override || message); // sets this.message
         this.code = code;
         this.http_code = http_code;
         this.detail = detail;
@@ -164,6 +167,11 @@ S3Error.InvalidBucketState = Object.freeze({
     message: 'The request is not valid with the current state of the bucket.',
     http_code: 409,
 });
+S3Error.ObjectQuotaExceeded = Object.freeze({
+    code: 'ObjectQuotaExceeded',
+    message: 'Object quota exceeded for the bucket.',
+    http_code: 409,
+});
 S3Error.InvalidDigest = Object.freeze({
     code: 'InvalidDigest',
     message: 'The Content-MD5 you specified is not valid.',
@@ -249,8 +257,8 @@ S3Error.InvalidURI = Object.freeze({
     message: 'Couldn\'t parse the specified URI.',
     http_code: 400,
 });
-S3Error.KeyTooLong = Object.freeze({
-    code: 'KeyTooLong',
+S3Error.KeyTooLongError = Object.freeze({
+    code: 'KeyTooLongError',
     message: 'Your key is too long.',
     http_code: 400,
 });
@@ -266,7 +274,8 @@ S3Error.MalformedPOSTRequest = Object.freeze({
 });
 S3Error.MalformedXML = Object.freeze({
     code: 'MalformedXML',
-    message: 'This happens when the user sends malformed xml (xml that doesn\'t conform to the published xsd) for the configuration. The error message is, "The XML you provided was not well-formed or did not validate against our published schema."',
+    // This happens when the user sends malformed xml (xml that doesn't conform to the published xsd) for the configuration.
+    message: 'The XML you provided was not well-formed or did not validate against our published schema.',
     http_code: 400,
 });
 S3Error.InvalidTag = Object.freeze({
@@ -326,7 +335,7 @@ S3Error.NoLoggingStatusForKey = Object.freeze({
 });
 S3Error.NoSuchBucket = Object.freeze({
     code: 'NoSuchBucket',
-    message: 'The specified bucket does not exist.',
+    message: 'The specified bucket does not exist',
     http_code: 404,
 });
 S3Error.NoSuchKey = Object.freeze({
@@ -337,6 +346,11 @@ S3Error.NoSuchKey = Object.freeze({
 S3Error.NoSuchLifecycleConfiguration = Object.freeze({
     code: 'NoSuchLifecycleConfiguration',
     message: 'The lifecycle configuration does not exist.',
+    http_code: 404,
+});
+S3Error.NoSuchCORSConfiguration = Object.freeze({
+    code: 'NoSuchCORSConfiguration',
+    message: 'The specified bucket does not have a CORS configuration.',
     http_code: 404,
 });
 S3Error.NoSuchUpload = Object.freeze({
@@ -470,7 +484,8 @@ S3Error.AccessControlListNotSupported = Object.freeze({
 /////////////////////////////////////
 S3Error.NotModified = Object.freeze({
     code: 'NotModified',
-    message: 'The resource was not modified according to the conditions in the provided headers.',
+    // this short undescriptive message is compatible with AWS and is expected by s3-tests
+    message: 'Not Modified',
     http_code: 304,
 });
 S3Error.BadRequest = Object.freeze({
@@ -534,6 +549,26 @@ S3Error.InvalidEncodingType = Object.freeze({
     message: 'Invalid Encoding Method specified in Request',
     http_code: 400,
 });
+S3Error.AuthorizationQueryParametersErrorWeek = Object.freeze({
+    code: 'AuthorizationQueryParametersError',
+    message: 'X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires must be less than 604800 seconds',
+    http_code: 400,
+});
+S3Error.AuthorizationQueryParametersErrorNonNegative = Object.freeze({
+    code: 'AuthorizationQueryParametersError',
+    message: 'X-Amz-Expires must be non-negative',
+    http_code: 400,
+});
+S3Error.RequestExpired = Object.freeze({
+    code: 'AccessDenied',
+    message: 'Request has expired',
+    http_code: 403,
+});
+S3Error.RequestNotValidYet = Object.freeze({
+    code: 'AccessDenied',
+    message: 'request is not valid yet',
+    http_code: 403,
+});
 
 ////////////////////////////////////////////////////////////////
 // S3 Select                                                  //
@@ -570,6 +605,29 @@ S3Error.InvalidObjectStorageClass = Object.freeze({
     http_code: 403,
 });
 
+////////////////////////////////////////////////////////////////
+// S3 RDMA
+////////////////////////////////////////////////////////////////
+
+S3Error.S3InvalidRdmaToken = Object.freeze({
+    code: 'S3InvalidRdmaToken',
+    message: 'The specified S3-RDMA token is not valid.',
+    http_code: 400,
+});
+
+S3Error.S3RdmaNotSupported = Object.freeze({
+    code: 'S3RdmaNotSupported',
+    message: 'S3-RDMA is not supported.',
+    http_code: 501,
+});
+
+S3Error.S3RdmaIoError = Object.freeze({
+    code: 'S3RdmaIoError',
+    message: 'S3-RDMA I/O error occurred.',
+    http_code: 500,
+});
+
+
 S3Error.RPC_ERRORS_TO_S3 = Object.freeze({
     UNAUTHORIZED: S3Error.AccessDenied,
     BAD_REQUEST: S3Error.BadRequest,
@@ -593,6 +651,7 @@ S3Error.RPC_ERRORS_TO_S3 = Object.freeze({
     INVALID_PORT_ORDER: S3Error.InvalidPartOrder,
     INVALID_BUCKET_STATE: S3Error.InvalidBucketState,
     NOT_ENOUGH_SPACE: S3Error.InvalidBucketState,
+    OBJECT_QUOTA_EXCEEDED: S3Error.ObjectQuotaExceeded,
     MALFORMED_POLICY: S3Error.MalformedPolicy,
     NO_SUCH_OBJECT_LOCK_CONFIGURATION: S3Error.NoSuchObjectLockConfiguration,
     OBJECT_LOCK_CONFIGURATION_NOT_FOUND_ERROR: S3Error.ObjectLockConfigurationNotFoundError,

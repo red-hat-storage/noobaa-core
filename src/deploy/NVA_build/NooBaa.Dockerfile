@@ -1,8 +1,7 @@
 ARG CENTOS_VER=9
-FROM noobaa-base as server_builder
+FROM noobaa-base AS server_builder
 
-RUN mkdir -p /noobaa_init_files && \
-    cp -p ./build/Release/kube_pv_chown /noobaa_init_files
+RUN mkdir -p /noobaa_init_files
 
 COPY . ./
 ARG GIT_COMMIT 
@@ -33,34 +32,55 @@ RUN tar \
 
 #####################################################################################################################################
 
+FROM quay.io/centos/centos:stream${CENTOS_VER} AS noobaa-base
+
+##############################################################
+# Layers:
+#   Title: Copying the tar file from the server_builder
+#   Size: ~ 230 MB
+#   Cache: Rebuild when there is a new tar file.
+##############################################################
+COPY --from=server_builder /noobaa/noobaa-NVA.tar.gz /tmp/
+RUN mkdir -m 777 /root/node_modules && \
+    cd /root/node_modules && \
+    tar -xzf /tmp/noobaa-NVA.tar.gz && \
+    chgrp -R 0 /root/node_modules && \
+    chmod -R 775 /root/node_modules
+
+#####################################################################################################################################
+
 ##############################################################
 #   Title: Start of the Server Image
 #   Size: ~ 841 MB
 #   Cache: Rebuild when any layer is changing
 ##############################################################
 
-FROM quay.io/centos/centos:stream${CENTOS_VER}
+FROM quay.io/centos/centos:stream${CENTOS_VER} AS noobaa
+
+# an arg to control if we install parquet-libs or not
+ARG BUILD_S3SELECT=1
+ARG BUILD_S3SELECT_PARQUET=0
 
 # The ports are overridden for Ceph Test later
-ENV container docker
-ENV PORT 8080
-ENV SSL_PORT 8443
-ENV ENDPOINT_PORT 6001
-ENV ENDPOINT_SSL_PORT 6443
-ENV WEB_NODE_OPTIONS ''
-ENV BG_NODE_OPTIONS ''
-ENV HOSTED_AGENTS_NODE_OPTIONS ''
-ENV ENDPOINT_NODE_OPTIONS ''
+ENV container=docker
+ENV PORT=8080
+ENV SSL_PORT=8443
+ENV ENDPOINT_PORT=6001
+ENV ENDPOINT_SSL_PORT=6443
+ENV WEB_NODE_OPTIONS=''
+ENV BG_NODE_OPTIONS=''
+ENV HOSTED_AGENTS_NODE_OPTIONS=''
+ENV ENDPOINT_NODE_OPTIONS=''
 
 ##############################################################
 # Layers:
 #   Title: Installing dependencies
 #   Size: ~ 272 MB
-#   Cache: Rebuild when we adding/removing requirments
+#   Cache: Rebuild when we adding/removing requirements
 ##############################################################
 
-RUN dnf install -y epel-release
-RUN dnf install -y -q bash \
+RUN dnf install -y epel-release && \ 
+    dnf install -y -q bash \
     boost \
     lsof \
     procps \
@@ -79,8 +99,7 @@ RUN dnf install -y -q bash \
     dnf clean all
 
 COPY ./src/deploy/NVA_build/install_arrow_run.sh ./src/deploy/NVA_build/install_arrow_run.sh
-ARG BUILD_S3SELECT_PARQUET=0
-RUN ./src/deploy/NVA_build/install_arrow_run.sh $BUILD_S3SELECT_PARQUET
+RUN if [ "$BUILD_S3SELECT_PARQUET" = "1" ]; then ./src/deploy/NVA_build/install_arrow_run.sh; fi
 
 ##############################################################
 # Layers:
@@ -95,7 +114,7 @@ RUN chmod +x ./install_nodejs.sh && \
 
 ##############################################################
 # Layers:
-#   Title: Copying and giving premissions 
+#   Title: Copying and giving permissions 
 #   Size: ~ 1 MB
 #   Cache: Rebuild when we need to add another copy
 #
@@ -120,25 +139,9 @@ RUN chmod 775 /noobaa_init_files && \
     chgrp -R 0 /noobaa_init_files/ && \
     chmod -R g=u /noobaa_init_files/
 
-
 COPY --from=server_builder /kubectl /usr/local/bin/kubectl
-COPY --from=server_builder ./noobaa_init_files/kube_pv_chown /noobaa_init_files
-RUN mkdir -m 777 /root/node_modules && \
-    chown root:root /noobaa_init_files/kube_pv_chown && \
-    chmod 750 /noobaa_init_files/kube_pv_chown && \
-    chmod u+s /noobaa_init_files/kube_pv_chown
-
-##############################################################
-# Layers:
-#   Title: Copying the tar file from the server_builder
-#   Size: ~ 153 MB
-#   Cache: Rebuild when there is a new tar file.
-##############################################################
-COPY --from=server_builder /noobaa/noobaa-NVA.tar.gz /tmp/
-RUN cd /root/node_modules && \
-    tar -xzf /tmp/noobaa-NVA.tar.gz && \
-    chgrp -R 0 /root/node_modules && \
-    chmod -R 775 /root/node_modules
+RUN mkdir -m 777 /root/node_modules
+COPY --from=noobaa-base /root/node_modules /root/node_modules
 
 ###############
 # PORTS SETUP #
@@ -153,10 +156,7 @@ EXPOSE 27000
 EXPOSE 26050
 
 # Needs to be added only after installing jemalloc in dependencies section (our env section is before) - otherwise it will fail
-ENV LD_PRELOAD /usr/lib64/libjemalloc.so.2
-
-#RUN mkdir -p /nsfs/fs1/amitpb && chmod -R 777 /nsfs/
-#RUN mkdir -p /nsfsAA/fs1/amitpb && chmod -R 777 /nsfsAA/
+ENV LD_PRELOAD=/usr/lib64/libjemalloc.so.2
 
 ###############
 # EXEC SETUP #

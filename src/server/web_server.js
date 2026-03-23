@@ -58,7 +58,6 @@ async function main() {
         server_rpc.register_system_services();
         server_rpc.register_node_services();
         server_rpc.register_object_services();
-        server_rpc.register_func_services();
         server_rpc.register_common_services();
         server_rpc.rpc.router.default = 'fcall://fcall';
         server_rpc.rpc.register_http_app(app);
@@ -218,6 +217,8 @@ async function get_log_level_handler(req, res) {
 }
 
 async function get_version_handler(req, res) {
+    // Authorize bearer token version endpoint
+    if (config.NOOBAA_VERSION_AUTH_ENABLED && !http_utils.authorize_bearer(req, res)) return;
     const { status, version } = await getVersion(req.url);
     if (version) res.send(version);
     if (status !== 200) res.status(status);

@@ -16,6 +16,9 @@ const PARTIAL_SINGLE_BUCKET_REPLICATION_DEFAULTS = {
     last_cycle_writes_size: 0,
     last_cycle_error_writes_num: 0,
     last_cycle_error_writes_size: 0,
+    bucket_last_cycle_total_objects_num: 0,
+    bucket_last_cycle_replicated_objects_num: 0,
+    bucket_last_cycle_error_objects_num: 0,
 };
 
 //TODO: this function is not being used anymore, commenting out and keeping it as reference 
@@ -39,7 +42,7 @@ const PARTIAL_SINGLE_BUCKET_REPLICATION_DEFAULTS = {
 //     return false;
 // }
 
-function get_rule_status(rule, src_cont_token, keys_diff_map, copy_res) {
+function get_rule_and_bucket_status(rule, src_cont_token, keys_diff_map, copy_res) {
     const { num_keys_to_copy, num_bytes_to_copy } = Object.entries(keys_diff_map).reduce(
         (acc, [key, value]) => {
             acc.num_keys_to_copy += value.length;
@@ -51,22 +54,31 @@ function get_rule_status(rule, src_cont_token, keys_diff_map, copy_res) {
     const num_keys_moved = copy_res.num_of_objects;
     const num_bytes_moved = copy_res.size_of_objects;
 
-    const status = {
+    const rule_status = {
         last_cycle_rule_id: rule,
         last_cycle_writes_num: num_keys_moved,
         last_cycle_writes_size: num_bytes_moved,
         last_cycle_error_writes_num: num_keys_to_copy - num_keys_moved,
         last_cycle_error_writes_size: num_bytes_to_copy - num_bytes_moved,
     };
-    if (src_cont_token) status.last_cycle_src_cont_token = src_cont_token;
-    dbg.log1('get_rule_status: ', status);
-    return status;
+    if (src_cont_token) rule_status.last_cycle_src_cont_token = src_cont_token;
+    dbg.log1('get_rule_and_bucket_status:: rule_status: ', rule_status);
+
+    const bucket_status = {
+        bucket_last_cycle_total_objects_num: num_keys_to_copy,
+        bucket_last_cycle_replicated_objects_num: num_keys_moved,
+        bucket_last_cycle_error_objects_num: num_keys_to_copy - num_keys_moved,
+    };
+    dbg.log1('get_rule_and_bucket_status:: bucket_status: ', bucket_status);
+
+    return {rule_status, bucket_status};
 }
 
-function update_replication_prom_report(bucket_name, replication_policy_id, replication_status) {
+function update_replication_prom_report(bucket_name, replication_policy_id, rule_status, bucket_status) {
     const core_report = prom_reporting.get_core_report();
     const last_cycle_status = _.defaults({
-        ...replication_status,
+        ...rule_status,
+        ...bucket_status,
         bucket_name: bucket_name.unwrap(),
         replication_id: replication_policy_id
     }, PARTIAL_SINGLE_BUCKET_REPLICATION_DEFAULTS);
@@ -77,7 +89,7 @@ function update_replication_prom_report(bucket_name, replication_policy_id, repl
 /**
  * @param {any} bucket_name
  * @param {string} key
- * @param {AWS.S3} s3
+ * @param {import('@aws-sdk/client-s3').S3} s3
  * @param {string} version_id
  */
 async function get_object_md(bucket_name, key, s3, version_id) {
@@ -90,14 +102,14 @@ async function get_object_md(bucket_name, key, s3, version_id) {
 
     dbg.log1('get_object_md params:', params);
     try {
-        const head = await s3.headObject(params).promise();
+        const head = await s3.headObject(params);
         //for namespace s3 we are omitting the 'noobaa-namespace-s3-bucket' as it will be defer between buckets
         if (head?.Metadata) head.Metadata = _.omit(head.Metadata, 'noobaa-namespace-s3-bucket');
         dbg.log1('get_object_md: finished successfully', head);
         return head;
     } catch (err) {
-        dbg.error('get_object_md: error:', err);
-        if (err.code === 'NotFound') return;
+        dbg.error('get_object_md: error.name: ', err?.name, ' error: ', err);
+        if (err?.name === 'NotFound') return;
         throw err;
     }
 }
@@ -185,7 +197,7 @@ async function delete_objects(scanner_semaphore, client, bucket_name, keys) {
 }
 
 // EXPORTS
-exports.get_rule_status = get_rule_status;
+exports.get_rule_and_bucket_status = get_rule_and_bucket_status;
 exports.update_replication_prom_report = update_replication_prom_report;
 exports.get_object_md = get_object_md;
 exports.find_src_and_dst_buckets = find_src_and_dst_buckets;

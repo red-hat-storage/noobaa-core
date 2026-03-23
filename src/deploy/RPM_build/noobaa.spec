@@ -8,9 +8,9 @@
 %define nodever null
 %define releasedate null
 %define changelogdata null
+%define CENTOS_VER null
 %define BUILD_S3SELECT null
 %define BUILD_S3SELECT_PARQUET null
-%define CENTOS_VER null
 %define _build_id_links none
 
 %define noobaatar %{name}-%{version}-%{revision}.tar.gz
@@ -26,10 +26,27 @@ URL:  https://www.noobaa.io/
 Source0:  %{noobaatar}
 
 BuildRequires:  systemd
-BuildRequires:  python3
 BuildRequires:  make
 BuildRequires:  gcc-c++
 BuildRequires:  boost-devel
+BuildRequires:  libcap-devel
+%if 0%{?rhel} == 8
+BuildRequires:  gcc-toolset-11
+%endif
+%if 0%{?rhel} > 8
+# We can use default version in RHEL 9+
+BuildRequires:  python3
+%else
+# We need at least 3.9 in RHEL 8
+BuildRequires:  python3.9
+%endif
+
+%ifarch x86_64
+%if 0%{?rhel} == 9
+BuildRequires:  rdma-core-devel
+BuildRequires:  cuobjserver
+%endif
+%endif
 
 Recommends:     jemalloc
 
@@ -42,6 +59,7 @@ NooBaa is a data service for cloud environments, providing S3 object-store inter
 %setup -n noobaa -q
 
 %build
+PATH=/opt/rh/gcc-toolset-11/root/bin:$PATH
 NODEJS_VERSION="%{nodever}"
 SKIP_NODE_INSTALL=1 source src/deploy/NVA_build/install_nodejs.sh $NODEJS_VERSION
 
@@ -54,7 +72,7 @@ PATH=$PATH:%{_builddir}/node/node-v$NODEJS_VERSION-linux-$(get_arch)/bin
 
 npm install --omit=dev && npm cache clean --force
 
-./src/deploy/NVA_build/clone_s3select_submodules.sh
+if [ "%{BUILD_S3SELECT}" = "1" ]; then ./src/deploy/NVA_build/clone_s3select_submodules.sh; fi
 
 if [[ "%{CENTOS_VER}" = "8" ]]
 then
@@ -62,7 +80,9 @@ then
   echo "Using libboost 1.66 for S3 Select"
 fi
 
-GYP_DEFINES="BUILD_S3SELECT=%{BUILD_S3SELECT} BUILD_S3SELECT_PARQUET=%{BUILD_S3SELECT_PARQUET}" npm run build
+BUILD_S3SELECT=%{BUILD_S3SELECT} \
+  BUILD_S3SELECT_PARQUET=%{BUILD_S3SELECT_PARQUET} \
+  npm run build
 
 %install
 rm -rf $RPM_BUILD_ROOT

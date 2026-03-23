@@ -31,7 +31,8 @@ const Quota = require('../system_services/objects/quota');
 const stats_collector_utils = require('../../util/stats_collector_utils');
 // these type hacks are needed because the type info from require('node:cluster') is incorrect
 const cluster_module = /** @type {import('node:cluster').Cluster} */ (
-    /** @type {unknown} */ (require('node:cluster'))
+    /** @type {unknown} */
+    (require('node:cluster'))
 );
 
 
@@ -309,8 +310,8 @@ async function get_partial_providers_stats(req) {
                 const pool = system_store.data.pools.find(pool_rec => String(pool_rec._id) === String(key));
                 // TODO: Handle deleted pools
                 if (!pool) continue;
-                if (pool.mongo_pool_info) continue;
                 let type = 'KUBERNETES';
+                if (pool.is_default_pool) continue;
                 if (pool.cloud_pool_info) {
                     type = (supported_cloud_types.includes(pool.cloud_pool_info.endpoint_type)) ?
                         pool.cloud_pool_info.endpoint_type : 'OTHERS';
@@ -419,6 +420,19 @@ async function get_partial_systems_stats(req) {
     }
 }
 
+function _get_bucket_quota_info(bucket) {
+    const quota = new Quota(bucket.quota);
+    const { size_used_percent, quantity_used_percent } = quota.get_bucket_quota_usages_percent(bucket);
+    const quota_max_objects = quota.get_quota_by_quantity() === '0' ? 0 : parseInt(quota.get_quota_by_quantity(), 10);
+    const quota_max_bytes = quota.get_quota_by_size() === '0' ? 0 : size_utils.json_to_bigint(quota.get_quota_by_size()).toJSNumber();
+
+    return {
+        size_used_percent,
+        quantity_used_percent,
+        quota_max_objects,
+        quota_max_bytes
+    };
+}
 
 async function _partial_buckets_info(req) {
     const buckets_stats = _.cloneDeep(PARTIAL_BUCKETS_STATS_DEFAULTS);
@@ -463,7 +477,7 @@ async function _partial_buckets_info(req) {
                 'OPTIMAL',
                 'NO_RESOURCES_INTERNAL',
                 'DATA_ACTIVITY',
-                'APPROUCHING_QUOTA',
+                'APPROACHING_QUOTA',
                 'TIER_LOW_CAPACITY',
                 'LOW_CAPACITY',
                 'TIER_NO_CAPACITY',
@@ -515,16 +529,20 @@ async function _partial_buckets_info(req) {
             const bucket_available = size_utils.json_to_bigint(_.get(bucket_info, 'data.free') || 0);
             const bucket_total = bucket_used.plus(bucket_available);
             const is_capacity_relevant = _.includes(CAPACITY_MODES, bucket_info.mode);
-            const { size_used_percent, quantity_used_percent } = new Quota(bucket.quota).get_bucket_quota_usages_percent(bucket);
+            const { size_used_percent, quantity_used_percent, quota_max_objects, quota_max_bytes } = _get_bucket_quota_info(bucket);
+
             buckets_stats.buckets.push({
                 bucket_name: bucket_info.name.unwrap(),
-                quota_size_precent: size_used_percent,
+                quota_size_percent: size_used_percent,
                 quota_quantity_percent: quantity_used_percent,
-                capacity_precent: (is_capacity_relevant && bucket_total > 0) ? size_utils.bigint_to_json(bucket_used.multiply(100)
+                capacity_percent: (is_capacity_relevant && bucket_total > 0) ? size_utils.bigint_to_json(bucket_used.multiply(100)
                     .divide(bucket_total)) : 0,
                 is_healthy: _.includes(OPTIMAL_MODES, bucket_info.mode),
                 tagging: bucket_info.tagging || [],
-                bucket_used_bytes: bucket_used.valueOf()
+                bucket_used_bytes: bucket_used.valueOf(),
+                object_count: bucket_info.num_objects.value || 0,
+                quota_max_objects: quota_max_objects,
+                quota_max_bytes: quota_max_bytes
             });
         }
 
@@ -703,7 +721,7 @@ async function get_cloud_pool_stats(req) {
     const OPTIMAL_MODES = [
         'OPTIMAL',
         'DATA_ACTIVITY',
-        'APPROUCHING_QUOTA',
+        'APPROACHING_QUOTA',
         'RISKY_TOLERANCE',
         'NO_RESOURCES_INTERNAL',
         'TIER_LOW_CAPACITY',
@@ -711,7 +729,7 @@ async function get_cloud_pool_stats(req) {
     ];
     //Per each system fill out the needed info
     for (const pool of system_store.data.pools) {
-        if (pool.mongo_pool_info) continue;
+        if (pool.is_default_pool) continue;
         const pool_info = await server_rpc.client.pool.read_pool({ name: pool.name }, {
             auth_token: req.auth_token
         });

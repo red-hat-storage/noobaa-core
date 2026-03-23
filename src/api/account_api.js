@@ -21,7 +21,7 @@ module.exports = {
             method: 'POST',
             params: {
                 type: 'object',
-                required: ['name', 'email', 'has_login', 's3_access'],
+                required: ['name', 'email', 's3_access'],
                 properties: {
                     name: { $ref: 'common_api#/definitions/account_name' },
                     email: { $ref: 'common_api#/definitions/email' },
@@ -29,7 +29,7 @@ module.exports = {
                     must_change_password: {
                         type: 'boolean',
                     },
-                    has_login: {
+                    has_login: { // DEPRECATED - TO BE REMOVED
                         type: 'boolean'
                     },
                     s3_access: {
@@ -40,6 +40,12 @@ module.exports = {
                     },
                     allow_bucket_creation: {
                         type: 'boolean'
+                    },
+                    owner: {
+                        type: 'string',
+                    },
+                    iam_path: {
+                        type: 'string',
                     },
                     roles: {
                         type: 'array',
@@ -87,6 +93,12 @@ module.exports = {
                 type: 'object',
                 required: ['token'],
                 properties: {
+                    id: {
+                        type: 'string'
+                    },
+                    arn: {
+                        type: 'string'
+                    },
                     token: {
                         type: 'string'
                     },
@@ -216,26 +228,6 @@ module.exports = {
             }
         },
 
-        reset_password: {
-            doc: 'Reset an account password',
-            method: 'PUT',
-            params: {
-                type: 'object',
-                required: ['email', 'verification_password', 'password'],
-                properties: {
-                    email: { $ref: 'common_api#/definitions/email' },
-                    verification_password: { $ref: 'common_api#/definitions/password' },
-                    password: { $ref: 'common_api#/definitions/password' },
-                    must_change_password: {
-                        type: 'boolean'
-                    }
-                },
-            },
-            auth: {
-                system: 'admin'
-            }
-        },
-
         generate_account_keys: {
             doc: 'Generate new account keys',
             method: 'PUT',
@@ -312,7 +304,11 @@ module.exports = {
                             uid: { type: 'number' },
                             gid: { type: 'number' },
                             new_buckets_path: { type: 'string' },
-                            nsfs_only: { type: 'boolean' }
+                            nsfs_only: { type: 'boolean' },
+                            supplemental_groups: {
+                                $ref: 'common_api#/definitions/supplemental_groups'
+                            },
+                            custom_bucket_path_allowed_list: { type: 'string' },
                         }
                     },
                 },
@@ -629,14 +625,497 @@ module.exports = {
                 system: 'admin'
             }
         },
-
+        get_user: {
+            method: 'GET',
+            doc: 'Get IAM user',
+            params: {
+                type: 'object',
+                properties: {
+                    username: {
+                        type: 'string'
+                    },
+                },
+            },
+            reply: {
+                $ref: '#/definitions/user_info',
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        create_user: {
+            method: 'POST',
+            doc: 'Create IAM Users',
+            params: {
+                type: 'object',
+                required: ['email', 'name'],
+                properties: {
+                    name: { $ref: 'common_api#/definitions/account_name' },
+                    email: { $ref: 'common_api#/definitions/email' },
+                    default_resource: {
+                        type: 'string',
+                    },
+                    s3_access: {
+                        type: 'boolean'
+                    },
+                    has_login: { // DEPRECATED - TO BE REMOVED
+                        type: 'boolean'
+                    },
+                    allow_bucket_creation: {
+                        type: 'boolean'
+                    },
+                    roles: {
+                        type: 'array',
+                        items: {
+                            type: 'string',
+                            enum: ['admin', 'user', 'viewer', 'operator']
+                        }
+                    },
+                    owner: {
+                        type: 'string',
+                    },
+                    iam_path: {
+                        type: 'string',
+                    },
+                }
+            },
+           reply: {
+                type: 'object',
+                required: ['arn', 'id'],
+                properties: {
+                    id: {
+                        type: 'string'
+                    },
+                    arn: {
+                        type: 'string'
+                    },
+                    token: {
+                        type: 'string'
+                    },
+                    access_keys: {
+                        type: 'array',
+                        items: {
+                            $ref: 'common_api#/definitions/access_keys'
+                        }
+                    },
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        update_user: {
+            method: 'PUT',
+            doc: 'Update IAM Users',
+            params: {
+                type: 'object',
+                required: ['username'],
+                properties: {
+                    username: {
+                        type: 'string'
+                    },
+                    new_username: {
+                        type: 'string'
+                     },
+                    new_iam_path: {
+                        type: 'string'
+                    }
+                }
+            },
+            reply: {
+                $ref: '#/definitions/user_info',
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        delete_user: {
+            method: 'DELETE',
+            doc: 'Delete IAM Users',
+            params: {
+                type: 'object',
+                required: ['username'],
+                properties: {
+                    username: {
+                        type: 'string'
+                    },
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        list_users: {
+            doc: 'List IAM Users',
+            method: 'GET',
+            params: {
+                type: 'object',
+                properties: {
+                    iam_path_prefix: {
+                        type: 'string',
+                    },
+                    max_items: {
+                        type: 'integer',
+                    },
+                    marker: {
+                        type: 'string',
+                    },
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    members: {
+                        type: 'array',
+                        items: {
+                            $ref: '#/definitions/user_info'
+                        },
+                    },
+                    is_truncated: {
+                        type: 'boolean'
+                    },
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        create_access_key: {
+            doc: 'Create accesskeys for users',
+            method: 'POST',
+            params: {
+                type: 'object',
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                }
+            },
+            reply: {
+                $ref: '#/definitions/user_accesskey_info'
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        list_access_keys: {
+            doc: 'List IAM User accessKeys',
+            method: 'GET',
+            params: {
+                type: 'object',
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    max_items: {
+                        type: 'integer',
+                    },
+                    marker: {
+                        type: 'string',
+                    },
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    members: {
+                        type: 'array',
+                        items: {
+                            $ref: '#/definitions/user_accesskey_info'
+                        },
+                    },
+                    is_truncated: {
+                        type: 'boolean',
+                    },
+                    username: {
+                        type: 'string',
+                    }
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        update_access_key: {
+            doc: 'Update accesskeys for users',
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: [ 'access_key', 'status'],
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    access_key: {
+                        type: 'string',
+                    },
+                    status: {
+                        type: 'string',
+                        enum: [
+                            'Inactive',
+                            'Active',
+                        ]
+                    },
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        delete_access_key: {
+            doc: 'Delete accesskeys for users',
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: ['access_key'],
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    access_key: {
+                        type: 'string',
+                    },
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        get_access_key_last_used: {
+            doc: 'Accesskey last used',
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: ['access_key'],
+                properties: {
+                    access_key: {
+                        type: 'string',
+                    },
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    region: {
+                        type: 'string',
+                    },
+                    username: {
+                        type: 'string',
+                    },
+                    service_name: {
+                        type: 'string',
+                    },
+                    last_used_date: {
+                        idate: true,
+                    },
+                },
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        tag_user: {
+            doc: 'Tag user',
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: ['username', 'tags'],
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    tags: {
+                        type: 'array',
+                        items: {
+                            $ref: 'common_api#/definitions/tag',
+                        }
+                    },
+                }
+            },
+            auth: {
+                system: 'admin'
+            },
+        },
+        untag_user: {
+            doc: 'Remove user tags',
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: ['username', 'tag_keys'],
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    tag_keys: {
+                        type: 'array',
+                        items: {
+                            type: 'string',
+                        }
+                    },
+                }
+            },
+            auth: {
+                system: 'admin'
+            },
+        },
+        list_user_tags: {
+            doc: 'List user tags',
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: ['username'],
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    max_items: {
+                        type: 'integer',
+                    },
+                    marker: {
+                        type: 'string',
+                    },
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    tags: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                member: {
+                                    $ref: '#/definitions/tag'
+                                },
+                            },
+                        },
+                    },
+                    is_truncated: {
+                        type: 'boolean',
+                    },
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        put_user_policy: {
+            doc: 'Put user policy',
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: ['username', 'policy_name', 'policy_document'],
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    policy_name: {
+                        type: 'string',
+                    },
+                    policy_document: {
+                        $ref: 'common_api#/definitions/iam_user_policy_document',
+                    },
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        get_user_policy: {
+            doc: 'Get user policy',
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: ['username', 'policy_name'],
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    policy_name: {
+                        type: 'string',
+                    },
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    policy_name: {
+                        type: 'string',
+                    },
+                    policy_document: {
+                        type: 'string',
+                    }
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        delete_user_policy: {
+            doc: 'Delete user policy',
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: ['username', 'policy_name'],
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    policy_name: {
+                        type: 'string',
+                    },
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+        list_user_policies: {
+            doc: 'List user policies',
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: ['username'],
+                properties: {
+                    username: {
+                        type: 'string',
+                    },
+                    max_items: {
+                        type: 'integer',
+                    },
+                    marker: {
+                        type: 'string',
+                    },
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    is_truncated: {
+                        type: 'boolean'
+                    },
+                    members: {
+                        type: 'array',
+                        items: {
+                            type: 'string',
+                        }
+                    }
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
     },
-
     definitions: {
         account_info: {
             type: 'object',
-            required: ['name', 'email', 'has_login', 'has_s3_access'],
+            required: ['name', 'email', 'has_s3_access'],
             properties: {
+                _id: { type: 'string'},
                 name: { $ref: 'common_api#/definitions/account_name' },
                 email: { $ref: 'common_api#/definitions/email' },
                 is_support: {
@@ -645,7 +1124,7 @@ module.exports = {
                 is_external: {
                     type: 'boolean'
                 },
-                has_login: {
+                has_login: { // DEPRECATED - TO BE REMOVED
                     type: 'boolean',
                 },
                 next_password_change: {
@@ -677,6 +1156,9 @@ module.exports = {
                 },
                 bucket_claim_owner: {
                     $ref: 'common_api#/definitions/bucket_name',
+                },
+                iam_path: {
+                    type: 'string',
                 },
                 external_connections: {
                     type: 'object',
@@ -766,6 +1248,15 @@ module.exports = {
                 },
                 nsfs_account_config: {
                     $ref: 'common_api#/definitions/nsfs_account_config'
+                },
+                iam_user_policies: {
+                    type: 'array',
+                    items: {
+                        $ref: 'common_api#/definitions/iam_user_policy',
+                    }
+                },
+                owner: {
+                    type: 'string'
                 }
             },
         },
@@ -786,6 +1277,84 @@ module.exports = {
                     }
                 }
             }]
-        }
+        },
+        user_info: {
+            type: 'object',
+            required: ['username'],
+            properties: {
+                user_id: {
+                    type: 'string'
+                },
+                username: {
+                    type: 'string'
+                },
+                arn: {
+                    type: 'string'
+                },
+                iam_path: {
+                    type: 'string'
+                },
+                create_date: {
+                    idate: true,
+                },
+                password_last_used: {
+                    idate: true,
+                },
+                access_keys: {
+                    type: 'array',
+                    items: {
+                        $ref: 'common_api#/definitions/access_keys'
+                    }
+                },
+                tags: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            member: {
+                                $ref: '#/definitions/tag'
+                            },
+                        },
+                    },
+                },
+            }
+        },
+        user_accesskey_info: {
+            type: 'object',
+            required: ['username', 'status', 'access_key'],
+            properties: {
+                username: {
+                    type: 'string',
+                },
+                status: {
+                    type: 'string'
+                },
+                create_date: {
+                    idate: true,
+                },
+                access_key: {
+                    type: 'string'
+                },
+                secret_key: {
+                    type: 'string'
+                },
+            }
+        },
+        // Cant reuse the common_api tag, where key and value is small letter. GAP
+        tag: {
+            type: 'object',
+            required: [
+                'Key',
+                'Value'
+            ],
+            properties: {
+                Key: {
+                    type: 'string'
+                },
+                Value: {
+                    type: 'string'
+                },
+            }
+        },
     }
 };

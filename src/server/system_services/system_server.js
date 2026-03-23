@@ -19,7 +19,7 @@ const config = require('../../../config');
 const { BucketStatsStore } = require('../analytic_services/bucket_stats_store');
 const { EndpointStatsStore } = require('../analytic_services/endpoint_stats_store');
 const os_utils = require('../../util/os_utils');
-const { RpcError } = require('../../rpc');
+const { RpcError, RPC_BUFFERS } = require('../../rpc');
 const nb_native = require('../../util/nb_native');
 const Dispatcher = require('../notifications/dispatcher');
 const size_utils = require('../../util/size_utils');
@@ -188,14 +188,10 @@ function new_system_changes(req, name, owner_account_id) {
     system.master_key_id = m_key._id;
 
     let default_pool;
-    if (config.DEFAULT_POOL_TYPE === 'INTERNAL') {
-        const pool_name = `${config.INTERNAL_STORAGE_POOL_NAME}-${system._id}`;
-        const mongo_pool = pool_server.new_pool_defaults(pool_name, system._id, 'INTERNAL', 'BLOCK_STORE_MONGO', owner_account_id);
-        mongo_pool.mongo_pool_info = {};
-        default_pool = mongo_pool;
-    } else if (config.DEFAULT_POOL_TYPE === 'HOSTS') {
+    if (config.DEFAULT_POOL_TYPE === 'HOSTS') {
         const pool_name = config.DEFAULT_POOL_NAME;
         const fs_pool = pool_server.new_pool_defaults(pool_name, system._id, 'HOSTS', 'BLOCK_STORE_FS', owner_account_id);
+        fs_pool.is_default_pool = true;
         fs_pool.hosts_pool_info = { is_managed: false, host_count: 0 };
         default_pool = fs_pool;
     } else {
@@ -303,6 +299,15 @@ function get_system_status(req) {
     };
 }
 
+async function get_system_store() {
+    try {
+        return {
+            [RPC_BUFFERS]: {data: Buffer.from(JSON.stringify(await system_store.recent_db_data()))},
+        };
+    } catch (e) {
+        dbg.error("Failed getting system store", e);
+    }
+}
 
 async function _update_system_state(system_id, mode) {
     const update = {
@@ -491,7 +496,6 @@ async function read_system(req) {
         nodes_aggregate_pool_with_cloud_no_mongo,
         hosts_aggregate_pool,
         accounts,
-        funcs,
         buckets_stats,
         endpoint_groups
     } = await P.map_props({
@@ -516,15 +520,6 @@ async function read_system(req) {
         ),
 
         refresh_system_alloc_unused: node_allocator.refresh_system_alloc(system),
-
-        funcs: P.resolve()
-            // using default domain - will serve the list_funcs from web_server so if
-            // endpoint is down it will not fail the read_system
-            .then(() => server_rpc.client.func.list_funcs({}, {
-                auth_token: req.auth_token,
-                domain: 'default'
-            }))
-            .then(res => res.functions),
 
         buckets_stats: BucketStatsStore.instance().get_all_buckets_stats({ system: system._id }),
         endpoint_groups: _get_endpoint_groups()
@@ -605,12 +600,10 @@ async function read_system(req) {
             bucket => {
                 const tiering_pools_status = node_allocator.get_tiering_status(bucket.tiering);
                 Object.assign(tiering_status_by_tier, tiering_pools_status);
-                const func_configs = funcs.map(func => func.config);
                 const b = bucket_server.get_bucket_info({
                     bucket,
                     nodes_aggregate_pool: nodes_aggregate_pool_with_cloud_and_mongo,
                     hosts_aggregate_pool,
-                    func_configs,
                     bucket_stats: stats_by_bucket[bucket.name],
                 });
 
@@ -619,14 +612,13 @@ async function read_system(req) {
         namespace_resources: _.map(system.namespace_resources_by_name,
             ns => pool_server.get_namespace_resource_info(ns)),
         pools: _.filter(system.pools_by_name,
-                pool => (!_.get(pool, 'cloud_pool_info.pending_delete') && !_.get(pool, 'mongo_pool_info.pending_delete')))
+                pool => (!_.get(pool, 'cloud_pool_info.pending_delete')))
             .map(pool => pool_server.get_pool_info(pool, nodes_aggregate_pool_with_cloud_and_mongo, hosts_aggregate_pool)),
         tiers: _.map(system.tiers_by_name,
             tier => tier_server.get_tier_info(tier,
                 nodes_aggregate_pool_with_cloud_and_mongo,
                 tiering_status_by_tier[String(tier._id)])),
         accounts: accounts,
-        functions: funcs,
         storage: size_utils.to_bigint_storage(_.defaults({
             used: objects_sys.size,
         }, nodes_aggregate_pool_with_cloud_no_mongo.storage, SYS_STORAGE_DEFAULTS)),
@@ -1613,3 +1605,5 @@ exports.rotate_master_key = rotate_master_key;
 exports.disable_master_key = disable_master_key;
 exports.enable_master_key = enable_master_key;
 exports.upgrade_master_keys = upgrade_master_keys;
+
+exports.get_system_store = get_system_store;

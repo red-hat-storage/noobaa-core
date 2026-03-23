@@ -25,8 +25,10 @@ const NamespaceMultipart = require('./namespace_multipart');
 const NamespaceNetStorage = require('./namespace_net_storage');
 const BucketSpaceNB = require('./bucketspace_nb');
 const { RpcError } = require('../rpc');
+const noobaa_s3_client = require('../sdk/noobaa_s3_client/noobaa_s3_client');
 
 const anonymous_access_key = Symbol('anonymous_access_key');
+
 const bucket_namespace_cache = new LRUCache({
     name: 'ObjectSDK-Bucket-Namespace-Cache',
     // This is intentional. Cache entry expiration is handled by _validate_bucket_namespace().
@@ -45,10 +47,10 @@ const bucket_namespace_cache = new LRUCache({
     validate: (data, params) => params.sdk._validate_bucket_namespace(data, params),
 });
 
+// TODO: account_cache should be in account_sdk
 const account_cache = new LRUCache({
     name: 'AccountCache',
-    // TODO: Decide on a time that we want to invalidate
-    expiry_ms: Number(process.env.ACCOUNTS_CACHE_EXPIRY) || 10 * 60 * 1000,
+    expiry_ms: config.OBJECT_SDK_ACCOUNT_CACHE_EXPIRY_MS,
     /**
      * Set type for the generic template
      * @param {{
@@ -58,6 +60,7 @@ const account_cache = new LRUCache({
      */
     make_key: ({ access_key }) => access_key,
     load: async ({ bucketspace, access_key }) => bucketspace.read_account_by_access_key({ access_key }),
+    validate: (data, params) => _validate_account(data, params),
 });
 
 const dn_cache = new LRUCache({
@@ -67,17 +70,36 @@ const dn_cache = new LRUCache({
     /**
      * Set type for the generic template
      * @param {{
-    *      distinguished_name: string;
-    * }} params
-    */
+     *      distinguished_name: string;
+     * }} params
+     */
     make_key: ({ distinguished_name }) => distinguished_name,
     load: async ({ distinguished_name }) => native_fs_utils.get_user_by_distinguished_name({ distinguished_name }),
- });
+});
 
 const MULTIPART_NAMESPACES = [
     'NET_STORAGE'
 ];
-const required_obj_properties = ['obj_id', 'bucket', 'key', 'size', 'content_type', 'etag'];
+
+/** _validate_account is an additional layer (to expiry_ms)
+ * and in NC deployment it checks the stat of the config file
+ * @param {object} data
+ * @param {object} params
+ * @returns Promise<{boolean>}
+ */
+// TODO: account function should be handled in account_sdk 
+async function _validate_account(data, params) {
+    // stat check (only in bucketspace FS)
+    const bs = params.bucketspace;
+    const bs_allow_stat_account = Boolean(bs.check_same_stat_account);
+    if (bs_allow_stat_account && config.NC_ENABLE_ACCOUNT_CACHE_STAT_VALIDATION) {
+        const same_stat = await bs.check_same_stat_account(params.access_key, data.stat);
+        if (!same_stat) { // config file of account was changed
+            return false;
+        }
+    }
+    return true;
+}
 
 class ObjectSDK {
 
@@ -196,7 +218,9 @@ class ObjectSDK {
             s3_policy: bucket.s3_policy,
             system_owner: bucket.system_owner, // note that bucketspace_fs currently doesn't return system_owner
             bucket_owner: bucket.bucket_owner,
-            owner_account: bucket.owner_account, // in NC NSFS this is the account id that owns the bucket
+            bucket_owner_id: bucket.bucket_owner_id, // in containerized this is the account id that owns the bucket
+            owner_account: bucket.owner_account, // in NC NSFS this is an object of account id and name that owns the bucket
+            public_access_block: bucket.public_access_block,
         };
         return policy_info;
     }
@@ -208,6 +232,16 @@ class ObjectSDK {
 
     async read_bucket_full_info(name) {
         return bucket_namespace_cache.get_with_cache({ sdk: this, name });
+    }
+
+    async read_bucket_sdk_cors_info(name) {
+        try {
+            const { bucket } = await bucket_namespace_cache.get_with_cache({ sdk: this, name });
+            return bucket.cors_configuration_rules;
+        } catch (error) {
+            if (error.rpc_code === 'NO_SUCH_BUCKET') return undefined;
+            throw error;
+        }
     }
 
     async load_requesting_account(req) {
@@ -286,6 +320,15 @@ class ObjectSDK {
 
     async _validate_bucket_namespace(data, params) {
         const time = Date.now();
+        // stat check (only in bucketspace FS)
+        const bs = this._get_bucketspace();
+        const bs_allow_stat_bucket = Boolean(bs.check_same_stat_bucket);
+        if (bs_allow_stat_bucket && config.NC_ENABLE_BUCKET_NS_CACHE_STAT_VALIDATION) {
+            const same_stat = await bs.check_same_stat_bucket(params.name, data.bucket.stat);
+            if (!same_stat) { // config file of bucket was changed
+                return false;
+            }
+        }
         if (time <= data.valid_until) return true;
         const bucket = await this._get_bucketspace().read_bucket_sdk_info({ name: params.name });
         if (_.isEqual(bucket, data.bucket)) {
@@ -333,8 +376,7 @@ class ObjectSDK {
                     return {
                         ns: this._setup_single_namespace(
                             bucket.namespace.read_resources[0],
-                            bucket._id,
-                            {
+                            bucket._id, {
                                 versioning: bucket.bucket_info && bucket.bucket_info.versioning,
                                 force_md5_etag: bucket.force_md5_etag
                             },
@@ -391,8 +433,8 @@ class ObjectSDK {
                 write_resource: wr,
                 read_resources: _.map(rr, it => (
                     it.resource.endpoint_type === 'MULTIPART' ?
-                        it.ns :
-                        this._setup_single_namespace(it)
+                    it.ns :
+                    this._setup_single_namespace(it)
                 ))
             },
             active_triggers: bucket.active_triggers
@@ -417,25 +459,22 @@ class ObjectSDK {
             r.endpoint_type === 'FLASHBLADE' ||
             r.endpoint_type === 'IBM_COS') {
 
-            const agent = r.endpoint_type === 'AWS' ?
-                http_utils.get_default_agent(r.endpoint) :
-                http_utils.get_unsecured_agent(r.endpoint);
-
             return new NamespaceS3({
                 namespace_resource_id: r.id,
                 s3_params: {
-                    params: { Bucket: r.target_bucket },
                     endpoint: r.endpoint,
                     aws_sts_arn: r.aws_sts_arn,
-                    accessKeyId: r.access_key.unwrap(),
-                    secretAccessKey: r.secret_key.unwrap(),
-                    // region: 'us-east-1', // TODO needed?
-                    signatureVersion: cloud_utils.get_s3_endpoint_signature_ver(r.endpoint, r.auth_method),
-                    s3ForcePathStyle: true,
-                    // computeChecksums: false, // disabled by default for performance
-                    httpOptions: { agent },
-                    access_mode: r.access_mode
+                    credentials: {
+                        accessKeyId: r.access_key.unwrap(),
+                        secretAccessKey: r.secret_key.unwrap(),
+                    },
+                    region: r.region || config.DEFAULT_REGION, // SDKv3 needs region
+                    forcePathStyle: true,
+                    requestHandler: noobaa_s3_client.get_requestHandler_with_suitable_agent(r.endpoint),
+                    requestChecksumCalculation: 'WHEN_REQUIRED',
+                    access_mode: r.access_mode,
                 },
+                bucket: r.target_bucket,
                 stats: this.stats,
             });
         }
@@ -640,6 +679,7 @@ class ObjectSDK {
         if (params.xattr_copy) {
             params.xattr = source_md.xattr;
             params.content_type = source_md.content_type;
+            params.content_encoding = source_md.content_encoding;
         }
         try {
             //omitBy iterates all xattr calling startsWith on them. this can include symbols such as XATTR_SORT_SYMBOL.
@@ -877,12 +917,12 @@ class ObjectSDK {
     // BUCKET //
     ////////////
 
-    async list_buckets() {
+    async list_buckets(params = {}) {
         return this._call_op_and_update_stats({
             op_name: 'list_buckets',
             op_func: async () => {
                 const bs = this._get_bucketspace();
-                return bs.list_buckets(this);
+                return bs.list_buckets(params, this);
             },
         });
     }
@@ -946,7 +986,7 @@ class ObjectSDK {
 
     async put_bucket_tagging(params) {
         const bs = this._get_bucketspace();
-        return bs.put_bucket_tagging(params);
+        return bs.put_bucket_tagging(params, this);
     }
 
     async delete_bucket_tagging(params) {
@@ -1051,19 +1091,41 @@ class ObjectSDK {
         });
     }
 
-    async dispatch_triggers({ active_triggers, obj, operation, bucket }) {
-        const dispatch = this.should_run_triggers({ active_triggers, obj, operation });
-        if (dispatch) {
-            const dispatch_obj = _.pick(obj, required_obj_properties);
-            // Dummy obj_id (not all flows return with obj_id and we need it for the API schema)
-            dispatch_obj.obj_id = '10101010aaaabbbbccccdddd';
-            await this.internal_rpc_client.object.dispatch_triggers({
-                bucket,
-                event_name: operation,
-                obj: dispatch_obj
-            });
-        }
+    /////////////////////////
+    // BUCKET NOTIFICATION //
+    /////////////////////////
+
+    async put_bucket_notification(params) {
+        const bs = this._get_bucketspace();
+        const res = bs.put_bucket_notification(params);
+        bucket_namespace_cache.invalidate_key(params.bucket_name);
+        return res;
     }
+
+    async get_bucket_notification(params) {
+        const { bucket } = await bucket_namespace_cache.get_with_cache({ sdk: this, name: params.bucket_name });
+        return bucket.notifications;
+    }
+
+    ////////////////////
+    // BUCKET CORS //
+    ////////////////////
+
+    async put_bucket_cors(params) {
+        const bs = this._get_bucketspace();
+        return bs.put_bucket_cors(params);
+    }
+
+    async delete_bucket_cors(params) {
+        const bs = this._get_bucketspace();
+        return bs.delete_bucket_cors(params);
+    }
+
+    async get_bucket_cors(params) {
+        const bs = this._get_bucketspace();
+        return bs.get_bucket_cors(params);
+    }
+
     ////////////////////
     //  OBJECT LOCK   //
     ////////////////////
@@ -1109,6 +1171,42 @@ class ObjectSDK {
         const ns = await this._get_bucket_namespace(params.bucket);
         this._check_is_readonly_namespace(ns);
         return ns.put_object_acl(params, this);
+    }
+
+    //////////////////////////
+    //  OBJECT ATTRIBUTES   //
+    //////////////////////////
+
+    async get_object_attributes(params) {
+        const ns = await this._get_bucket_namespace(params.bucket);
+        if (ns.get_object_attributes) {
+            return ns.get_object_attributes(params, this);
+        } else {
+            // fallback to calling get_object_md without attributes params
+            dbg.warn('namespace does not implement get_object_attributes action, fallback to read_object_md');
+            const md_params = { ...params };
+            delete md_params.attributes; // not part of the schema of read_object_md
+            return ns.read_object_md(md_params, this);
+        }
+    }
+
+    //////////////////////////
+    // PUBLIC ACCESS BLOCK  //
+    //////////////////////////
+
+    async get_public_access_block(params) {
+        const bs = this._get_bucketspace();
+        return bs.get_public_access_block?.({ bucket_name: params.name });
+    }
+
+    async put_public_access_block(params) {
+        const bs = this._get_bucketspace();
+        return bs.put_public_access_block?.({ bucket_name: params.name, public_access_block: params.public_access_block });
+    }
+
+    async delete_public_access_block(params) {
+        const bs = this._get_bucketspace();
+        return bs.delete_public_access_block?.({ bucket_name: params.name });
     }
 }
 

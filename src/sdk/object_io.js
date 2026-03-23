@@ -7,7 +7,7 @@ const stream = require('stream');
 
 const dbg = require('../util/debug_module')(__filename);
 const config = require('../../config');
-const Semaphore = require('../util/semaphore');
+const semaphore = require('../util/semaphore');
 const ChunkCoder = require('../util/chunk_coder');
 const range_utils = require('../util/range_utils');
 const buffer_utils = require('../util/buffer_utils');
@@ -122,7 +122,7 @@ class ObjectIO {
         this._last_io_bottleneck_report = 0;
         this.location_info = location_info;
 
-        this._io_buffers_sem = new Semaphore(config.IO_SEMAPHORE_CAP, {
+        this._io_buffers_sem = new semaphore.Semaphore(config.IO_SEMAPHORE_CAP, {
             timeout: config.IO_STREAM_SEMAPHORE_TIMEOUT,
             timeout_error_code: 'IO_STREAM_ITEM_TIMEOUT'
         });
@@ -173,7 +173,7 @@ class ObjectIO {
         params.bucket_master_key_id = obj_upload.bucket_master_key_id;
 
         try {
-            dbg.log0('upload_object_range: start upload stream', upload_params);
+            dbg.log1('upload_object_range: start upload stream', upload_params);
             return this._upload_stream(params, complete_params);
         } catch (err) {
             dbg.error('upload_object_range: object part upload failed', upload_params, err);
@@ -213,7 +213,7 @@ class ObjectIO {
             'last_modified_time',
         );
         try {
-            dbg.log0('upload_object: start upload', create_params);
+            dbg.log1('upload_object: start upload', create_params);
             const create_reply = await params.client.object.create_object_upload(create_params);
             params.obj_id = create_reply.obj_id;
             params.tier_id = create_reply.tier_id;
@@ -228,7 +228,7 @@ class ObjectIO {
                 await this._upload_stream(params, complete_params);
             }
 
-            dbg.log0('upload_object: complete upload', complete_params);
+            dbg.log1('upload_object: complete upload', complete_params);
 
             if (params.async_get_last_modified_time) {
                 complete_params.last_modified_time = await params.async_get_last_modified_time();
@@ -275,7 +275,7 @@ class ObjectIO {
             'num',
         );
         try {
-            dbg.log0('upload_multipart: start upload', complete_params);
+            dbg.log1('upload_multipart: start upload', complete_params);
             const multipart_reply = await params.client.object.create_multipart(create_params);
             params.tier_id = multipart_reply.tier_id;
             params.bucket_id = multipart_reply.bucket_id;
@@ -289,8 +289,10 @@ class ObjectIO {
             } else {
                 await this._upload_stream(params, complete_params);
             }
-            dbg.log0('upload_multipart: complete upload', complete_params);
-            return params.client.object.complete_multipart(complete_params);
+            dbg.log1('upload_multipart: complete upload', complete_params);
+            const multipart_params = await params.client.object.complete_multipart(complete_params);
+            multipart_params.multipart_id = complete_params.multipart_id;
+            return multipart_params;
         } catch (err) {
             dbg.warn('upload_multipart: failed', complete_params, err);
             // we leave the cleanup of failed multiparts to complete_object_upload or abort_object_upload
@@ -375,7 +377,7 @@ class ObjectIO {
     async _upload_stream_internal(params, complete_params) {
 
         params.desc = _.pick(params, 'obj_id', 'num', 'bucket', 'key');
-        dbg.log0('UPLOAD:', params.desc, 'streaming to', params.bucket, params.key);
+        dbg.log1('UPLOAD:', params.desc, 'streaming to', params.bucket, params.key);
 
         // start and seq are set to zero even for multiparts and will be fixed
         // when multiparts are combined to object in complete_object_upload
@@ -433,7 +435,8 @@ class ObjectIO {
         ];
 
         await stream_utils.pipeline(transforms);
-        await stream_utils.wait_finished(uploader);
+        // Explicitly wait for finish as a defensive measure although pipeline should do it
+        await stream.promises.finished(uploader);
 
         if (splitter.md5) complete_params.md5_b64 = splitter.md5.toString('base64');
         if (splitter.sha256) complete_params.sha256_b64 = splitter.sha256.toString('base64');
@@ -487,7 +490,7 @@ class ObjectIO {
                 params.range.end = params.start;
                 complete_params.size += chunk.size;
                 complete_params.num_parts += 1;
-                dbg.log0('UPLOAD: part', { ...params.desc, start: part.start, end: part.end, seq: part.seq });
+                dbg.log1('UPLOAD: part', { ...params.desc, start: part.start, end: part.end, seq: part.seq });
 
                 if (chunk.size > config.MAX_OBJECT_PART_SIZE) {
                     throw new Error(`Chunk size=${chunk.size} exceeds ` +
@@ -497,7 +500,7 @@ class ObjectIO {
                 return chunk;
             });
 
-            /** 
+            /**
              * passing partial object info we have in this context which will be sent to block_stores
              * as block_md.mapping_info so it can be used for recovery in case the db is not available.
              * @type {Partial<nb.ObjectInfo>}
@@ -589,13 +592,19 @@ class ObjectIO {
                 reader.push(reader.pending.shift());
                 return;
             }
-            const io_sem_size = _get_io_semaphore_size(requested_size);
 
             // TODO we dont want to use requested_size as end, because we read entire chunks
             // and we are better off return the data to the stream buffer
             // instead of getting multiple calls from the stream with small slices to return.
 
             const requested_end = Math.min(params.end, reader.pos + requested_size);
+            if (requested_end <= reader.pos) {
+                dbg.log1(`READ reader finished. requested end is less than reader pos. requested_end=${requested_end} reader.pos=${reader.pos}`);
+                reader.push(null);
+                return;
+            }
+
+            const io_sem_size = _get_io_semaphore_size(requested_end - reader.pos);
             this._io_buffers_sem.surround_count(io_sem_size, async () => {
                 try {
                     const buffers = await this.read_object({
@@ -624,7 +633,7 @@ class ObjectIO {
                                 reader.pending.push(missing_buf);
                             }
                         }
-                        dbg.log0('READ reader pos', reader.pos);
+                        dbg.log1('READ reader pos', reader.pos);
                         reader.push(reader.pending.shift());
                     } else {
                         reader.push(null);

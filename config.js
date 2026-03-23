@@ -64,17 +64,23 @@ config.BUFFERS_MEM_LIMIT_MIN = 32 * 1024 * 1024; // just some workable minimum s
 config.BUFFERS_MEM_LIMIT_MAX = 4 * 1024 * 1024 * 1024;
 config.BUFFERS_MEM_LIMIT = Math.min(
     config.BUFFERS_MEM_LIMIT_MAX,
-    Math.max(Math.floor(config.CONTAINER_MEM_LIMIT / 4), config.BUFFERS_MEM_LIMIT_MIN,)
+    Math.max(Math.floor(config.CONTAINER_MEM_LIMIT / 4), config.BUFFERS_MEM_LIMIT_MIN)
 );
 
 ////////////////////////
 // CERTIFICATE CONFIG //
 ////////////////////////
 
-config.STS_SERVICE_CERT_PATH = '/etc/sts-secret';
 config.S3_SERVICE_CERT_PATH = '/etc/s3-secret';
+config.STS_SERVICE_CERT_PATH = '/etc/sts-secret';
+config.IAM_SERVICE_CERT_PATH = '/etc/iam-secret';
 config.MGMT_SERVICE_CERT_PATH = '/etc/mgmt-secret';
 config.EXTERNAL_DB_SERVICE_CERT_PATH = '/etc/external-db-secret';
+
+/////////////////
+// LDAP CONFIG //
+/////////////////
+config.LDAP_CONFIG_PATH = '/etc/noobaa-server/ldap_config';
 
 //////////////////
 // NODES CONFIG //
@@ -83,14 +89,19 @@ config.EXTERNAL_DB_SERVICE_CERT_PATH = '/etc/external-db-secret';
 // TODO take nodes min and free space reserve from system/pool config
 config.NODES_MIN_COUNT = 3;
 config.NODES_PER_CLOUD_POOL = 1;
-config.NODES_PER_MONGO_POOL = 1;
 // in kubernetes use reserve of 100MB instead of 10GB
 config.NODES_FREE_SPACE_RESERVE = 100 * (1024 ** 2);
 
 // don't use agents with less than reserve + 5 GB
 config.MINIMUM_AGENT_TOTAL_STORAGE = config.NODES_FREE_SPACE_RESERVE + (5 * (1024 ** 3));
 
-config.NODE_IO_DETENTION_DISABLE = false;
+
+// by default not disconnecting nodes on error. This caused more issues than benefits
+config.NODES_DISCONNECT_ON_ERROR = false;
+
+// by default not detaining nodes on io errors. This caused more issues than benefits
+config.NODE_IO_DETENTION_DISABLE = true;
+
 config.NODE_IO_DETENTION_THRESHOLD = 60 * 1000;
 config.NODE_IO_DETENTION_RECENT_ISSUES = 5;
 // Picked two because minimum of nodes per pool is three
@@ -104,7 +115,6 @@ config.AGENT_HEARTBEAT_GRACE_TIME = 10 * 60 * 1000; // grace period before an ag
 config.CLOUD_ALERT_GRACE_TIME = 3 * 60 * 1000; // grace period before dispatching alert on cloud node status
 config.AGENT_RESPONSE_TIMEOUT = 1 * 60 * 1000;
 config.AGENT_TEST_CONNECTION_TIMEOUT = 1 * 60 * 1000;
-config.STORE_PERF_TEST_INTERVAL = 60 * 60 * 1000; // perform test_store_perf every 1 hour
 config.CLOUD_MAX_ALLOWED_IO_TEST_ERRORS = 3;
 
 config.ENABLE_DEV_RANDOM_SEED = process.env.DISABLE_DEV_RANDOM_SEED === 'false' || false;
@@ -153,21 +163,20 @@ config.ENDPOINT_HTTP_SERVER_REQUEST_TIMEOUT = 300 * 1000;
 config.ENDPOINT_HTTP_SERVER_KEEPALIVE_TIMEOUT = 5 * 1000;
 config.ENDPOINT_HTTP_MAX_REQUESTS_PER_SOCKET = 0; // 0 = no limit
 
-// For now we enable fixed CORS for all buckets
-// but this should become a setting per bucket which is configurable
-// with the s3 put-bucket-cors api.
+// For now we enable fixed CORS only for sts
+// for S3 per bucket is configurabl with the s3 put-bucket-cors api.
 // note that browsers do not really allow origin=* with credentials,
 // but we just allow both from our side for simplicity.
 config.S3_CORS_ENABLED = true;
-config.S3_CORS_ALLOW_ORIGIN = '*';
+config.S3_CORS_DEFAULTS_ENABLED = true;
+config.S3_CORS_ALLOW_ORIGIN = ['*'];
 config.S3_CORS_ALLOW_CREDENTIAL = 'true';
 config.S3_CORS_ALLOW_METHODS = [
     'GET',
     'POST',
     'PUT',
     'DELETE',
-    'OPTIONS'
-].join(',');
+];
 config.S3_CORS_ALLOW_HEADERS = [
     'Content-Type',
     'Content-MD5',
@@ -178,14 +187,29 @@ config.S3_CORS_ALLOW_HEADERS = [
     'X-Amz-Content-Sha256',
     'amz-sdk-invocation-id',
     'amz-sdk-request',
-].join(',');
+];
 config.S3_CORS_EXPOSE_HEADERS = [
     'ETag',
     'X-Amz-Version-Id'
-].join(',');
+];
 config.STS_CORS_EXPOSE_HEADERS = 'ETag';
 
+/**
+ * Whether to return x-amz-expiration header based on the bucket lifecycle rules.
+ * Currently the bucket rules are not cached so this can cause a performance hit on object head/get/put,
+ * so we want to be able to disable this feature if needed.
+ */
+config.S3_LIFECYCLE_EXPIRATION_HEADER_ENABLED = true;
+
 config.DENY_UPLOAD_TO_STORAGE_CLASS_STANDARD = false;
+
+/**
+ * NSFS_GLACIER_FORCE_STORAGE_CLASS controls which storage
+ * class to be used if no storage class or `STANDARD` storage
+ * class is provided.
+ * @type {nb.StorageClass}
+ */
+config.NSFS_GLACIER_FORCE_STORAGE_CLASS = undefined;
 
 // S3_RESTORE_MAX_DAYS controls that for how many maximum number
 // of days an object can be restored using `restore-object` call.
@@ -197,6 +221,22 @@ config.S3_RESTORE_REQUEST_MAX_DAYS = 30;
  * @type {'DENY' | 'TRUNCATE'}
  */
 config.S3_RESTORE_REQUEST_MAX_DAYS_BEHAVIOUR = 'TRUNCATE';
+
+/**
+ * S3_MAX_KEY_LENGTH controls the maximum key length that will be accepted
+ * by NooBaa endpoints.
+ *
+ * This value is 1024 bytes for S3 but the default is `Infinity`
+ */
+config.S3_MAX_KEY_LENGTH = Infinity;
+
+/**
+ * S3_MAX_BUCKET_NAME_LENGTH controls the maximum bucket name length that
+ * will be accepted by NooBaa endpoints.
+ *
+ * This value is 63 bytes for S3 but the default is `Infinity`
+ */
+config.S3_MAX_BUCKET_NAME_LENGTH = Infinity;
 
 /////////////////////
 // SECRETS CONFIG  //
@@ -215,20 +255,28 @@ config.ROOT_KEY_MOUNT = '/etc/noobaa-server/root_keys';
 
 config.DB_TYPE = /** @type {nb.DBType} */ (process.env.DB_TYPE || 'postgres');
 
-config.POSTGRES_MAX_CLIENTS = (process.env.LOCAL_MD_SERVER === 'true') ? 80 : 10;
+config.POSTGRES_DEFAULT_MAX_CLIENTS = 10;
+config.POSTGRES_MD_MAX_CLIENTS = (process.env.LOCAL_MD_SERVER === 'true') ? 70 : 10;
+
+//whether to use read-only postgres replica cluster
+//ro host is set by operator in process.env.POSTGRES_HOST_RO
+config.POSTGRES_USE_READ_ONLY = true;
 
 ///////////////////
 // SYSTEM CONFIG //
 ///////////////////
 
-config.DEFAULT_POOL_TYPE = 'INTERNAL'; // use 'HOSTS' for setting up a pool of FS backingstores instead
+config.DEFAULT_POOL_TYPE = 'HOSTS'; // use 'HOSTS' for setting up a pool of FS backingstores instead
 config.DEFAULT_POOL_NAME = 'backingstores'; // only used when config.DEFAULT_POOL_TYPE = 'HOSTS'
 config.DEFAULT_BUCKET_NAME = 'first.bucket';
 config.INTERNAL_STORAGE_POOL_NAME = 'system-internal-storage-pool';
 // config.SPILLOVER_TIER_NAME = 'bucket-spillover-tier';
 config.ALLOW_BUCKET_CREATE_ON_INTERNAL = true;
 config.BUCKET_AUTOCONF_TIER2_ENABLED = false;
-
+config.SYSTEM_STORE_LOAD_CONCURRENCY = parseInt(process.env.SYSTEM_STORE_LOAD_CONCURRENCY, 10) || 5;
+// SYSTEM_STORE_SOURCE determines the preffered source for loading system_store data
+// This can be either "DB" to load from the DB or "CORE" to load from the system_server in noobaa-core
+config.SYSTEM_STORE_SOURCE = process.env.SYSTEM_STORE_SOURCE?.toUpperCase() || "DB";
 //////////////////////////
 // MD AGGREGATOR CONFIG //
 //////////////////////////
@@ -364,7 +412,7 @@ config.BUCKET_RECLAIMER_BATCH_DELAY = 100;
 config.BUCKET_RECLAIMER_ERROR_DELAY = 3000;
 
 config.OBJECT_RECLAIMER_ENABLED = true;
-config.OBJECT_RECLAIMER_EMPTY_DELAY = 30000;
+config.OBJECT_RECLAIMER_EMPTY_DELAY = 60 * 60 * 1000; // 1 hour delay
 config.OBJECT_RECLAIMER_BATCH_SIZE = 100;
 config.OBJECT_RECLAIMER_BATCH_DELAY = 100;
 config.OBJECT_RECLAIMER_ERROR_DELAY = 3000;
@@ -392,10 +440,13 @@ config.CHUNK_CODER_EC_PARITY_TYPE = 'cm256';
 config.CHUNK_CODER_EC_TOLERANCE_THRESHOLD = 2;
 config.CHUNK_CODER_EC_IS_DEFAULT = false;
 
+// DEDUP
+config.MIN_CHUNK_AGE_FOR_DEDUP = 60 * 60 * 1000; // 1 hour
+
 //////////////////////////
 // DEDUP INDEXER CONFIG //
 //////////////////////////
-config.DEDUP_INDEXER_ENABLED = true;
+config.DEDUP_INDEXER_ENABLED = false;
 config.DEDUP_INDEXER_BATCH_SIZE = 200;
 config.DEDUP_INDEXER_BATCH_DELAY = 1000;
 config.DEDUP_INDEXER_ERROR_DELAY = 10 * 1000;
@@ -474,7 +525,7 @@ config.DEBUG_MODE_PERIOD = 10 * 60 * 1000; // 10 minutes for increased debug lev
 config.dbg_log_level = 0;
 config.DEBUG_FACILITY = 'LOG_LOCAL0';
 config.EVENT_FACILITY = 'LOG_LOCAL2';
-config.EVENT_LOGGING_ENABLED = true;
+config.EVENT_LOGGING_ENABLED = false; // should be changed in NC NSFS configuration
 config.EVENT_LEVEL = 5;
 
 config.LOG_TO_STDERR_ENABLED = true;
@@ -484,6 +535,7 @@ config.LOG_COLOR_ENABLED = process.env.NOOBAA_LOG_COLOR ? process.env.NOOBAA_LOG
 
 // TEST Mode
 config.test_mode = false;
+config.allow_anonymous_access_in_test = false; // used for emulating ACL='public-read' for ceph-s3 tests
 
 // On Premise NVA params
 config.on_premise = {
@@ -574,6 +626,7 @@ config.WS_METRICS_SERVER_PORT = 7001;
 config.BG_METRICS_SERVER_PORT = 7002;
 config.HA_METRICS_SERVER_PORT = 7003;
 config.EP_METRICS_SERVER_PORT = 7004;
+config.EP_METRICS_SERVER_SSL_PORT = 9443;
 
 //////////////////////////////
 // OAUTH RELATES            //
@@ -615,8 +668,24 @@ config.REMOTE_NOOAA_NAMESPACE = `remote-${config.KUBE_APP_LABEL}`;
 ///////////////////////////////
 config.INLINE_MAX_SIZE = 4096;
 
+///////////////////////////////
+// CACHE (ACCOUNT, BUCKET)   //
+///////////////////////////////
+
 // Object SDK bucket cache expiration time
 config.OBJECT_SDK_BUCKET_CACHE_EXPIRY_MS = 60000;
+// Object SDK account cache expiration time
+config.OBJECT_SDK_ACCOUNT_CACHE_EXPIRY_MS = Number(process.env.ACCOUNTS_CACHE_EXPIRY) || 10 * 60 * 1000; // TODO: Decide on a time that we want to invalidate
+// Accountspace_fs account id cache expiration time
+config.ACCOUNTS_ID_CACHE_EXPIRY = 3 * 60 * 1000; // TODO: Decide on a time that we want to invalidate
+
+
+// Object SDK bucket_namespace_cache allow stat of the config file
+config.NC_ENABLE_BUCKET_NS_CACHE_STAT_VALIDATION = true;
+// Object SDK account_cache allow stat of the config file
+config.NC_ENABLE_ACCOUNT_CACHE_STAT_VALIDATION = true;
+// accountspace_fs allow stat of the config file
+config.NC_ENABLE_ACCOUNT_ID_CACHE_STAT_VALIDATION = true;
 
 //////////////////////////////
 // OPERATOR RELATED         //
@@ -671,6 +740,16 @@ config.PERSISTENT_BUCKET_LOG_DIR = process.env.GUARANTEED_LOGS_PATH;
 config.PERSISTENT_BUCKET_LOG_NS = 'bucket_logging';
 config.BUCKET_LOG_CONCURRENCY = 10;
 
+////////////////////////////////
+//      NOTIFICATIONS         //
+////////////////////////////////
+config.NOTIFICATION_CONNECT_DIR = process.env.NOTIFICATION_CONNECT_DIR || '/etc/notif_connect/';
+config.NOTIFICATION_LOG_NS = 'notification_logging';
+config.NOTIFICATION_LOG_DIR = process.env.NOTIFICATION_LOG_DIR;
+config.NOTIFICATION_BATCH = process.env.BATCH || 10;
+config.NOTIFICATION_REQ_PER_SPACE_CHECK = process.env.NOTIFICATION_REQ_PER_SPACE_CHECK || 0;
+config.NOTIFICATION_SPACE_CHECK_THRESHOLD = parseFloat(process.env.NOTIFICATION_SPACE_CHECK_THRESHOLD) || 0.2;
+
 ///////////////////////////
 //      KEY ROTATOR      //
 ///////////////////////////
@@ -710,28 +789,25 @@ config.NSFS_BUF_SIZE_XS = 4 * 1024;
 config.NSFS_BUF_SIZE_S = 64 * 1024;
 config.NSFS_BUF_SIZE_M = 1 * 1024 * 1024;
 config.NSFS_BUF_SIZE_L = 8 * 1024 * 1024;
+config.NSFS_BUF_SIZE_XL = 64 * 1024 * 1024;
 
 // This configs help calculate the number of small and XS buffers that will be created
 // The top number of buffers we want of the small and extra small sizes - 512 seems to be enough
 config.NSFS_WANTED_BUFFERS_NUMBER = 512;
-// The maximum size that the total XS buffers will take - as XS should be few kb 8M should be enough
-config.NSFS_MAX_MEM_SIZE_XS = 8 * 1024 * 1024;
-// The maximum size that the total small buffers will take - as S should be tens of kb 32M should be enough
-config.NSFS_MAX_MEM_SIZE_S = 32 * 1024 * 1024;
-
-// Semaphore size will give the amount of XS buffers that fits in 8MB up to 512 buffers
-config.NSFS_BUF_POOL_MEM_LIMIT_XS = Math.min(Math.floor(config.NSFS_MAX_MEM_SIZE_XS / config.NSFS_BUF_SIZE_XS),
-    config.NSFS_WANTED_BUFFERS_NUMBER) * config.NSFS_BUF_SIZE_XS;
-// Semaphore size will give the amount of small buffers that fits in 32MB up to 512 buffers
-config.NSFS_BUF_POOL_MEM_LIMIT_S = Math.min(Math.floor(config.NSFS_MAX_MEM_SIZE_S / config.NSFS_BUF_SIZE_S),
-    config.NSFS_WANTED_BUFFERS_NUMBER) * config.NSFS_BUF_SIZE_S;
-// Semaphore size will give 90% of remainning memory to large buffer size, 10% to medium
-config.NSFS_BUF_POOL_MEM_LIMIT_M = range_utils.align_down((config.BUFFERS_MEM_LIMIT -
-    config.NSFS_BUF_POOL_MEM_LIMIT_S - config.NSFS_BUF_POOL_MEM_LIMIT_XS) * 0.1,
-    config.NSFS_BUF_SIZE_M);
-config.NSFS_BUF_POOL_MEM_LIMIT_L = range_utils.align_down((config.BUFFERS_MEM_LIMIT -
-    config.NSFS_BUF_POOL_MEM_LIMIT_S - config.NSFS_BUF_POOL_MEM_LIMIT_XS) * 0.9,
-    config.NSFS_BUF_SIZE_L);
+// XS and S are small enough so we always allocate the max number of wanted buffers (overall ~34MB)
+config.NSFS_BUF_POOL_MEM_LIMIT_XS = config.NSFS_BUF_SIZE_XS * config.NSFS_WANTED_BUFFERS_NUMBER;
+config.NSFS_BUF_POOL_MEM_LIMIT_S = config.NSFS_BUF_SIZE_S * config.NSFS_WANTED_BUFFERS_NUMBER;
+const remaining_mem = Math.max(0, config.BUFFERS_MEM_LIMIT -
+    (config.NSFS_BUF_POOL_MEM_LIMIT_S + config.NSFS_BUF_POOL_MEM_LIMIT_XS));
+// M buffers get 10% of remaining memory, with 4GB mem and M size of 1MB this gives ~400 M buffers
+config.NSFS_BUF_POOL_MEM_LIMIT_M = range_utils.align_down(remaining_mem * 0.1, config.NSFS_BUF_SIZE_M);
+// L buffers share 90% of remaining memory, with 4GB mem and L size of 8MB this gives ~450 L buffers
+config.NSFS_BUF_POOL_MEM_LIMIT_L = range_utils.align_down(remaining_mem * 0.9, config.NSFS_BUF_SIZE_L);
+// XL buffers are treated as extension to the memory and will be allocated on top as needed,
+// however we will periodically release unused XL buffers back to the system
+config.NSFS_BUF_POOL_MEM_LIMIT_XL = config.NSFS_WANTED_BUFFERS_NUMBER * config.NSFS_BUF_SIZE_XL;
+// XL buffers not used in the last interval will be released back to the system (0 means disable)
+config.NSFS_BUF_POOL_XL_RELEASE_UNUSED_INTERVAL = 0;
 
 config.NSFS_BUF_WARMUP_SPARSE_FILE_READS = true;
 
@@ -759,6 +835,7 @@ config.NSFS_WARN_THRESHOLD_MS = 100;
 config.NSFS_CALCULATE_MD5 = false;
 config.NSFS_TRIGGER_FSYNC = true;
 config.NSFS_CHECK_BUCKET_BOUNDARIES = true;
+config.NSFS_CHECK_BUCKET_PATH_EXISTS = true;
 config.NSFS_REMOVE_PARTS_ON_COMPLETE = true;
 
 config.NSFS_BUF_POOL_WARNING_TIMEOUT = 2 * 60 * 1000;
@@ -773,6 +850,9 @@ config.NSFS_UPDATE_ISSUES_REPORT_ENABLED = true;
 
 config.NSFS_EXIT_EVENTS_TIME_FRAME_MIN = 24 * 60; // per day
 config.NSFS_MAX_EXIT_EVENTS_PER_TIME_FRAME = 10; // allow max 10 failed forks per day
+
+config.GPFS_DL_PATH = '/usr/lpp/mmfs/lib/libgpfs.so';
+config.NSFS_ENABLE_DYNAMIC_SUPPLEMENTAL_GROUPS = 'true';
 
 config.NSFS_GLACIER_LOGS_DIR = '/var/run/noobaa-nsfs/wal';
 config.NSFS_GLACIER_LOGS_POLL_INTERVAL = 10 * 1000;
@@ -822,6 +902,49 @@ config.NSFS_GLACIER_EXPIRY_TZ = 'LOCAL';
 // the request will be used
 config.NSFS_GLACIER_EXPIRY_TIME_OF_DAY = '';
 
+// If set to to true, NooBaa will attempt to read DMAPI
+// xattrs
+config.NSFS_GLACIER_DMAPI_ENABLE = false;
+
+// NSFS_GLACIER_DMAPI_IMPLICIT_RESTORE_STATUS if enabled then
+// NooBaa will derive restore status of the files based on DMAPI
+// xattr IF there are no explicit restore status attributes on
+// the file.
+config.NSFS_GLACIER_DMAPI_IMPLICIT_RESTORE_STATUS = false;
+
+// If set to true then NooBaa will consider DMAPI extended attributes
+// in conjuction with NooBaa's `user.storage_class` extended attribute
+// to determine state of an object.
+//
+// NOTE:NSFS_GLACIER_DMAPI_ENABLE should be enabled to use this.
+config.NSFS_GLACIER_DMAPI_IMPLICIT_SC = false;
+
+// NSFS_GLACIER_DMAPI_ALLOW_NOOBAA_TAKEOVER allows NooBaa to take over lifecycle
+// management of an object which was originally NOT managed by NooBaa.
+//
+// NOTE:NSFS_GLACIER_DMAPI_ENABLE and NSFS_GLACIER_USE_DMAPI should be enabled to use this.
+config.NSFS_GLACIER_DMAPI_ALLOW_NOOBAA_TAKEOVER = false;
+
+// NSFS_GLACIER_DMAPI_TPS_HTTP_HEADER_ENABLE if true will add additional HTTP headers
+// `config.NSFS_GLACIER_DMAPI_TPS_HTTP_HEADER` based on `dmapi.IBMTPS` EA.
+//
+// NOTE:NSFS_GLACIER_DMAPI_ENABLE should be enabled to use this.
+config.NSFS_GLACIER_DMAPI_TPS_HTTP_HEADER_ENABLE = false;
+config.NSFS_GLACIER_DMAPI_TPS_HTTP_HEADER = 'x-tape-meta-copy';
+
+// NSFS_GLACIER_DMAPI_PMIG_DAYS controls the "virtual"/fake expiry
+// days that will be shown if we detect a glacier object whose life-
+// cycle NSFS doesn't controls
+//
+// This is initialized to be the same as S3_RESTORE_REQUEST_MAX_DAYS
+// but can be overridden to any numberical value
+config.NSFS_GLACIER_DMAPI_PMIG_DAYS = config.S3_RESTORE_REQUEST_MAX_DAYS;
+
+// NSFS_GLACIER_DMAPI_FINALIZE_RESTORE_ENABLE if enabled will force NooBaa to
+// examine the DMAPI xattr of the file before finalizing the restore to prevent
+// accidental blocking reads from happening.
+config.NSFS_GLACIER_DMAPI_FINALIZE_RESTORE_ENABLE = false;
+
 config.NSFS_STATFS_CACHE_SIZE = 10000;
 config.NSFS_STATFS_CACHE_EXPIRY_MS = 1 * 1000;
 
@@ -850,8 +973,65 @@ config.NSFS_LOW_FREE_SPACE_MB_UNLEASH = 10 * 1024;
 // operations safely.
 config.NSFS_LOW_FREE_SPACE_PERCENT_UNLEASH = 0.10;
 
+// NSFS_GLACIER_GET_FORCE_EXPIRE if set to true then any restored item in the GLACIER
+// storage class will expire as soon as first GET request is received for it or
+// if the previous restore time has exceed, whichever is the earlier.
+config.NSFS_GLACIER_FORCE_EXPIRE_ON_GET = false;
+
+// NSFS_GLACIER_MIGRATE_LOG_THRESHOLD controls that how big the migration log file should be
+// Once this size is exceeded, migrate calls are supposed to kick in regardless of configured
+// interval
+config.NSFS_GLACIER_MIGRATE_LOG_THRESHOLD = 50 * 1024;
+
+// NSFS_GLACIER_METRICS_STAT_PATHS if set NooBaa will start reporting the statfs info of that
+// path as part of its metrics report
+config.NSFS_GLACIER_METRICS_STATFS_PATHS = [];
+config.NSFS_GLACIER_METRICS_STATFS_INTERVAL = 60 * 1000; // Refresh statfs value every minute
+
+/** 
+ * NSFS_GLACIER_RESERVED_BUCKET_TAGS defines an object of bucket tags which will be reserved
+ * by the system and PUT operations for them via S3 API would be limited - as in they would be
+ * mutable only if specified and only under certain conditions.
+ *
+ * @type {Record<string, {
+ *  schema: Record<any, any> & { $id: string },
+ *  immutable: true | false | 'if-data',
+ *  default: any,
+ *  event: boolean
+ * }>}
+ * 
+ * @example
+ * {
+    'deep-archive-copies': {
+        schema: {
+            $id: 'deep-archive-copies-schema-v0',
+            enum: ['1', '2']
+        }, // JSON Schema
+        immutable: 'if-data',
+        default: '1',
+        event: true
+    }
+ * }
+ */
+config.NSFS_GLACIER_RESERVED_BUCKET_TAGS = {};
+
+config.NSFS_LOGGER_LOCK_CHECK_INTERVAL = process.env.NODE_ENV === 'test' ? 10 : 1000;
+
 // anonymous account name
 config.ANONYMOUS_ACCOUNT_NAME = 'anonymous';
+
+config.NSFS_UPLOAD_STREAM_MEM_THRESHOLD = 8 * 1024 * 1024;
+config.NSFS_DOWNLOAD_STREAM_MEM_THRESHOLD = 8 * 1024 * 1024;
+
+// we want to change our handling related to EACCESS error
+config.NSFS_LIST_IGNORE_ENTRY_ON_EACCES = true;
+// we will for now handle the same way also EINVAL error - for gpfs stat issues on list (.snapshots)
+config.NSFS_LIST_IGNORE_ENTRY_ON_EINVAL = true;
+
+config.NSFS_CUSTOM_BUCKET_PATH_HTTP_HEADER = 'x-noobaa-custom-bucket-path';
+config.NSFS_CUSTOM_BUCKET_PATH_ALLOWED_LIST = ''; // colon separated list of paths prefixes
+
+config.NSFS_SPEEDOMETER_ENABLED = false;
 
 ////////////////////////////
 // NSFS NON CONTAINERIZED //
@@ -867,10 +1047,16 @@ config.NSFS_NC_CONFIG_DIR_BACKEND = '';
 config.NSFS_NC_STORAGE_BACKEND = '';
 config.ENDPOINT_PORT = Number(process.env.ENDPOINT_PORT) || 6001;
 config.ENDPOINT_SSL_PORT = Number(process.env.ENDPOINT_SSL_PORT) || 6443;
-config.ENDPOINT_SSL_STS_PORT = Number(process.env.ENDPOINT_SSL_STS_PORT) || -1;
-config.ENDPOINT_SSL_IAM_PORT = Number(process.env.ENDPOINT_SSL_IAM_PORT) || -1;
+// Remove the NSFS condition when NSFS starts to support STS.
+config.ENDPOINT_SSL_STS_PORT = Number(process.env.ENDPOINT_SSL_STS_PORT) || (process.env.NC_NSFS_NO_DB_ENV === 'true' ? -1 : 7443);
+// Remove the NC NSFS condition when NC NSFS starts to support IAM.
+config.ENDPOINT_SSL_IAM_PORT = Number(process.env.ENDPOINT_SSL_IAM_PORT) || (process.env.NC_NSFS_NO_DB_ENV === 'true' ? -1 : 13443);
+// each fork will get port in range [ENDPOINT_FORK_PORT_BASE, ENDPOINT_FORK_PORT_BASE + number of forks - 1)]
+config.ENDPOINT_FORK_PORT_BASE = Number(process.env.ENDPOINT_FORK_PORT_BASE) || 6002;
 config.ALLOW_HTTP = false;
-// config files should allow access to the owner of the files 
+config.ALLOW_HTTP_METRICS = true;
+config.ALLOW_HTTPS_METRICS = true;
+// config files should allow access to the owner of the files
 config.BASE_MODE_CONFIG_FILE = 0o600;
 config.BASE_MODE_CONFIG_DIR = 0o700;
 
@@ -879,6 +1065,8 @@ config.VIRTUAL_HOSTS = process.env.VIRTUAL_HOSTS || '';
 
 config.NC_HEALTH_ENDPOINT_RETRY_COUNT = 3;
 config.NC_HEALTH_ENDPOINT_RETRY_DELAY = 10;
+config.NC_FORK_SERVER_TIMEOUT = 5; // 5 minutes
+config.NC_FORK_SERVER_RETRIES = 10;
 
 
 /** @type {'file' | 'executable'} */
@@ -894,6 +1082,43 @@ config.NC_DISABLE_ACCESS_CHECK = false;
 config.NC_DISABLE_HEALTH_ACCESS_CHECK = false;
 config.NC_DISABLE_POSIX_MODE_ACCESS_CHECK = true;
 config.NC_DISABLE_SCHEMA_CHECK = false;
+
+config.ENTROPY_DISK_SIZE_THRESHOLD = 100 * 1024 * 1024;
+config.ENTROPY_MIN_THRESHOLD = 512;
+
+config.NC_HEALTH_BUCKETS_COUNT_LIMIT_WARNING = 5000;
+config.NC_HEALTH_ACCOUNTS_COUNT_LIMIT_WARNING = 5000;
+
+////////// NC LIFECYLE  //////////
+
+config.NC_LIFECYCLE_LOGS_DIR = '/var/log/noobaa/lifecycle';
+config.NC_LIFECYCLE_CONFIG_DIR_NAME = 'lifecycle';
+config.NC_LIFECYCLE_TIMEOUT_MS = 8 * 60 * 60 * 1000;
+
+// NC_LIFECYCLE_RUN_TIME must be of the format hh:mm which specifies
+// when NooBaa should allow running nc lifecycle process
+// NOTE: This will also be in the same timezone as specified in
+// NC_LIFECYCLE_TZ
+config.NC_LIFECYCLE_RUN_TIME = '00:00';
+
+// NC_LIFECYCLE_RUN_DELAY_LIMIT_MINS configures the delay
+// tolerance in minutes.
+//
+// eg. If the expiry run time is set to 00:00 and the tolerance is
+// set to be 2 mins then the expiry can trigger till 00:02 (unless
+// already triggered between 00:00 - 00:02
+config.NC_LIFECYCLE_RUN_DELAY_LIMIT_MINS = 2;
+
+/** @type {'UTC' | 'LOCAL'} */
+config.NC_LIFECYCLE_TZ = 'LOCAL';
+
+config.NC_LIFECYCLE_LIST_BATCH_SIZE = 1000;
+config.NC_LIFECYCLE_BUCKET_BATCH_SIZE = 10000;
+
+config.NC_LIFECYCLE_GPFS_ILM_ENABLED = true;
+config.NC_LIFECYCLE_GPFS_ALLOW_SCAN_ON_REMOTE = true;
+config.NC_GPFS_BIN_DIR = '/usr/lpp/mmfs/bin/';
+config.NC_LIFECYCLE_GPFS_MMAPPLY_ILM_POLICY_CONCURRENCY = 1;
 
 ////////// GPFS //////////
 config.GPFS_DOWN_DELAY = 1000;
@@ -948,6 +1173,44 @@ config.DEFAULT_REGION = 'us-east-1';
 /////////////////////////
 
 config.VACCUM_ANALYZER_INTERVAL = 86400000;
+
+config.NOOBAA_METRICS_AUTH_ENABLED = process.env.NOOBAA_METRICS_AUTH_ENABLED === 'true';
+config.NOOBAA_VERSION_AUTH_ENABLED = process.env.NOOBAA_VERSION_AUTH_ENABLED === 'true';
+
+//////////////
+///  RDMA  ///
+//////////////
+
+// rdma is not enabled by default
+config.S3_RDMA_ENABLED = false;
+// enable direct path of client RDMA to GPFS for zero copy,
+// requires RDMA to be enabled and GPFS library with zero copy support (auto-detected)
+config.S3_RDMA_GPFS_ZERO_COPY_ENABLED = false;
+
+/** @type {string[]} */
+config.S3_RDMA_SERVER_IPS = [];
+
+/** @type {'ERROR' | 'INFO' | 'DEBUG'} */
+config.S3_RDMA_LOG_LEVEL = 'INFO';
+config.S3_RDMA_USE_TELEMETRY = true;
+
+// Dynamic Connection key value used for RDMA secure communication. Default: 0xffeeddcc. Must match between client and server.
+config.S3_RDMA_DC_KEY = 0xffeeddcc;
+// Number of Dynamic Connection Interfaces (DCIs) - controls max concurrent connections. Default: 128
+config.S3_RDMA_NUM_DCIS = 128; // increase for higher concurrency
+// async events are false by default because thread pool provides better performance
+config.S3_RDMA_USE_ASYNC_EVENTS = false;
+
+// client request header that identifies the RDMA token type and the library used
+config.S3_RDMA_AGENT_HDR = 'x-amz-rdma-agent';
+config.S3_RDMA_AGENT_CUOBJ = 'cuobj';
+// client request header for the RDMA token
+config.S3_RDMA_TOKEN_HDR = 'x-amz-rdma-token';
+config.S3_RDMA_VALIDATE_TOKEN_HDR = true;
+// server response header for reply code (e.g. 200, 204, 206, 501) 
+config.S3_RDMA_REPLY_HDR = 'x-amz-rdma-reply';
+// server response header for number of bytes transferred
+config.S3_RDMA_BYTES_HDR = 'x-amz-rdma-bytes-transferred';
 
 /////////////////////
 //                 //
@@ -1053,10 +1316,23 @@ function _get_config_root() {
 }
 
 /**
- * validate_nc_master_keys_config validates the following - 
+ * go over the config object and set the relevant configurations as environment variables
+ */
+function _set_nc_config_to_env() {
+    const config_to_env = ['NOOBAA_LOG_LEVEL', 'UV_THREADPOOL_SIZE', 'GPFS_DL_PATH', 'NSFS_ENABLE_DYNAMIC_SUPPLEMENTAL_GROUPS'];
+    for (const configuration_key of config_to_env) {
+        if (config && Object.keys(config).includes(configuration_key) && config[configuration_key] !== undefined) {
+            console.warn('setting configuration_key as env var', configuration_key, config[configuration_key]);
+            process.env[configuration_key] = config[configuration_key];
+        }
+    }
+}
+
+/**
+ * validate_nc_master_keys_config validates the following -
  * 1. if type is file -
  *    1.1. no GET/PUT executables provided
- * 2. if type is executable - 
+ * 2. if type is executable -
  *    2.1. no file location provided
  *    2.2. GET & PUT executables exist and executables
  */
@@ -1101,22 +1377,18 @@ function load_nsfs_nc_config() {
         const merged_config = _.merge(shared_config, node_config || {});
 
         Object.keys(merged_config).forEach(function(key) {
-            const config_to_env = ['NOOBAA_LOG_LEVEL', 'UV_THREADPOOL_SIZE', 'GPFS_DL_PATH'];
-            if (config_to_env.includes(key)) {
-                process.env[key] = merged_config[key];
-                return;
-            }
             config[key] = merged_config[key];
         });
         console.warn(`nsfs: config_dir_path=${config.NSFS_NC_CONF_DIR}`);
         console.warn(`nsfs: config.json= ${util.inspect(config_data)}`);
         console.warn(`nsfs: merged config.json= ${util.inspect(merged_config)}`);
         validate_nc_master_keys_config(config);
-        config.event_emitter.emit("config_updated");
+        config.event_emitter.emit('config_updated');
     } catch (err) {
         if (err.code !== 'MODULE_NOT_FOUND' && err.code !== 'ENOENT') throw err;
         console.warn('config.load_nsfs_nc_config could not find config.json... skipping');
     }
+    _set_nc_config_to_env();
 }
 /**
  * reload_nsfs_nc_config reloads on non containerized env the config.json file every 10 seconfs

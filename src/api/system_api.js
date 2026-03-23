@@ -459,6 +459,19 @@ module.exports = {
             auth: {
                 system: 'admin'
             }
+        },
+
+        get_system_store: {
+            method: 'GET',
+            reply: {
+                type: 'object',
+                properties: {
+                    // [RPC_BUFFERS].data
+                },
+            },
+            auth: {
+                system: false
+            }
         }
     },
 
@@ -551,12 +564,6 @@ module.exports = {
                     type: 'array',
                     items: {
                         $ref: 'account_api#/definitions/account_info'
-                    }
-                },
-                functions: {
-                    type: 'array',
-                    items: {
-                        $ref: 'func_api#/definitions/func_info'
                     }
                 },
                 objects: {

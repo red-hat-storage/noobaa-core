@@ -81,10 +81,14 @@ module.exports = {
                 properties: {
                     uid: { type: 'number' },
                     gid: { type: 'number' },
+                    supplemental_groups: {
+                        $ref: 'common_api#/definitions/supplemental_groups'
+                    },
                     new_buckets_path: { type: 'string' },
                     fs_backend: {
                         $ref: 'common_api#/definitions/fs_backend'
-                    }
+                    },
+                    custom_bucket_path_allowed_list: { type: 'string' },
                 }
             }, {
                 type: 'object',
@@ -94,9 +98,13 @@ module.exports = {
                     new_buckets_path: { type: 'string' },
                     fs_backend: {
                         $ref: 'common_api#/definitions/fs_backend'
-                    }
+                    },
+                    custom_bucket_path_allowed_list: { type: 'string' },
                 }
             }]
         },
+        default_connection: {
+            type: 'string'
+        }
     }
 };

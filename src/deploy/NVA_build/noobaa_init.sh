@@ -4,7 +4,6 @@ RUN_INIT=${1}
 NOOBAA_SUPERVISOR="/data/noobaa_supervisor.conf"
 NOOBAA_DATA_VERSION="/data/noobaa_version"
 NOOBAA_PACKAGE_PATH="/root/node_modules/noobaa-core/package.json"
-KUBE_PV_CHOWN="/noobaa_init_files/kube_pv_chown"
 
 update_services_autostart() {
   local programs=(webserver bg_workers hosted_agents s3rver)
@@ -123,16 +122,24 @@ run_internal_process() {
 
 prepare_agent_conf() {
   AGENT_CONF_FILE="/noobaa_storage/agent_conf.json"
-  if [ -z ${AGENT_CONFIG} ]
-  then
-    echo "AGENT_CONFIG is required ENV variable. AGENT_CONFIG is missing. Exit"
+
+  [ -f "$AGENT_CONF_FILE" ] && return 0
+
+  # get AGENT_CONFIG from env var or file
+  AGENT_CONFIG_PATH=${AGENT_CONFIG_PATH:-"/etc/agent-config/agent_config"}
+  AGENT_CONFIG=${AGENT_CONFIG:-$(cat "$AGENT_CONFIG_PATH" 2>/dev/null || echo "")}
+
+  if [ -z "${AGENT_CONFIG}" ]; then
+    echo "AGENT_CONFIG is required. AGENT_CONFIG is not found in env or $AGENT_CONFIG_PATH. Exit"
     exit 1
-  else
-    echo "Got base64 agent_conf: ${AGENT_CONFIG}"
-    if [ ! -f $AGENT_CONF_FILE ]; then
-      openssl enc -base64 -d -A <<<${AGENT_CONFIG} >${AGENT_CONF_FILE}
-    fi
-    echo "Written agent_conf.json: $(cat ${AGENT_CONF_FILE})"
+  fi
+
+  # write agent config - decode base64 if not a valid JSON format
+  if ! echo "${AGENT_CONFIG}" | jq . >"$AGENT_CONF_FILE" 2>/dev/null; then
+    openssl enc -base64 -d -A <<<"${AGENT_CONFIG}" >"$AGENT_CONF_FILE" || {
+      echo "AGENT_CONFIG format is invalid. AGENT_CONFIG must be valid JSON or base64 encoded JSON. Exit"
+      exit 1
+    }
   fi
 }
 
@@ -143,37 +150,13 @@ prepare_server_pvs() {
 }
 
 prepare_mongo_pv() {
-  local main_dir="/mongo_data"
   local shard_dir="/mongo_data/mongo/cluster/shard1"
-  local recursive_file="/mongo_data/recursive_file"
-  local dir_id=$(stat -c '%u' ${main_dir})
-  local current_id=$(id -u)
-
-  # change ownership and permissions of mongo db path
-  if [ "${dir_id}" != "${current_id}" ] || [ ! -f ${recursive_file} ]; then
-    echo "uid change has been identified - will change from uid: ${dir_id} to new uid: ${current_id}"
-    time ${KUBE_PV_CHOWN} mongo ${current_id}
-    touch ${recursive_file}
-  fi
 
   if [ ! -d ${shard_dir} ]; then
     echo "creating shard directory: ${shard_dir}" 
     mkdir -p ${shard_dir}
     chgrp 0 ${shard_dir}
     chmod g=u ${shard_dir}
-  fi
-}
-
-prepare_postgres_pv() {
-  local dir="/var/lib/pgsql"
-  local dir_id=$(stat -c '%u' ${dir})    
-  local current_id=$(id -u)
-
-  # change ownership and permissions of mongo db path
-  if [ "${dir_id}" != "${current_id}" ]
-  then
-    echo "uid change has been identified - will change from uid: ${dir_id} to new uid: ${current_id}"
-    time ${KUBE_PV_CHOWN} postgres ${current_id}
   fi
 }
 
@@ -200,28 +183,9 @@ init_noobaa_server() {
 init_noobaa_agent() {
   fix_non_root_user
 
-  local dir="/noobaa_storage"
-  mkdir -p ${dir}
-  local dir_id=$(stat -c '%u' ${dir})    
-  local current_id=$(id -u)
-
-  # change ownership and permissions of noobaa_storage path
-  if [ "${dir_id}" != "${current_id}" ]
-  then
-    echo "uid change has been identified - will change from uid: ${dir_id} to new uid: ${current_id}"
-    time ${KUBE_PV_CHOWN} agent ${current_id}
-  fi
-
   cd /root/node_modules/noobaa-core/
   prepare_agent_conf
   run_internal_process node --unhandled-rejections=warn ./src/agent/agent_cli
-}
-
-migrate_dbs() {
-  fix_non_root_user
-  
-  cd /root/node_modules/noobaa-core/
-  /usr/local/bin/node --unhandled-rejections=warn src/upgrade/migration_to_postgres.js
 }
 
 if [ "${RUN_INIT}" == "agent" ]
@@ -230,12 +194,6 @@ then
 elif [ "${RUN_INIT}" == "init_mongo" ]
 then
   prepare_mongo_pv
-elif [ "${RUN_INIT}" == "init_postgres" ]
-then
-  prepare_postgres_pv
-elif [ "${RUN_INIT}" == "db_migrate" ]
-then
-  migrate_dbs
 elif [ "${RUN_INIT}" == "init_endpoint" ]
 then
   init_endpoint

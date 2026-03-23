@@ -1,7 +1,7 @@
 /* Copyright (C) 2016 NooBaa */
 'use strict';
 
-const { v4: uuid } = require('uuid');
+const crypto = require('crypto');
 const path = require('path');
 const util = require('util');
 const fs = require('fs');
@@ -62,7 +62,7 @@ class HostedAgents {
     reload() {
         // start agents for all existing cloud pools
         const agents_to_start = system_store.data.pools.filter(pool =>
-            (!_.isUndefined(pool.cloud_pool_info) || !_.isUndefined(pool.mongo_pool_info))
+            (!_.isUndefined(pool.cloud_pool_info))
         );
         dbg.log0(`will start agents for these pools: ${util.inspect(agents_to_start)}`);
         return P.map(agents_to_start, pool => this._start_pool_agent(pool));
@@ -79,8 +79,9 @@ class HostedAgents {
     }
 
 
-    _monitor_stats() {
-        P.pwhile(() => true, () => {
+    async _monitor_stats() {
+        /* eslint-disable no-constant-condition */
+        while (true) {
             const cpu_usage = process.cpuUsage(this.cpu_usage); //usage since last sample
             const mem_usage = process.memoryUsage();
             dbg.log0(`hosted_agent_stats_titles - process: cpu_usage_user, cpu_usage_sys, mem_usage_rss`);
@@ -94,11 +95,9 @@ class HostedAgents {
                 }
             }
             this.cpu_usage = cpu_usage;
-            return P.delay(60000);
-        });
+            await P.delay(60000);
+        }
     }
-
-
 
     async _start_pool_agent(pool) {
         if (!this._started) return;
@@ -115,8 +114,7 @@ class HostedAgents {
 
         const host_id = config.HOSTED_AGENTS_HOST_ID + pool_id;
         const storage_path = path.join(process.cwd(), 'noobaa_storage', node_name);
-        const pool_property_path = pool.resource_type === 'INTERNAL' ?
-            'mongo_pool_info.agent_info.mongo_path' : 'cloud_pool_info.agent_info.cloud_path';
+        const pool_property_path = 'cloud_pool_info.agent_info.cloud_path';
         const pool_path = _.get(pool, pool_property_path, `noobaa_blocks/${pool_id}`);
         const pool_path_property = pool.resource_type === 'INTERNAL' ? 'mongo_path' : 'cloud_path';
         const pool_info_property = pool.resource_type === 'INTERNAL' ? 'mongo_info' : 'cloud_info';
@@ -132,12 +130,10 @@ class HostedAgents {
             role: 'create_node'
         });
         const { token_wrapper, create_node_token_wrapper } = _get_pool_token_wrapper(pool);
-        const info = pool.resource_type === 'INTERNAL' ?
-            pool.mongo_pool_info : pool.cloud_pool_info;
+        const info = pool.cloud_pool_info;
         if (!info.agent_info || !info.agent_info.create_node_token) {
             const existing_token = info.agent_info ? info.agent_info.node_token : null;
-            const pool_agent_path = pool.resource_type === 'INTERNAL' ?
-                'mongo_pool_info' : 'cloud_pool_info';
+            const pool_agent_path = 'cloud_pool_info';
             const update = {
                 pools: [{
                     _id: pool._id,
@@ -197,7 +193,7 @@ class HostedAgents {
     start_local_agent(params) {
         if (!this._started) return;
 
-        const host_id = uuid();
+        const host_id = crypto.randomUUID();
         const node_name = 'noobaa-internal-agent-' + params.name;
         const storage_path = path.join(process.cwd(), 'noobaa_storage', node_name);
 
@@ -378,8 +374,7 @@ function _get_pool_and_path_for_token(token_pool) {
     const sys = system_store.data.systems[0];
     const pool = sys.pools_by_name[token_pool.name];
     if (!pool) throw new Error(`Pool ${token_pool.name}, ${token_pool._id} does not exist`);
-    const pool_property_path = pool.resource_type === 'INTERNAL' ?
-        'mongo_pool_info.agent_info' : 'cloud_pool_info.agent_info';
+    const pool_property_path = 'cloud_pool_info.agent_info';
     return {
         pool_property_path,
         pool

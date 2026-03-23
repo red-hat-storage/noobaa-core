@@ -3,7 +3,7 @@
 
 const _ = require('lodash');
 const util = require('util');
-const Semaphore = require('./semaphore');
+const semaphore = require('./semaphore');
 
 require('setimmediate'); // shim for the browser
 
@@ -50,7 +50,7 @@ async function map(arr, func) {
  * @returns {Promise<Array<V>>}
  */
 async function map_with_concurrency(concurrency, arr, func) {
-    const sem = new Semaphore(concurrency);
+    const sem = new semaphore.Semaphore(concurrency);
     return Promise.all(arr.map(async (key, index) => sem.surround(async () => func(key, index))));
 }
 
@@ -210,56 +210,6 @@ async function retry({ attempts, delay_ms, func, error_logger }) {
 /////////////////////////////////////
 
 /**
- * @deprecated LEGACY PROMISE UTILS - DEPRECATED IN FAVOR OF ASYNC-AWAIT
- */
-class Defer {
-
-    constructor() {
-        this.isPending = true;
-        this.isResolved = false;
-        this.isRejected = false;
-        this.promise = new Promise((resolve, reject) => {
-            this._promise_resolve = resolve;
-            this._promise_reject = reject;
-        });
-        Object.seal(this);
-    }
-
-    // setting resolve and reject to assert that the current code assumes 
-    // the Promise ctor is calling the callback synchronously and not deferring it,
-    // otherwise we might have weird cases that we miss the caller's resolve/reject
-    // events, so we throw to assert 
-
-    /**
-     * @param {any} [res]
-     * @returns {void}
-     */
-    resolve(res) {
-        if (!this.isPending) {
-            return;
-        }
-        this.isPending = false;
-        this.isResolved = true;
-        Object.freeze(this);
-        this._promise_resolve(res);
-    }
-
-    /**
-     * @param {Error} err
-     * @returns {void}
-     */
-    reject(err) {
-        if (!this.isPending) {
-            return;
-        }
-        this.isPending = false;
-        this.isRejected = true;
-        Object.freeze(this);
-        this._promise_reject(err);
-    }
-}
-
-/**
  * Callback is a template typedef to help propagate types correctly
  * when using nodejs callback functions.
  * @template T
@@ -310,18 +260,6 @@ async function fromCallback(receiver) {
     });
 }
 
-
-/**
- * @deprecated LEGACY PROMISE UTILS - DEPRECATED IN FAVOR OF ASYNC-AWAIT
- * @param {() => boolean} condition 
- * @param {() => Promise} body 
- */
-async function pwhile(condition, body) {
-    while (condition()) {
-        await body();
-    }
-}
-
 /**
  * Wait until an async condition is met.
  * @deprecated LEGACY PROMISE UTILS - DEPRECATED IN FAVOR OF ASYNC-AWAIT
@@ -358,13 +296,13 @@ exports.timeout = timeout;
 exports.TimeoutError = TimeoutError;
 exports.retry = retry;
 // should we deprecated usage of P.resolve/reject/all ?
-exports.resolve = val => Promise.resolve(val);
-exports.reject = err => Promise.reject(err);
+// we should probably keep all and remove resolve/reject
+// when resolve/reject are used, it is probably better to use async/await
+exports.resolve = val => Promise.resolve(val); // 178 occurrences
+exports.reject = err => Promise.reject(err); // 3 occurrences
 exports.all = arr => Promise.all(arr);
 // deprecated
-exports.fromCallback = fromCallback; // 44 occurrences
-exports.fcall = fcall; // 59 occurrences
-exports.ninvoke = ninvoke; // 30 occurrences
-exports.wait_until = wait_until; // 20 occurrences
-exports.Defer = Defer; // 13 occurrences
-exports.pwhile = pwhile; // 15 occurrences
+exports.fromCallback = fromCallback; // 28 occurrences
+exports.fcall = fcall; // 51 occurrences
+exports.ninvoke = ninvoke; // 26 occurrences
+exports.wait_until = wait_until; // 21 occurrences

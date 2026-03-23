@@ -33,6 +33,7 @@ module.exports = {
                     },
                     bucket_claim: { $ref: '#/definitions/bucket_claim' },
                     force_md5_etag: { type: 'boolean' },
+                    custom_bucket_path: { type: 'string' }
                 }
             },
             reply: {
@@ -300,6 +301,59 @@ module.exports = {
             }
         },
 
+        get_bucket_notification: {
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: [
+                    'name'
+                ],
+                properties: {
+                    name: { $ref: 'common_api#/definitions/bucket_name' },
+                }
+            },
+            reply: {
+                type: 'object',
+                required: [
+                    'notifications'
+                ],
+                properties: {
+                    notifications: {
+                        type: 'array',
+                        items: {
+                            $ref: 'common_api#/definitions/bucket_notification'
+                        }
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        put_bucket_notification: {
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: [
+                    'notifications',
+                    'name',
+                ],
+                properties: {
+                    name: { $ref: 'common_api#/definitions/bucket_name' },
+                    notifications: {
+                        type: 'array',
+                        items: {
+                            $ref: 'common_api#/definitions/bucket_notification'
+                        }
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user'],
+            }
+        },
+
         read_bucket_sdk_info: {
             method: 'GET',
             params: {
@@ -388,6 +442,17 @@ module.exports = {
 
         list_buckets: {
             method: 'GET',
+            params: {
+                type: 'object',
+                properties: {
+                    continuation_token: { $ref: 'common_api#/definitions/continuation_token' },
+                    max_buckets: {
+                        type: 'integer',
+                        minimum: 1,
+                        maximum: 1000
+                    }
+                }
+            },
             reply: {
                 type: 'object',
                 required: ['buckets'],
@@ -401,10 +466,11 @@ module.exports = {
                                 name: { $ref: 'common_api#/definitions/bucket_name' },
                                 creation_date: {
                                     idate: true
-                                },
+                                }
                             }
                         }
-                    }
+                    },
+                    continuation_token: { $ref: 'common_api#/definitions/continuation_token' }
                 }
             },
             auth: {
@@ -621,43 +687,6 @@ module.exports = {
             }
         },
 
-        add_bucket_lambda_trigger: {
-            method: 'PUT',
-            params: {
-                $ref: '#/definitions/new_lambda_trigger'
-            },
-            auth: {
-                system: 'admin'
-            }
-        },
-
-        delete_bucket_lambda_trigger: {
-            method: 'DELETE',
-            required: ['id', 'bucket_name'],
-            params: {
-                type: 'object',
-                properties: {
-                    id: {
-                        objectid: true
-                    },
-                    bucket_name: { $ref: 'common_api#/definitions/bucket_name' },
-                }
-            },
-            auth: {
-                system: 'admin'
-            }
-        },
-
-        update_bucket_lambda_trigger: {
-            method: 'PUT',
-            params: {
-                $ref: '#/definitions/update_lambda_trigger'
-            },
-            auth: {
-                system: 'admin'
-            }
-        },
-
         update_all_buckets_default_pool: {
             method: 'PUT',
             params: {
@@ -820,6 +849,124 @@ module.exports = {
                 }, {
                     type: 'null'
                 }]
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        get_bucket_cors: {
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: ['name'],
+                properties: {
+                    name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                },
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    cors: {
+                        $ref: 'common_api#/definitions/bucket_cors_configuration'
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        put_bucket_cors: {
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: ['name', 'cors_rules'],
+                properties: {
+                    name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                    cors_rules: {
+                        $ref: 'common_api#/definitions/bucket_cors_configuration'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        delete_bucket_cors: {
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: ['name'],
+                properties: {
+                    name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        get_public_access_block: {
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: ['bucket_name'],
+                properties: {
+                    bucket_name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    }
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    public_access_block: {
+                        $ref: 'common_api#/definitions/public_access_block'
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        put_public_access_block: {
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: ['bucket_name', 'public_access_block'],
+                properties: {
+                    bucket_name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                    public_access_block: {
+                        $ref: 'common_api#/definitions/public_access_block'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        delete_public_access_block: {
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: ['bucket_name'],
+                properties: {
+                    bucket_name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                },
             },
             auth: {
                 system: ['admin', 'user']
@@ -1013,12 +1160,6 @@ module.exports = {
                 undeletable: {
                     $ref: '#/definitions/undeletable_bucket_reason'
                 },
-                triggers: {
-                    type: 'array',
-                    items: {
-                        $ref: '#/definitions/lambda_trigger_info'
-                    }
-                },
                 tagging: {
                     $ref: 'common_api#/definitions/tagging'
                 },
@@ -1066,6 +1207,9 @@ module.exports = {
                 },
                 bucket_owner: {
                     $ref: 'common_api#/definitions/email'
+                },
+                bucket_owner_id: {
+                    type: 'string'
                 },
                 website: {
                     $ref: 'common_api#/definitions/bucket_website'
@@ -1130,6 +1274,18 @@ module.exports = {
                 bucket_info: {
                     $ref: '#/definitions/bucket_info'
                 },
+                notifications: {
+                    type: 'array',
+                    items: {
+                        $ref: 'common_api#/definitions/bucket_notification'
+                    }
+                },
+                cors_configuration_rules: {
+                    $ref: 'common_api#/definitions/bucket_cors_configuration',
+                },
+                public_access_block: {
+                    $ref: 'common_api#/definitions/public_access_block',
+                }
             }
         },
 
@@ -1182,7 +1338,7 @@ module.exports = {
                     type: 'string',
                     enum: [
                         'QUOTA_NOT_SET',
-                        'APPROUCHING_QUOTA',
+                        'APPROACHING_QUOTA',
                         'EXCEEDING_QUOTA',
                         'OPTIMAL'
                     ]
@@ -1192,105 +1348,6 @@ module.exports = {
         undeletable_bucket_reason: {
             enum: ['NOT_EMPTY'],
             type: 'string',
-        },
-
-
-        new_lambda_trigger: {
-            type: 'object',
-            required: ['bucket_name', 'event_name', 'func_name'],
-            properties: {
-                bucket_name: { $ref: 'common_api#/definitions/bucket_name' },
-                event_name: {
-                    $ref: 'common_api#/definitions/bucket_trigger_event'
-                },
-                func_name: {
-                    type: 'string'
-                },
-                func_version: {
-                    type: 'string'
-                },
-                enabled: {
-                    type: 'boolean',
-                },
-                object_prefix: {
-                    type: 'string'
-                },
-                object_suffix: {
-                    type: 'string'
-                },
-                attempts: {
-                    type: 'integer'
-                },
-            }
-        },
-
-        update_lambda_trigger: {
-            type: 'object',
-            required: ['id'],
-            properties: {
-                id: {
-                    objectid: true
-                },
-                bucket_name: { $ref: 'common_api#/definitions/bucket_name' },
-                event_name: {
-                    $ref: 'common_api#/definitions/bucket_trigger_event'
-                },
-                func_name: {
-                    type: 'string'
-                },
-                func_version: {
-                    type: 'string'
-                },
-                enabled: {
-                    type: 'boolean',
-                },
-                object_prefix: {
-                    type: 'string'
-                },
-                object_suffix: {
-                    type: 'string'
-                },
-                attempts: {
-                    type: 'integer'
-                },
-            }
-        },
-
-        lambda_trigger_info: {
-            type: 'object',
-            required: ['id', 'event_name', 'func_name'],
-            properties: {
-                id: {
-                    objectid: true
-                },
-                event_name: {
-                    $ref: 'common_api#/definitions/bucket_trigger_event'
-                },
-                func_name: {
-                    type: 'string'
-                },
-                func_version: {
-                    type: 'string'
-                },
-                enabled: {
-                    type: 'boolean',
-                },
-                permission_problem: {
-                    type: 'boolean',
-                },
-                last_run: {
-                    idate: true
-                },
-                object_prefix: {
-                    type: 'string'
-                },
-                object_suffix: {
-                    type: 'string'
-                },
-                attempts: {
-                    type: 'integer'
-                },
-            }
         },
         object_lock_configuration: {
             type: 'object',

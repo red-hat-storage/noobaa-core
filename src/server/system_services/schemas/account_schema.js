@@ -25,9 +25,20 @@ module.exports = {
 
         // password login
         has_login: { type: 'boolean' },
-        password: { wrapper: SensitiveString }, // bcrypted password
-        next_password_change: { date: true },
-
+        password: { wrapper: SensitiveString }, // bcrypted password - DEPRECATED
+        next_password_change: { date: true }, // DEPRECATED
+        owner: { objectid: true },
+        tagging: {
+            $ref: 'common_api#/definitions/tagging',
+        },
+        iam_path: { type: 'string' },
+        iam_user_policies: {
+            type: 'array',
+            items: {
+                $ref: 'common_api#/definitions/iam_user_policy',
+            }
+        },
+        creation_date: { idate: true },
         // default policy for new buckets
         default_resource: { objectid: true },
         default_chunk_config: { objectid: true },
@@ -42,6 +53,8 @@ module.exports = {
                 properties: {
                     access_key: { $ref: 'common_api#/definitions/access_key' },
                     secret_key: { $ref: 'common_api#/definitions/secret_key' },
+                    deactivated: { type: 'boolean' },
+                    creation_date: { idate: true },
                 }
             }
         },

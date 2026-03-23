@@ -117,6 +117,25 @@ class AccountSDK {
         return accountspace.list_users(params, this);
     }
 
+    ////////////
+    // TAGS   //
+    ////////////
+
+    async tag_user(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.tag_user(params, this);
+    }
+
+    async untag_user(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.untag_user(params, this);
+    }
+
+    async list_user_tags(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.list_user_tags(params, this);
+    }
+
     ////////////////
     // ACCESS KEY //
     ////////////////
@@ -145,6 +164,31 @@ class AccountSDK {
         const accountspace = this._get_accountspace();
         return accountspace.list_access_keys(params, this);
     }
+
+    /////////////////
+    // USER POLICY //
+    /////////////////
+
+    async put_user_policy(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.put_user_policy(params, this);
+    }
+
+    async get_user_policy(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.get_user_policy(params, this);
+    }
+
+    async delete_user_policy(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.delete_user_policy(params, this);
+    }
+
+    async list_user_policies(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.list_user_policies(params, this);
+    }
+
 }
 
 // EXPORTS

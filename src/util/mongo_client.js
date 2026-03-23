@@ -33,9 +33,8 @@ class MongoCollection {
         MongoCollection.implements_interface(this);
         this.schema = col.schema;
         this.name = col.name;
-        this.db_indexes = col.db_indexes;
+        this.db_indexes = col.db_indexes?.filter(index => !index?.options?.postgres_only);
         this.mongo_client = mongo_client;
-
     }
 
     /**
@@ -46,9 +45,9 @@ class MongoCollection {
     }
 
     /**
-     * 
-     * @param {object} doc 
-     * @param {'warn'} [warn] 
+     *
+     * @param {object} doc
+     * @param {'warn'} [warn]
      */
     validate(doc, warn) {
         if (this.schema) {
@@ -74,6 +73,17 @@ class MongoCollection {
     async estimatedDocumentCount(options = {}) { return this._get_mongo_col().estimatedDocumentCount(options); }
     async estimatedQueryCount(query) { return this._get_mongo_col().countDocuments(query); }
     async stats() { return this._get_mongo_col().stats(); }
+
+    /**
+     * 
+     * @param {*} query 
+     * @param {*} params 
+     * @param {*} options 
+     * @returns {Promise<any>}
+     */
+    async executeSQL(query, params, options) {
+        throw new Error("NOT SUPPORTED");
+    }
 }
 
 class MongoSequence {
@@ -553,7 +563,7 @@ class MongoClient extends EventEmitter {
     }
 
     /**
-     * 
+     *
      * @returns {nb.DBCollection}
      */
     define_collection(col) {
@@ -585,7 +595,7 @@ class MongoClient extends EventEmitter {
     }
 
     /**
-     * 
+     *
      * @returns {nb.DBCollection}
      */
     collection(col_name) {
@@ -944,7 +954,6 @@ class MongoClient extends EventEmitter {
         clearTimeout(this.connect_timeout);
         this.connect_timeout = null;
     }
-
 }
 
 MongoClient._instance = undefined;

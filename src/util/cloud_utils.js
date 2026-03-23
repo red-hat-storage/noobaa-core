@@ -9,6 +9,10 @@ const AWS = require('aws-sdk');
 const url = require('url');
 const _ = require('lodash');
 const SensitiveString = require('./sensitive_string');
+const { STSClient, AssumeRoleWithWebIdentityCommand } = require('@aws-sdk/client-sts');
+const { NodeHttpHandler } = require('@smithy/node-http-handler');
+const config = require('../../config');
+const noobaa_s3_client = require('../sdk/noobaa_s3_client/noobaa_s3_client');
 
 const projectedServiceAccountToken = "/var/run/secrets/openshift/serviceaccount/token";
 const defaultRoleSessionName = 'default_noobaa_s3_ops';
@@ -26,39 +30,43 @@ function find_cloud_connection(account, conn_name) {
     return conn;
 }
 
-async function createSTSS3Client(params, additionalParams) {
-    const creds = await generate_aws_sts_creds(params, additionalParams.RoleSessionName);
-    return new AWS.S3({
+async function createSTSS3SDKv3Client(params, additionalParams) {
+    const creds = await generate_aws_sdkv3_sts_creds(params, additionalParams.RoleSessionName);
+    return noobaa_s3_client.get_s3_client_v3_params({
         credentials: creds,
-        region: params.region,
+        region: params.region || config.DEFAULT_REGION,
         endpoint: additionalParams.endpoint,
-        signatureVersion: additionalParams.signatureVersion,
-        s3DisableBodySigning: additionalParams.s3DisableBodySigning,
-        httpOptions: additionalParams.httpOptions,
-        s3ForcePathStyle: additionalParams.s3ForcePathStyle
+        requestHandler: new NodeHttpHandler({
+            httpsAgent: additionalParams.httpOptions
+        }),
+        forcePathStyle: additionalParams.s3ForcePathStyle
     });
 }
 
-async function generate_aws_sts_creds(params, roleSessionName) {
-    const sts = new AWS.STS();
-    const creds = await (sts.assumeRoleWithWebIdentity({
+async function generate_aws_sdkv3_sts_creds(params, roleSessionName) {
+
+    const sts_client = new STSClient({ region: params.region || config.DEFAULT_REGION });
+    const input = {
+        DurationSeconds: defaultSTSCredsValidity,
         RoleArn: params.aws_sts_arn,
         RoleSessionName: roleSessionName || defaultRoleSessionName,
         WebIdentityToken: (await fs.promises.readFile(projectedServiceAccountToken)).toString(),
-        DurationSeconds: defaultSTSCredsValidity
-    }).promise());
-    if (_.isEmpty(creds.Credentials)) {
+    };
+    const command = new AssumeRoleWithWebIdentityCommand(input);
+    const response = await sts_client.send(command);
+    if (_.isEmpty(response) || _.isEmpty(response.Credentials)) {
         dbg.error(`AWS STS empty creds ${params.RoleArn}, RolesessionName: ${params.RoleSessionName},Projected service Account Token Path : ${projectedServiceAccountToken}`);
         throw new RpcError('AWS_STS_ERROR', 'Empty AWS STS creds retrieved for Role "' + params.RoleArn + '"');
     }
-    return new AWS.Credentials(
-        creds.Credentials.AccessKeyId,
-        creds.Credentials.SecretAccessKey,
-        creds.Credentials.SessionToken
-    );
+    return {
+        accessKeyId: response.Credentials.AccessKeyId,
+        secretAccessKey: response.Credentials.SecretAccessKey,
+        sessionToken: response.Credentials.SessionToken,
+    };
 }
 
-function get_signed_url(params) {
+function get_signed_url(params, expiry = 604800, custom_operation = 'getObject') {
+    const op = custom_operation;
     const s3 = new AWS.S3({
         endpoint: params.endpoint,
         credentials: {
@@ -68,20 +76,23 @@ function get_signed_url(params) {
         s3ForcePathStyle: true,
         sslEnabled: false,
         signatureVersion: get_s3_endpoint_signature_ver(params.endpoint),
+        // IMPORATANT - we had issues with applyChecksum - when migrating to sdkv3 check if this option is needed.
         s3DisableBodySigning: disable_s3_compatible_bodysigning(params.endpoint),
-        region: 'eu-central-1',
+        region: params.region || config.DEFAULT_REGION,
         httpOptions: {
             // Setting the agent is not mandatory in this case as this s3 client
             // is only used to acquire a signed Url
             agent: http_utils.get_unsecured_agent(params.endpoint)
         }
     });
+    const response_queries = params.response_queries || {};
     return s3.getSignedUrl(
-        'getObject', {
+        op, {
             Bucket: params.bucket.unwrap(),
             Key: params.key,
             VersionId: params.version_id,
-            Expires: 604800
+            Expires: expiry,
+            ...response_queries
         }
     );
 }
@@ -167,23 +178,25 @@ function get_used_cloud_targets(endpoint_type, bucket_list, pool_list, namespace
 
 function set_noobaa_s3_connection(sys) {
     const system_address = _.filter(sys.system_address, { 'api': 's3', 'kind': 'INTERNAL' });
-    const endpoint = system_address[0] && system_address[0].hostname;
+    const endpoint = system_address[0] && 'http://' + system_address[0].hostname;
     const access_key = sys.owner && sys.owner.access_keys && sys.owner.access_keys[0].access_key.unwrap();
     const secret_key = sys.owner && sys.owner.access_keys && sys.owner.access_keys[0].secret_key.unwrap();
     if (!endpoint || !access_key || !secret_key) {
         dbg.error('set_noobaa_s3_connection: temporary error: invalid noobaa s3 connection details');
         return;
     }
-
-    return new AWS.S3({
+    const s3_client = noobaa_s3_client.get_s3_client_v3_params({
         endpoint: endpoint,
         credentials: {
             accessKeyId: access_key,
             secretAccessKey: secret_key
         },
-        s3ForcePathStyle: true,
-        sslEnabled: false
+        forcePathStyle: true,
+        tls: false,
+        region: config.DEFAULT_REGION,
+        requestHandler: noobaa_s3_client.get_requestHandler_with_suitable_agent(endpoint),
     });
+    return s3_client;
 }
 
 function generate_access_keys() {
@@ -202,6 +215,6 @@ exports.get_s3_endpoint_signature_ver = get_s3_endpoint_signature_ver;
 exports.is_aws_endpoint = is_aws_endpoint;
 exports.disable_s3_compatible_bodysigning = disable_s3_compatible_bodysigning;
 exports.set_noobaa_s3_connection = set_noobaa_s3_connection;
-exports.createSTSS3Client = createSTSS3Client;
-exports.generate_aws_sts_creds = generate_aws_sts_creds;
 exports.generate_access_keys = generate_access_keys;
+exports.createSTSS3SDKv3Client = createSTSS3SDKv3Client;
+exports.generate_aws_sdkv3_sts_creds = generate_aws_sdkv3_sts_creds;
