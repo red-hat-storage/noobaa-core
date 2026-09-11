@@ -1,12 +1,11 @@
 /* Copyright (C) 2016 NooBaa */
+/*eslint max-lines: ["error", 2100]*/
 'use strict';
 
 const P = require('../../util/promise');
 const _ = require('lodash');
 const net = require('net');
 const chance = require('chance')();
-const GoogleStorage = require('../../util/google_storage_wrap');
-const bcrypt = require('bcrypt');
 const server_rpc = require('../server_rpc');
 
 const config = require('../../../config');
@@ -15,23 +14,19 @@ const { RpcError } = require('../../rpc');
 const Dispatcher = require('../notifications/dispatcher');
 const SensitiveString = require('../../util/sensitive_string');
 const cloud_utils = require('../../util/cloud_utils');
-const auth_server = require('../common_services/auth_server');
 const system_store = require('../system_services/system_store').get_instance();
-const bucket_server = require('../system_services/bucket_server');
-const pool_server = require('../system_services/pool_server');
-const azure_storage = require('../../util/azure_storage_wrap');
 const NetStorage = require('../../util/NetStorageKit-Node-master/lib/netstorage');
 const usage_aggregator = require('../bg_services/usage_aggregator');
 const { OP_NAME_TO_ACTION } = require('../../endpoint/sts/sts_rest');
-const { Durations, LogsQueryClient } = require('@azure/monitor-query');
+const { Durations, LogsQueryClient } = require('@azure/monitor-query-logs');
 const { ClientSecretCredential } = require("@azure/identity");
 const noobaa_s3_client = require('../../sdk/noobaa_s3_client/noobaa_s3_client');
+const account_util = require('./../../util/account_util');
+const iam_utils = require('../../endpoint/iam/iam_utils');
+const access_policy_utils = require('../../util/access_policy_utils');
+const { IAM_ACTIONS, IAM_DEFAULT_PATH, ACCESS_KEY_STATUS_ENUM,
+     MAX_TAGS, MAX_NUMBER_OF_IAM_ROLES, DEFAULT_MAX_SESSION_DURATION_SECS } = require('../../endpoint/iam/iam_constants');
 
-
-const demo_access_keys = Object.freeze({
-    access_key: new SensitiveString('123'),
-    secret_key: new SensitiveString('abc')
-});
 
 const check_connection_timeout = 15 * 1000;
 const check_new_azure_connection_timeout = 20 * 1000;
@@ -42,136 +37,27 @@ const check_new_azure_connection_timeout = 20 * 1000;
  *
  */
 async function create_account(req) {
-    const account = {
-        _id: (
-            req.rpc_params.new_system_parameters ?
-            system_store.parse_system_store_id(req.rpc_params.new_system_parameters.account_id) :
-            system_store.new_system_store_id()
-        ),
-        name: req.rpc_params.name,
-        email: req.rpc_params.email,
-        has_login: req.rpc_params.has_login,
-        is_external: req.rpc_params.is_external,
-        nsfs_account_config: req.rpc_params.nsfs_account_config,
-        force_md5_etag: req.rpc_params.force_md5_etag
-    };
-
-    const { roles: account_roles = ['admin'] } = req.rpc_params;
-
-    validate_create_account_permissions(req);
-    validate_create_account_params(req);
-
-    if (account.name.unwrap() === 'demo' && account.email.unwrap() === 'demo@noobaa.com') {
-        account.access_keys = [demo_access_keys];
+    let iam_arn;
+    if (req.rpc_params.owner) {
+        const action = IAM_ACTIONS.CREATE_USER;
+        const username = req.rpc_params.name.unwrap();
+        account_util._check_if_requesting_account_is_root_account(action, req.account,
+            { username: username, path: req.rpc_params.iam_path });
+        account_util._check_username_already_exists(action, req.rpc_params.email, username);
+        iam_arn = iam_utils.create_arn_for_user(req.account._id.toString(), username,
+            req.rpc_params.iam_path || IAM_DEFAULT_PATH);
     } else {
-        const access_keys = req.rpc_params.access_keys || [cloud_utils.generate_access_keys()];
-        if (!access_keys.length) throw new RpcError('FORBIDDEN', 'cannot create account without access_keys');
-        account.access_keys = access_keys;
+        account_util.validate_create_account_permissions(req);
+        account_util.validate_create_account_params(req);
     }
+    const { id, token, access_keys } = await account_util.create_account(req);
 
-    if (req.rpc_params.must_change_password) {
-        account.next_password_change = new Date();
-    }
-
-    const sys_id = req.rpc_params.new_system_parameters ?
-        system_store.parse_system_store_id(req.rpc_params.new_system_parameters.new_system_id) :
-        req.system._id;
-
-    if (req.rpc_params.has_login) {
-        account.password = req.rpc_params.password;
-        const password_hash = await bcrypt_password(account.password.unwrap());
-        account.password = password_hash;
-    }
-
-    if (req.rpc_params.s3_access) {
-        if (req.rpc_params.new_system_parameters) {
-            account.default_resource = system_store.parse_system_store_id(req.rpc_params.new_system_parameters.default_resource);
-            account.allow_bucket_creation = true;
-        } else {
-            const resource = req.rpc_params.default_resource ? req.system.pools_by_name[req.rpc_params.default_resource] ||
-                (req.system.namespace_resources_by_name && req.system.namespace_resources_by_name[req.rpc_params.default_resource]) :
-                pool_server.get_internal_mongo_pool(req.system); //Internal
-            if (!resource) throw new RpcError('BAD_REQUEST', 'default resource doesn\'t exist');
-            if (resource.nsfs_config && resource.nsfs_config.fs_root_path && !req.rpc_params.nsfs_account_config) {
-                throw new RpcError('Invalid account configuration - must specify nsfs_account_config when default resource is a namespace resource');
-            }
-            account.default_resource = resource._id;
-            account.allow_bucket_creation = _.isUndefined(req.rpc_params.allow_bucket_creation) ?
-                true : req.rpc_params.allow_bucket_creation;
-
-            const bucket_claim_owner = req.rpc_params.bucket_claim_owner;
-            if (bucket_claim_owner) {
-                const creator_roles = req.account.roles_by_system[req.system._id];
-                if (creator_roles.includes('operator')) { // Not allowed to create claim owner outside of the operator
-                    account.bucket_claim_owner = req.system.buckets_by_name[bucket_claim_owner.unwrap()]._id;
-                } else {
-                    dbg.warn('None operator user was trying to set a bucket-claim-owner for account', req.account);
-                }
-            }
-        }
-    }
-
-    const roles = account_roles.map(role => ({
-        _id: system_store.new_system_store_id(),
-        account: account._id,
-        system: sys_id,
-        role
-    }));
-
-    // Suppress audit entry for creation of operator account.
-    if (!account_roles.includes('operator')) {
-        Dispatcher.instance().activity({
-            event: 'account.create',
-            level: 'info',
-            system: (req.system && req.system._id) || sys_id,
-            actor: req.account && req.account._id,
-            account: account._id,
-            desc: `${account.email.unwrap()} was created ` + (req.account ? `by ${req.account.email.unwrap()}` : ``),
-        });
-    }
-    const account_mkey = system_store.master_key_manager.new_master_key({
-        description: `master key of ${account._id} account`,
-        cipher_type: system_store.data.systems[0].master_key_id.cipher_type,
-        master_key_id: system_store.data.systems[0].master_key_id._id
-    });
-    account.master_key_id = account_mkey._id;
-    const decrypted_access_keys = _.cloneDeep(account.access_keys);
-    account.access_keys[0] = {
-        access_key: account.access_keys[0].access_key,
-        secret_key: system_store.master_key_manager.encrypt_sensitive_string_with_master_key_id(
-            account.access_keys[0].secret_key, account_mkey._id)
-    };
-
-    if (req.rpc_params.role_config) {
-        validate_assume_role_policy(req.rpc_params.role_config.assume_role_policy);
-        account.role_config = req.rpc_params.role_config;
-    }
-
-    await system_store.make_changes({
-        insert: {
-            accounts: [account],
-            roles,
-            master_keys: [account_mkey]
-        }
-    });
-
-    const created_account = system_store.data.get_by_id(account._id);
-    const auth = {
-        account_id: created_account._id
-    };
-    // since we created the first system for this account
-    // we expect just one system, but use _.each to get it from the map
-    const current_system = (req.system && req.system._id) || sys_id;
-    _.each(created_account.roles_by_system, (sys_roles, system_id) => {
-        //we cannot assume only one system.
-        if (current_system.toString() === system_id) {
-            auth.system_id = system_id;
-            auth.role = sys_roles[0];
-        }
-    });
+    iam_arn = iam_arn || iam_utils.create_arn_for_root(id);
     return {
-        token: auth_server.make_auth_token(auth),
-        access_keys: decrypted_access_keys
+        id,
+        arn: iam_arn,
+        token,
+        access_keys
     };
 }
 
@@ -247,9 +133,7 @@ function read_account(req) {
 function read_account_by_access_key(req) {
     const { access_key } = req.rpc_params;
 
-    const account = _.find(system_store.data.accounts, acc =>
-        acc.access_keys && acc.access_keys[0].access_key.unwrap() === access_key.unwrap()
-    );
+    const account = system_store.get_account_by_access_key(access_key);
 
     if (!account) throw new RpcError('NO_SUCH_ACCOUNT', 'No such account with credentials: ' + access_key);
 
@@ -262,41 +146,7 @@ function read_account_by_access_key(req) {
  *
  */
 async function generate_account_keys(req) {
-    const account = system_store.get_account_by_email(req.rpc_params.email);
-    if (!account) {
-        throw new RpcError('NO_SUCH_ACCOUNT', 'No such account email: ' + req.rpc_params.email);
-    }
-    if (req.system && req.account) {
-        if (!is_support_or_admin_or_me(req.system, req.account, account)) {
-            throw new RpcError('UNAUTHORIZED', 'Cannot update account');
-        }
-    }
-    if (account.is_support) {
-        throw new RpcError('FORBIDDEN', 'Cannot update support account');
-    }
-    const access_keys = cloud_utils.generate_access_keys();
-    access_keys.secret_key = system_store.master_key_manager.encrypt_sensitive_string_with_master_key_id(
-        access_keys.secret_key, account.master_key_id._id);
-
-    await system_store.make_changes({
-        update: {
-            accounts: [{
-                _id: account._id,
-                access_keys: [
-                    access_keys
-                ]
-            }]
-        }
-    });
-
-    Dispatcher.instance().activity({
-        event: 'account.generate_credentials',
-        level: 'info',
-        system: req.system && req.system._id,
-        actor: req.account && req.account._id,
-        account: account._id,
-        desc: `Credentials for ${account.email.unwrap()} were regenerated ${req.account && 'by ' + req.account.email.unwrap()}`,
-    });
+    return await account_util.generate_account_keys(req);
 }
 
 /**
@@ -377,7 +227,7 @@ function update_account_s3_access(req) {
     //If s3_access is on, update allowed buckets, default_resource and force_md5_etag
     if (req.rpc_params.s3_access) {
         if (!req.rpc_params.default_resource) {
-            const pools = _.filter(req.system.pools_by_name, p => (!_.get(p, 'mongo_pool_info'))); // find none-internal pools
+            const pools = _.filter(req.system.pools_by_name, p => !p.is_default_pool);
             if (pools.length) { // has resources which is not internal - must supply resource
                 throw new RpcError('BAD_REQUEST', 'Enabling S3 requires providing default_resource');
             }
@@ -463,12 +313,6 @@ function update_account_s3_access(req) {
                 account: account._id,
                 desc: desc_string.join('\n'),
             });
-            if (removed_buckets.length) {
-                _.forEach(removed_buckets, bucket_name => {
-                    const bucket = req.system.buckets_by_name[bucket_name.unwrap()];
-                    bucket_server.check_for_lambda_permission_issue(req, bucket, [account]);
-                });
-            }
         });
 }
 
@@ -548,64 +392,6 @@ function update_account(req) {
         }));
 }
 
-/**
- *
- * RESET PASSWORD
- *
- */
-async function reset_password(req) {
-    const is_authorized_account = await verify_authorized_account(req);
-    if (!is_authorized_account) {
-        throw new RpcError('UNAUTHORIZED', 'Invalid verification password');
-    }
-    const account = system_store.data.accounts_by_email[req.rpc_params.email.unwrap()];
-    if (!account) {
-        throw new RpcError('NO_SUCH_ACCOUNT', 'No such account email: ' + req.rpc_params.email);
-    }
-    if (!is_support_or_admin_or_me(req.system, req.account, account)) {
-        throw new RpcError('UNAUTHORIZED', 'Cannot change password');
-    }
-    if (account.is_support) {
-        throw new RpcError('FORBIDDEN', 'Cannot change support password');
-    }
-    if (!account.has_login) {
-        throw new RpcError('FORBIDDEN', 'Cannot change non management password');
-    }
-
-    const params = req.rpc_params;
-
-    const password = await bcrypt_password(params.password.unwrap());
-
-    const changes = {
-        password: new SensitiveString(password),
-        next_password_change: params.must_change_password === true ? new Date() : undefined
-    };
-    const removals = {
-        next_password_change: params.must_change_password === false ? true : undefined
-    };
-
-    await system_store.make_changes({
-        update: {
-            accounts: [{
-                _id: account._id,
-                $set: _.omitBy(changes, _.isUndefined),
-                $unset: _.omitBy(removals, _.isUndefined)
-            }]
-        }
-    });
-
-    await Dispatcher.instance().activity({
-        event: 'account.update',
-        level: 'info',
-        system: req.system && req.system._id,
-        actor: req.account && req.account._id,
-        account: account._id,
-        desc: `${account.email.unwrap()} was updated by ${req.account.email.unwrap()}: reset password`,
-    });
-
-}
-
-
 async function get_account_usage(req) {
     const { since, till, accounts, endpoint_groups } = req.rpc_params;
 
@@ -629,45 +415,7 @@ async function get_account_usage(req) {
 function delete_account(req) {
     const account_to_delete = system_store.get_account_by_email(req.rpc_params.email);
     _verify_can_delete_account(req, account_to_delete);
-
-    const roles_to_delete = system_store.data.roles
-        .filter(
-            role => String(role.account._id) === String(account_to_delete._id)
-        )
-        .map(
-            role => role._id
-        );
-
-    return system_store.make_changes({
-            remove: {
-                accounts: [account_to_delete._id],
-                roles: roles_to_delete
-            }
-        })
-        .then(
-            val => {
-                Dispatcher.instance().activity({
-                    event: 'account.delete',
-                    level: 'info',
-                    system: req.system && req.system._id,
-                    actor: req.account && req.account._id,
-                    account: account_to_delete._id,
-                    desc: `${account_to_delete.email.unwrap()} was deleted by ${req.account && req.account.email.unwrap()}`,
-                });
-                return val;
-            },
-            err => {
-                Dispatcher.instance().activity({
-                    event: 'account.delete',
-                    level: 'alert',
-                    system: req.system && req.system._id,
-                    actor: req.account && req.account._id,
-                    account: account_to_delete._id,
-                    desc: `Error: ${account_to_delete.email.unwrap()} failed to delete by ${req.account && req.account.email.unwrap()}`,
-                });
-                throw err;
-            }
-        );
+    return account_util.delete_account(req, account_to_delete);
 }
 
 
@@ -717,6 +465,8 @@ function list_accounts(req) {
     }
 
     const accounts = system_store.data.accounts
+        // IAM roles are stored in accounts, exclude them from account list
+        .filter(account => !account_util._is_role_identity(account))
         // for support account - list all accounts
         .filter(account => is_support || !account.is_support)
         // filter list, UID and GID together
@@ -740,7 +490,7 @@ function list_accounts(req) {
  */
 function accounts_status(req) {
     const any_non_support_account = _.find(system_store.data.accounts, function(account) {
-        return !account.is_support;
+        return !account.is_support && !account_util._is_role_identity(account);
     });
     return {
         has_accounts: Boolean(any_non_support_account)
@@ -784,6 +534,12 @@ async function add_external_connection(req) {
         };
     }
 
+     if (req.rpc_params.azure_sts_credentials) {
+        info.azure_sts_credentials = {
+            azure_tenant_id: req.rpc_params.azure_sts_credentials.azure_tenant_id,
+            azure_client_id: req.rpc_params.azure_sts_credentials.azure_client_id,
+        };
+    }
     info.cp_code = req.rpc_params.cp_code || undefined;
     info.auth_method = req.rpc_params.auth_method || config.DEFAULT_S3_AUTH_METHOD[info.endpoint_type] || undefined;
     info = _.omitBy(info, _.isUndefined);
@@ -831,42 +587,61 @@ async function update_external_connection(req) {
     const secret = req.rpc_params.secret;
     const azure_log_access_keys = req.rpc_params.azure_log_access_keys;
     const region = req.rpc_params.region || connection.region;
+    const new_endpoint = req.rpc_params.endpoint_info?.endpoint || connection.endpoint;
+    const encrypted_secret = secret ?
+        system_store.master_key_manager.encrypt_sensitive_string_with_master_key_id(
+            secret, req.account.master_key_id._id) : undefined;
 
-    const encrypted_secret = system_store.master_key_manager.encrypt_sensitive_string_with_master_key_id(
-        secret, req.account.master_key_id._id);
-
-    let check_failed = false;
-    try {
-        const { status } = await _check_external_connection_internal({
-            name,
-            identity,
-            secret,
-            endpoint_type: connection.endpoint_type,
-            endpoint: connection.endpoint,
-            region: region,
-            cp_code: connection.cp_code,
-            auth_method: connection.auth_method,
-            azure_log_access_keys: azure_log_access_keys,
-        });
-        check_failed = status !== 'SUCCESS';
-
-    } catch (error) {
-        dbg.error('update_external_connection: _check_external_connection_internal had error', error);
-        check_failed = true;
+    if (req.rpc_params.endpoint_info?.endpoint_type &&
+        req.rpc_params.endpoint_info.endpoint_type !== connection.endpoint_type) {
+        throw new RpcError('FORBIDDEN', 'Changing endpoint_type is not allowed');
     }
 
-    if (check_failed) {
-        throw new RpcError('INVALID_CREDENTIALS', `Credentials are not valid ${name}`);
+    let endpoint_update = false;
+    if (new_endpoint && new_endpoint !== connection.endpoint) {
+        if (connection.endpoint_type !== 'S3_COMPATIBLE' &&
+            connection.endpoint_type !== 'IBM_COS') {
+            throw new RpcError('FORBIDDEN',
+                'Endpoint updates are only supported for S3-compatible and IBM COS connections');
+        }
+        endpoint_update = true;
     }
 
-    const acc_update_set_obj = {
-        "sync_credentials_cache.$.access_key": identity,
-        "sync_credentials_cache.$.secret_key": encrypted_secret,
-    };
-    const ns_resource_update_map_obj = {
-        'connection.access_key': identity,
-        'connection.secret_key': encrypted_secret
-    };
+    if (secret) {
+        let check_result;
+        try {
+            check_result = await _check_external_connection_internal({
+                name,
+                identity,
+                secret,
+                endpoint: new_endpoint || connection.endpoint,
+                endpoint_type: connection.endpoint_type,
+                region: region,
+                cp_code: connection.cp_code,
+                auth_method: connection.auth_method,
+                azure_log_access_keys: azure_log_access_keys,
+            });
+
+        } catch (error) {
+            dbg.error('update_external_connection: _check_external_connection_internal had error', error);
+            throw new RpcError(error.rpc_code || error.code || 'INTERNAL_ERROR',
+                error.message || `Connection check failed for ${name}`);
+        }
+
+        if (check_result.status !== 'SUCCESS') {
+            throw new RpcError(check_result.status || check_result.error?.code || 'INTERNAL_ERROR',
+                check_result.error?.message || `Connection check failed for ${name}`);
+        }
+    }
+
+    const acc_update_set_obj = {};
+    const ns_resource_update_map_obj = {};
+    if (identity && secret) {
+        acc_update_set_obj["sync_credentials_cache.$.access_key"] = identity;
+        acc_update_set_obj["sync_credentials_cache.$.secret_key"] = encrypted_secret;
+        ns_resource_update_map_obj["connection.access_key"] = identity;
+        ns_resource_update_map_obj["connection.secret_key"] = encrypted_secret;
+    }
 
     if (azure_log_access_keys) {
         const encrypted_azure_client_secret = system_store.master_key_manager.encrypt_sensitive_string_with_master_key_id(
@@ -880,6 +655,11 @@ async function update_external_connection(req) {
         };
         acc_update_set_obj["sync_credentials_cache.$.azure_log_access_keys"] = azure_creds_obj;
         ns_resource_update_map_obj["connection.azure_log_access_keys"] = azure_creds_obj;
+    }
+
+    if (endpoint_update) {
+        acc_update_set_obj["sync_credentials_cache.$.endpoint"] = new_endpoint;
+        ns_resource_update_map_obj["connection.endpoint"] = new_endpoint;
     }
 
     const accounts_updates = [{
@@ -900,8 +680,13 @@ async function update_external_connection(req) {
         )
         .map(pool => ({
             _id: pool._id,
-            'cloud_pool_info.access_keys.access_key': identity,
-            'cloud_pool_info.access_keys.secret_key': encrypted_secret,
+            ...(identity && secret ? {
+                'cloud_pool_info.access_keys.access_key': identity,
+                'cloud_pool_info.access_keys.secret_key': encrypted_secret,
+            } : {}),
+            ...(endpoint_update ? {
+                'cloud_pool_info.endpoint': new_endpoint,
+            } : {}),
         }));
 
     const ns_resources_updates = system_store.data.namespace_resources
@@ -926,12 +711,18 @@ async function update_external_connection(req) {
     });
 
     if (pools_updates.length > 0) {
-        await server_rpc.client.hosted_agents.update_credentials({
+        await server_rpc.client.hosted_agents.update_hosted_agents({
             pool_ids: pools_updates.map(update => String(update._id)),
-            credentials: {
+            ...(identity && secret ? {
+                credentials: {
                 access_key: identity.unwrap(),
                 secret_key: secret.unwrap(),
-            }
+            },
+            } : {}),
+            ...(endpoint_update ? {
+                endpoint: new_endpoint,
+                endpoint_type: connection.endpoint_type,
+            } : {}),
         }, {
             auth_token: req.auth_token
         });
@@ -955,6 +746,7 @@ async function check_external_connection(req) {
 async function _check_external_connection_internal(connection) {
     const { endpoint_type } = connection;
     switch (endpoint_type) {
+        case 'AZURESTS':
         case 'AZURE': {
             return check_azure_connection(connection);
         }
@@ -971,7 +763,8 @@ async function _check_external_connection_internal(connection) {
         case 'NET_STORAGE': {
             return check_net_storage_connection(connection);
         }
-        case 'GOOGLE': {
+        case 'GOOGLE':
+        case 'GOOGLE_STS': {
             return check_google_connection(connection);
         }
 
@@ -1004,12 +797,6 @@ async function check_azure_connection(params) {
 
 async function _check_azure_connection_internal(params) {
 
-    const conn_str = cloud_utils.get_azure_new_connection_string({
-        endpoint: params.endpoint,
-        access_key: params.identity,
-        secret_key: params.secret
-    });
-
     function err_to_status(err, status) {
         return Object.assign(new Error(status), {
             err_code: err.code || 'Error',
@@ -1017,12 +804,27 @@ async function _check_azure_connection_internal(params) {
         });
     }
 
-    /** @type {azure_storage.BlobServiceClient} */
+     /** @type {import('../../util/azure_storage_wrap').BlobServiceClient} */
     let blob;
     try {
-        blob = azure_storage.BlobServiceClient.fromConnectionString(conn_str);
+        const { endpoint_type } = params;
+        let conn_str;
+        if (endpoint_type === 'AZURE') {
+            conn_str = cloud_utils.get_azure_new_connection_string({
+                endpoint: params.endpoint,
+                access_key: params.identity,
+                secret_key: params.secret
+            });
+        }
+        blob = cloud_utils.create_azure_blob_client({
+            endpoint: params.endpoint,
+            connection_string: conn_str,
+            access_key: params.identity.unwrap(),
+            azure_client_id: params.azure_sts_credentials?.azure_client_id.unwrap(),
+            azure_tenant_id: params.azure_sts_credentials?.azure_tenant_id.unwrap(),
+        });
     } catch (err) {
-        dbg.warn(`got error on BlobServiceClient.fromConnectionString with params`, _.omit(params, 'secret'), ` error: ${err}`);
+        dbg.warn(`got error on BlobServiceClient with params`, _.omit(params, 'secret', 'azure_sts_credentials'), ` error: ${err}`);
         throw err_to_status(err, 'INVALID_CONNECTION_STRING');
     }
 
@@ -1037,8 +839,14 @@ async function _check_azure_connection_internal(params) {
             throw err_to_status(err, 'TIME_SKEW');
         } else if (err.code === 'ENOTFOUND') {
             throw err_to_status(err, 'UNKNOWN_FAILURE');
+        } else if (err.name?.toLowerCase().includes('authentication') || err.code?.toLowerCase().includes('authorization')) {
+            /* 
+                For AuthenticationRequiredError err.code is undefined, err.name is AuthenticationRequiredError, 
+                In case of AuthorizationPermissionMismatch err.code is AuthorizationPermissionMismatch and err.name is RestError
+            */
+            throw err_to_status(err, 'INVALID_CREDENTIALS');
         } else {
-            throw err_to_status(err, err.code === 'AuthenticationFailed' ? 'INVALID_CREDENTIALS' : 'INVALID_ENDPOINT');
+            throw err_to_status(err, 'INVALID_ENDPOINT');
         }
     }
 
@@ -1102,16 +910,21 @@ const net_storage_error_mapping = Object.freeze({
 
 async function check_google_connection(params) {
     try {
-        const key_file = JSON.parse(params.secret.unwrap());
-        const credentials = _.pick(key_file, 'client_email', 'private_key');
-        const storage = new GoogleStorage({ credentials, projectId: key_file.project_id });
-        await storage.getBuckets();
+        const storage = cloud_utils.create_google_storage_from_connection(params.secret.unwrap());
+        const timeout_err = Object.assign(new Error('TIMEOUT'), { code: 'TIMEOUT' });
+        await P.timeout(check_connection_timeout, storage.getBuckets(), () => timeout_err);
         return { status: 'SUCCESS' };
     } catch (err) {
-        // Currently we treat all errors as invalid credentials errors,
+        dbg.warn('check_google_connection:', _.omit(params, 'secret'),
+            `code: ${err.code}, message: ${err.message}`);
+        if (err.code === 403) {
+            dbg.warn('check_google_connection: GCP returned permission denied (auth may have succeeded; check IAM roles on the service account)');
+        }
+        // Currently we treat all errors as invalid credentials errors (except timeout),
         // because all information should exists in the keys file.
+        const status = err.code === 'TIMEOUT' ? 'TIMEOUT' : 'INVALID_CREDENTIALS';
         return {
-            status: 'INVALID_CREDENTIALS',
+            status,
             error: {
                 code: String(err.code),
                 message: String(err.message)
@@ -1121,7 +934,7 @@ async function check_google_connection(params) {
 }
 
 async function check_aws_sts_connection(params) {
-    const creds = await cloud_utils.generate_aws_sts_creds(params, "check_aws_sts_sessions");
+    const creds = await cloud_utils.generate_aws_sdkv3_sts_creds(params, "check_aws_sts_sessions");
     params.identity = new SensitiveString(creds.accessKeyId);
     params.secret = new SensitiveString(creds.secretAccessKey);
     params.sessionToken = creds.sessionToken;
@@ -1149,10 +962,23 @@ async function check_aws_connection(params) {
 
     try {
         await P.timeout(check_connection_timeout, s3.listBuckets({}), () => timeoutError);
+
+        if (params.bucket) {
+            const resp = await s3.listObjectsV2({
+                Bucket: params.bucket,
+                Prefix: 'noobaa_blocks/',
+                MaxKeys: 1
+            });
+
+            if (!resp?.KeyCount) {
+                throw Object.assign(new Error(`new endpoint should be a valid location used by noobaa`),
+                    { code: 'UnknownEndpoint' });
+            }
+        }
         return { status: 'SUCCESS' };
     } catch (err) {
         const error_code = err.Code || err.code;
-        dbg.warn(`got error on listBuckets with params`, _.omit(params, 'secret'),
+        dbg.warn(`got error on check_aws_connection with params`, _.omit(params, 'secret'),
             ` error: ${err}, code: ${error_code}, message: ${err.message}`
         );
         const status = aws_error_mapping[error_code] || 'UNKNOWN_FAILURE';
@@ -1253,7 +1079,7 @@ function get_account_info(account, include_connection_cache) {
         'has_login',
         'allowed_ips',
     );
-
+    info._id = account._id.toString();
     if (account.is_support) {
         info.is_support = true;
         info.has_login = true;
@@ -1263,7 +1089,11 @@ function get_account_info(account, include_connection_cache) {
             secret_key: 'Not Accesible'
         }];
     }
-
+    if (account.owner) {
+        info.owner = account_util.get_owner_account_id(account);
+    }
+    info.arn = access_policy_utils.get_policy_principal_arn(account);
+    info.iam_path = account.iam_path;
     if (account.next_password_change) {
         info.next_password_change = account.next_password_change.getTime();
     }
@@ -1314,6 +1144,11 @@ function get_account_info(account, include_connection_cache) {
     };
     info.role_config = account.role_config;
     info.force_md5_etag = account.force_md5_etag;
+
+    if (account.iam_inline_policies) {
+        info.iam_inline_policies = account.iam_inline_policies;
+    }
+
     return info;
 }
 
@@ -1334,33 +1169,24 @@ function ensure_support_account() {
             }
 
             console.log('CREATING SUPPORT ACCOUNT...');
-            return bcrypt_password(system_store.get_server_secret())
-                .then(password => {
-                    const support_account = {
-                        _id: system_store.new_system_store_id(),
-                        name: new SensitiveString('Support'),
-                        email: new SensitiveString('support@noobaa.com'),
-                        password: new SensitiveString(password),
-                        has_login: true,
-                        is_support: true,
-                    };
+            const support_account = {
+                _id: system_store.new_system_store_id(),
+                identity_type: account_util.IDENTITY_TYPES.ACCOUNT,
+                name: new SensitiveString('Support'),
+                email: new SensitiveString('support@noobaa.com'),
+                has_login: false,
+                is_support: true,
+            };
 
-                    return system_store.make_changes({
-                        insert: {
-                            accounts: [support_account]
-                        }
-                    });
-                })
-                .then(() => console.log('SUPPORT ACCOUNT CREATED'));
+            return system_store.make_changes({
+                insert: {
+                    accounts: [support_account]
+                }
+            }).then(() => console.log('SUPPORT ACCOUNT CREATED'));
         })
         .catch(function(err) {
             console.error('FAILED CREATE SUPPORT ACCOUNT', err);
         });
-}
-
-function bcrypt_password(password) {
-    return P.resolve()
-        .then(() => password && bcrypt.hash(password, 10));
 }
 
 function is_support_or_admin_or_me(system, account, target_account) {
@@ -1373,88 +1199,12 @@ function is_support_or_admin_or_me(system, account, target_account) {
         );
 }
 
-function validate_create_account_permissions(req) {
-    const account = req.account;
-    //For new system creation, nothing to be checked
-    if (req.rpc_params.new_system_parameters) return;
-
-    //Only allow support, admin/operator roles and UI login enabled accounts to create new accounts
-    if (!account.is_support &&
-        !account.has_login &&
-        !(account.roles_by_system[req.system._id].some(
-            role => role === 'admin' || role === 'operator'
-        ))) {
-        throw new RpcError('UNAUTHORIZED', 'Cannot create new account');
-    }
-}
-
-function validate_create_account_params(req) {
-    // find none-internal pools
-    const has_non_internal_resources = (req.system && req.system.pools_by_name) ?
-        Object.values(req.system.pools_by_name).some(p => !p.mongo_pool_info) :
-        false;
-
-    if (req.rpc_params.name.unwrap() !== req.rpc_params.name.unwrap().trim()) {
-        throw new RpcError('BAD_REQUEST', 'system name must not contain leading or trailing spaces');
-    }
-
-    if (system_store.get_account_by_email(req.rpc_params.email)) {
-        throw new RpcError('BAD_REQUEST', 'email address already registered');
-    }
-
-    if (req.rpc_params.s3_access) {
-        if (!req.rpc_params.new_system_parameters) {
-            if (req.system.pools_by_name === 0) {
-                throw new RpcError('No resources in the system - Can\'t create accounts');
-            }
-
-            if (req.rpc_params.allow_bucket_creation && !req.rpc_params.default_resource) { //default resource needed only if new bucket can be created
-                if (has_non_internal_resources) { // has resources which is not internal - must supply resource
-                    throw new RpcError('BAD_REQUEST', 'Enabling S3 requires providing default_resource');
-                }
-            }
-        }
-
-        if (req.rpc_params.new_system_parameters) {
-            if (!req.rpc_params.new_system_parameters.default_resource) {
-                throw new RpcError(
-                    'BAD_REQUEST',
-                    'Creating new system with enabled S3 access for owner requires providing default_resource'
-                );
-            }
-        }
-    }
-
-    if (req.rpc_params.has_login) {
-        if (!req.rpc_params.password) {
-            throw new RpcError('BAD_REQUEST', 'Password is missing');
-        }
-
-        // Verify that account with login access have full s3 access permissions.
-        const { default_resource } = req.rpc_params.new_system_parameters || req.rpc_params;
-        const allow_bucket_creation = req.rpc_params.new_system_parameters ?
-            true :
-            req.rpc_params.allow_bucket_creation;
-
-        if (
-            !req.rpc_params.s3_access ||
-            (has_non_internal_resources && !default_resource) ||
-            !allow_bucket_creation
-        ) {
-            throw new RpcError('BAD_REQUEST', 'Accounts with login access must have full s3 access permissions');
-        }
-
-    } else if (req.rpc_params.password) {
-        throw new RpcError('BAD_REQUEST', 'Password should not be sent');
-    }
-}
-
 async function verify_authorized_account(req) {
     //operator connects by token and doesn't have the password property.
     if (req.role === 'operator') {
         return true;
     }
-    return bcrypt.compare(req.rpc_params.verification_password.unwrap(), req.account.password.unwrap());
+    return false;
 }
 
 function _list_connection_usage(account, credentials) {
@@ -1472,7 +1222,7 @@ function _list_connection_usage(account, credentials) {
             entity: pool.name,
             external_entity: pool.cloud_pool_info.target_bucket
         }));
-        const namespace_resource_usage = _.map(
+    const namespace_resource_usage = _.map(
         _.filter(system_store.data.namespace_resources, ns => (
             ns.connection &&
             ns.connection.endpoint_type === credentials.endpoint_type &&
@@ -1506,6 +1256,721 @@ function _verify_can_delete_account(req, account_to_delete) {
             throw new RpcError('FORBIDDEN', 'Cannot delete account that is owner of buckets');
         }
     }
+    if (account_to_delete.owner === undefined) {
+        const has_iam_users = _list_active_iam_users_for_account(account_to_delete._id).length > 0;
+        if (has_iam_users) {
+            dbg.log2('account', account_to_delete.name.unwrap(), 'account has users');
+            throw new RpcError('FORBIDDEN', 'Cannot delete account that is owner of IAM users');
+        }
+        const account_roles = account_util._list_iam_roles_by_owner(account_to_delete._id);
+        if (account_roles.length > 0) {
+            dbg.log2('account', account_to_delete.name.unwrap(), 'account has roles');
+            throw new RpcError('FORBIDDEN', 'Cannot delete account that is owner of IAM roles');
+        }
+    }
+}
+
+/**
+ *
+ * IAM APIs methods 
+ *
+ */
+
+async function create_user(req) {
+    return await create_account(req);
+}
+
+async function get_user(req) {
+
+    const action = IAM_ACTIONS.GET_USER;
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account(req.rpc_params, action, requesting_account);
+    const username = requested_account.name.unwrap();
+    const iam_arn = iam_utils.create_arn_for_user(requesting_account._id.toString(), username,
+        requested_account.iam_path || IAM_DEFAULT_PATH);
+    const tags = account_util.get_sorted_list_tags_for_user(requested_account.tagging);
+    return {
+        user_id: requested_account._id.toString(),
+        iam_path: requested_account.iam_path || IAM_DEFAULT_PATH,
+        username: username,
+        arn: iam_arn,
+        create_date: requested_account.creation_date,
+        // TODO: Dates missing : GAP
+        password_last_used: Date.now(),
+        tags: tags
+    };
+}
+
+async function update_user(req) {
+    const action = IAM_ACTIONS.UPDATE_USER;
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account(req.rpc_params, action, requesting_account);
+    let iam_path = requested_account.iam_path;
+    let user_name = req.rpc_params.username;
+    // Change to complete user name
+    const is_username_update = req.rpc_params.new_username !== undefined &&
+        req.rpc_params.new_username !== req.rpc_params.username;
+    if (is_username_update) {
+        const new_account_email_wrapped = account_util.get_account_email_from_username(
+            req.rpc_params.new_username,
+            requesting_account._id.toString());
+        account_util._check_username_already_exists(action, new_account_email_wrapped, req.rpc_params.new_username);
+    }
+    if (req.rpc_params.new_iam_path) iam_path = req.rpc_params.new_iam_path;
+    if (req.rpc_params.new_username) user_name = req.rpc_params.new_username;
+    const iam_arn = iam_utils.create_arn_for_user(requesting_account._id.toString(), user_name, iam_path);
+    const new_account_email_wrapped = account_util.get_account_email_from_username(user_name, requesting_account._id.toString());
+    const updates = {
+        name: user_name,
+        email: new_account_email_wrapped,
+        iam_path: iam_path,
+    };
+    await system_store.make_changes({
+        update: {
+            accounts: [{
+                _id: requested_account._id,
+                $set: _.omitBy(updates, _.isUndefined),
+            }]
+        }
+    });
+
+    const sys_id = account_util.get_system_id_for_events(req);
+    Dispatcher.instance().activity({
+        event: 'account.update',
+        level: 'info',
+        system: sys_id,
+        actor: requesting_account._id,
+        account: requested_account._id,
+        desc: `${requested_account.email.unwrap()} was updated by ${requesting_account.email.unwrap()}`,
+    });
+
+    return {
+        iam_path: iam_path || IAM_DEFAULT_PATH,
+        username: user_name,
+        user_id: requested_account._id.toString(),
+        arn: iam_arn
+    };
+}
+
+async function delete_user(req) {
+    const action = IAM_ACTIONS.DELETE_USER;
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account(req.rpc_params, action, requesting_account);
+    account_util._check_if_user_does_not_have_resources_before_deletion(action, requested_account);
+    return account_util.delete_account(req, requested_account);
+}
+
+/**
+ * returns all non-deleted IAM users for the given owner account
+ * @param {string|nb.ID} owner_account_id
+ * @returns {nb.IamUser[]}
+ */
+function _list_active_iam_users_for_account(owner_account_id) {
+    const owner_account_id_str = String(owner_account_id);
+    return _.filter(system_store.data.accounts, account => {
+        if (!account_util._is_user_identity(account) || account.deleted) return false;
+        // Check IAM user owner is same as requesting_account id
+        return account_util.get_owner_account_id(account) === owner_account_id_str;
+    });
+}
+
+async function list_users(req) {
+    const action = IAM_ACTIONS.LIST_USERS;
+    const requesting_account = req.account;
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account);
+    // TODO: Pagination not supported - currently returns all users, ignoring marker and max_items params
+    const is_truncated = false;
+    const requesting_account_iam_users = _list_active_iam_users_for_account(requesting_account._id);
+    let members = _.map(requesting_account_iam_users, function(iam_user) {
+        const iam_username = iam_user.name.unwrap();
+        const iam_path = iam_user.iam_path || IAM_DEFAULT_PATH;
+        let member;
+        // Check the iam_path_prefix and add only those satify the iam_path if exists
+        if (req.rpc_params.iam_path_prefix) {
+            if (iam_path.toUpperCase() === req.rpc_params.iam_path_prefix.toUpperCase()) {
+                member = account_util.return_list_member(iam_user, iam_path, iam_username);
+            }
+        } else {
+            member = account_util.return_list_member(iam_user, iam_path, iam_username);
+        }
+        return member;
+    }).filter(Boolean);
+    members = members.sort((a, b) => a.username.localeCompare(b.username));
+    return { members, is_truncated };
+}
+
+async function create_access_key(req) {
+    const action = IAM_ACTIONS.CREATE_ACCESS_KEY;
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account_with_option_itself(
+        req.rpc_params, action, requesting_account);
+    account_util._check_number_of_access_key_array(action, requested_account);
+    const account_req = {
+        rpc_params: {
+            email: requested_account.email,
+            is_iam: true,
+            owner: requesting_account._id.toString(),
+        },
+        account: requesting_account,
+    };
+    let iam_access_key;
+    try {
+        iam_access_key = await account_util.generate_account_keys(account_req);
+    } catch (err) {
+        dbg.error(`AccountSpaceNB.${action} error: `, err);
+        const message_with_details = `Create accesskey failed for the user with name ${requested_account.name.unwrap()}.`;
+        throw new RpcError('INTERNAL_FAILURE', message_with_details, 500);
+    }
+
+    return {
+        username: requested_account.name.unwrap(),
+        access_key: iam_access_key.access_key.unwrap(),
+        create_date: iam_access_key.creation_date,
+        status: ACCESS_KEY_STATUS_ENUM.ACTIVE,
+        secret_key: iam_access_key.secret_key.unwrap(),
+    };
+}
+
+async function list_access_keys(req) {
+    const action = IAM_ACTIONS.LIST_ACCESS_KEYS;
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account_with_option_itself(
+        req.rpc_params, action, requesting_account);
+    // TODO: Pagination not supported - currently returns all access keys, ignoring marker and max_items params
+    const is_truncated = false;
+    let members = account_util._list_access_keys_from_account(requesting_account, requested_account, false);
+    members = members.sort((a, b) => a.access_key.localeCompare(b.access_key));
+    return {
+        members,
+        is_truncated,
+        username: account_util._returned_username(requesting_account, requested_account.name.unwrap(), false)
+    };
+}
+
+
+async function update_access_key(req) {
+    const action = IAM_ACTIONS.UPDATE_ACCESS_KEY;
+    const access_key_id = req.rpc_params.access_key;
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account_with_option_itself(
+        req.rpc_params, action, requesting_account);
+    account_util._check_access_key_belongs_to_account(action, requested_account, access_key_id);
+
+    const updating_access_key_obj = _.find(requested_account.access_keys,
+        access_key => access_key.access_key.unwrap() === access_key_id);
+    if (account_util._get_access_key_status(updating_access_key_obj.deactivated) === req.rpc_params.status) {
+        dbg.log0(`AccountSpaceNB.${action} status was not change, not updating the database`);
+        return;
+    }
+    const filtered_access_keys = account_util.get_non_updating_access_key(requested_account, access_key_id);
+    updating_access_key_obj.deactivated = account_util._check_access_key_is_deactivated(req.rpc_params.status);
+    updating_access_key_obj.secret_key = system_store.master_key_manager
+        .encrypt_sensitive_string_with_master_key_id(updating_access_key_obj.secret_key, requested_account.master_key_id._id);
+    filtered_access_keys.push(updating_access_key_obj);
+
+    await system_store.make_changes({
+        update: {
+            accounts: [{
+                _id: requested_account._id,
+                $set: { access_keys: filtered_access_keys }
+            }]
+        }
+    });
+
+    const sys_id = account_util.get_system_id_for_events(req);
+    Dispatcher.instance().activity({
+        event: 'account.update_credentials',
+        level: 'info',
+        system: sys_id,
+        actor: requesting_account._id,
+        account: requested_account._id,
+        desc: `Credentials for ${requested_account.email.unwrap()} were updated by ${requesting_account.email.unwrap()}`,
+    });
+}
+
+async function get_access_key_last_used(req) {
+    const action = IAM_ACTIONS.GET_ACCESS_KEY_LAST_USED;
+    const requesting_account = req.account;
+    const access_key_id = req.rpc_params.access_key;
+    const requested_account = account_util._check_if_iam_user_belongs_to_account_owner_by_access_key(
+        action, requesting_account, access_key_id);
+    const dummy_region = 'us-west-2';
+    const dummy_service_name = 's3';
+    // TODO: Need to return valid last_used_date date, Low priority.
+    return {
+        region: dummy_region, // GAP
+        last_used_date: Date.now(), // GAP
+        service_name: dummy_service_name, // GAP
+        username: requested_account.name.unwrap(),
+    };
+}
+
+async function delete_access_key(req) {
+    const action = IAM_ACTIONS.DELETE_ACCESS_KEY;
+    const access_key_id = req.rpc_params.access_key;
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account_with_option_itself(
+        req.rpc_params, action, requesting_account);
+    account_util._check_access_key_belongs_to_account(action, requested_account, access_key_id);
+    // Filter out the deleting access key from the access key list and save remaining accesskey.
+    const filtered_access_keys = account_util.get_non_updating_access_key(requested_account, access_key_id);
+    const updates = {
+        access_keys: filtered_access_keys,
+    };
+    await system_store.make_changes({
+        update: {
+            accounts: [{
+                _id: requested_account._id,
+                $set: _.omitBy(updates, _.isUndefined),
+            }]
+        }
+    });
+
+    const sys_id = account_util.get_system_id_for_events(req);
+    Dispatcher.instance().activity({
+        event: 'account.delete_credentials',
+        level: 'info',
+        system: sys_id,
+        actor: requesting_account._id,
+        account: requested_account._id,
+        desc: `Credentials for ${requested_account.email.unwrap()} were deleted by ${requesting_account.email.unwrap()}`,
+    });
+}
+
+async function tag_user(req) {
+    const action = IAM_ACTIONS.TAG_USER;
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account(req.rpc_params, action, requesting_account);
+    const existing_tags = requested_account.tagging || [];
+
+    const tags_map = new Map();
+    for (const tag of existing_tags) {
+        tags_map.set(tag.key, tag.value);
+    }
+    for (const tag of req.rpc_params.tags) {
+        tags_map.set(tag.key, tag.value);
+    }
+
+    // enforce AWS tag limit after merging
+    if (tags_map.size > MAX_TAGS) {
+        const message_with_details = `Failed to tag user. User cannot have more than ${MAX_TAGS} tags.`;
+        throw new RpcError('LIMIT_EXCEEDED', message_with_details, 409);
+    }
+
+    const updated_tags = Array.from(tags_map.entries()).map(([key, value]) => ({ key, value }));
+
+    await system_store.make_changes({
+        update: {
+            accounts: [{
+                _id: requested_account._id,
+                $set: { tagging: updated_tags }
+            }]
+        }
+    });
+
+    dbg.log1('AccountSpaceNB.tag_user: successfully tagged user', req.rpc_params.username, 'with', req.rpc_params.tags.length, 'tags');
+}
+
+async function untag_user(req) {
+    const action = IAM_ACTIONS.UNTAG_USER;
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account(req.rpc_params, action, requesting_account);
+    const existing_tags = requested_account.tagging || [];
+
+    const tag_keys_set = new Set(req.rpc_params.tag_keys);
+    const updated_tags = existing_tags.filter(tag => !tag_keys_set.has(tag.key));
+
+    await system_store.make_changes({
+        update: {
+            accounts: [{
+                _id: requested_account._id,
+                $set: { tagging: updated_tags }
+            }]
+        }
+    });
+
+    dbg.log1('AccountSpaceNB.untag_user: successfully removed', req.rpc_params.tag_keys.length, 'tags from user', req.rpc_params.username);
+}
+
+async function list_user_tags(req) {
+    const action = IAM_ACTIONS.LIST_USER_TAGS;
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account(req.rpc_params, action, requesting_account);
+    // TODO: Pagination not supported - currently returns all tags, ignoring marker and max_items params
+    const tags = account_util.get_sorted_list_tags_for_user(requested_account.tagging);
+    dbg.log1('AccountSpaceNB.list_user_tags: returning', tags, 'tags for user', req.rpc_params.username);
+
+    return {
+        tags: tags,
+        is_truncated: false
+    };
+}
+
+async function put_user_policy(req) {
+    const action = IAM_ACTIONS.PUT_USER_POLICY;
+    const requesting_account = req.account;
+    dbg.log1(`AccountSpaceNB.${action}`, req.rpc_params);
+    const requested_account = account_util.validate_and_return_requested_account(req.rpc_params, action, requesting_account);
+    const iam_inline_policies = [...(requested_account.iam_inline_policies || [])];
+    const index_of_iam_inline_policy = account_util._get_iam_policy_index(iam_inline_policies, req.rpc_params.policy_name);
+    const iam_inline_policy_to_add = {
+        policy_name: req.rpc_params.policy_name,
+        policy_document: req.rpc_params.policy_document,
+    };
+    if (index_of_iam_inline_policy === -1) {
+        iam_inline_policies.push(iam_inline_policy_to_add);
+    } else {
+        iam_inline_policies[index_of_iam_inline_policy] = iam_inline_policy_to_add;
+    }
+
+    account_util._check_total_policy_size(iam_inline_policies, req.rpc_params.username);
+    await system_store.make_changes({
+        update: {
+            accounts: [{
+                _id: requested_account._id,
+                $set: {
+                    iam_inline_policies,
+                },
+            }]
+        }
+    });
+}
+
+async function get_user_policy(req) {
+    const action = IAM_ACTIONS.GET_USER_POLICY;
+    dbg.log1(`AccountSpaceNB.${action}`, req.rpc_params);
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account(req.rpc_params, action, requesting_account);
+    const iam_inline_policies = requested_account.iam_inline_policies || [];
+    const iam_inline_policy_index = account_util._check_iam_policy_exists(action, iam_inline_policies, req.rpc_params.policy_name);
+    return {
+        username: req.rpc_params.username,
+        policy_name: req.rpc_params.policy_name,
+        policy_document: JSON.stringify(iam_inline_policies[iam_inline_policy_index].policy_document),
+    };
+}
+
+async function delete_user_policy(req) {
+    const action = IAM_ACTIONS.DELETE_USER_POLICY;
+    dbg.log1(`AccountSpaceNB.${action}`, req.rpc_params);
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account(req.rpc_params, action, requesting_account);
+    const iam_inline_policies = [...(requested_account.iam_inline_policies || [])];
+    const iam_inline_policy_index = account_util._check_iam_policy_exists(action, iam_inline_policies, req.rpc_params.policy_name);
+    iam_inline_policies.splice(iam_inline_policy_index, 1);
+
+    await system_store.make_changes({
+        update: {
+            accounts: [{
+                _id: requested_account._id,
+                $set: {
+                    iam_inline_policies,
+                },
+            }]
+        }
+    });
+}
+
+async function list_user_policies(req) {
+    const action = IAM_ACTIONS.LIST_USER_POLICIES;
+    dbg.log1(`AccountSpaceNB.${action}`, req.rpc_params);
+    const requesting_account = req.account;
+    const requested_account = account_util.validate_and_return_requested_account(req.rpc_params, action, requesting_account);
+    // TODO: Pagination not supported - currently returns all user policies, ignoring marker and max_items params
+    const is_truncated = false;
+    let members = _.map(requested_account.iam_inline_policies || [], iam_inline_policy => iam_inline_policy.policy_name);
+    members = members.sort((a, b) => a.localeCompare(b));
+    return {
+        is_truncated,
+        members
+    };
+}
+
+/**
+ * lookup role account by email
+ * @param {string} role_name
+ * @param {string|nb.ID} owner_account_id
+ * @returns {nb.IamRole|undefined}
+ */
+function _get_iam_role_by_name_and_owner_id(role_name, owner_account_id) {
+    const account = system_store.get_account_by_email(
+        account_util.get_account_email_from_role_name(role_name, owner_account_id));
+    if (!account || account.deleted || !account_util._is_role_identity(account)) return undefined;
+    return account;
+}
+
+/**
+ * return role by name or throw an error
+ * @param {string} role_name
+ * @param {string|nb.ID} owner_account_id
+ * @returns {nb.IamRole}
+ */
+function _get_iam_role_by_name_or_throw(role_name, owner_account_id) {
+    const iam_role = _get_iam_role_by_name_and_owner_id(role_name, owner_account_id);
+    if (!iam_role) {
+        throw new RpcError('NO_SUCH_ENTITY', `The role with name ${role_name} cannot be found.`);
+    }
+    return iam_role;
+}
+
+/**
+ * normalize role owner to account object
+ * @param {nb.Account|nb.ID|undefined} owner
+ * @returns {nb.Account|undefined}
+ */
+function _resolve_owner_account(owner) {
+    if (!owner) return undefined;
+    if (owner.access_keys) return owner;
+    return system_store.data.get_by_id(owner._id || owner);
+}
+
+/**
+ * build account_api role_info response object
+ * @param {nb.IamRole} iam_role
+ * @param {string} account_id
+ * @returns {object}
+ */
+function _return_iam_role_info(iam_role, account_id) {
+    const role_name = account_util._get_role_name(iam_role.name);
+    const owner_account = _resolve_owner_account(iam_role.owner);
+    return {
+        role_id: iam_role._id.toString(),
+        role_name,
+        arn: iam_utils.create_arn_for_role(account_id, role_name, iam_role.iam_path || IAM_DEFAULT_PATH),
+        iam_path: iam_role.iam_path || IAM_DEFAULT_PATH,
+        create_date: iam_role.creation_date,
+        assume_role_policy_document: iam_role.assume_role_policy_document,
+        description: iam_role.description,
+        max_session_duration: iam_role.max_session_duration ?? DEFAULT_MAX_SESSION_DURATION_SECS,
+        owner_access_key: owner_account?.access_keys?.[0]?.access_key,
+        iam_role_policies: iam_role.iam_inline_policies,
+    };
+}
+
+function read_role_by_name(req) {
+    const { role_name, owner_account_id } = req.rpc_params;
+    return _return_iam_role_info(
+        _get_iam_role_by_name_or_throw(role_name, owner_account_id), String(owner_account_id));
+}
+
+async function create_role(req) {
+    const action = IAM_ACTIONS.CREATE_ROLE;
+    const requesting_account = req.account;
+    // currently only root accounts can create roles; IAM users are not supported for this API yet
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account,
+        { role_name: req.rpc_params.role_name, path: req.rpc_params.iam_path || IAM_DEFAULT_PATH }, 'ROLE');
+    const role_name = req.rpc_params.role_name;
+    const account_id = String(requesting_account._id);
+    if (account_util._list_iam_roles_by_owner(account_id).length >= MAX_NUMBER_OF_IAM_ROLES) {
+        throw new RpcError('LIMIT_EXCEEDED',
+            `Cannot exceed quota for RolesPerAccount: ${MAX_NUMBER_OF_IAM_ROLES}.`);
+    }
+    if (_get_iam_role_by_name_and_owner_id(role_name, account_id)) {
+        throw new RpcError('ENTITY_ALREADY_EXISTS', `Role with name ${role_name} already exists.`);
+    }
+    const new_role = _.omitBy({
+        _id: system_store.new_system_store_id(),
+        identity_type: account_util.IDENTITY_TYPES.ROLE,
+        owner: requesting_account._id,
+        name: new SensitiveString(role_name),
+        email: account_util.get_account_email_from_role_name(role_name, account_id),
+        has_login: false,
+        access_keys: [],
+        iam_path: req.rpc_params.iam_path || IAM_DEFAULT_PATH,
+        description: req.rpc_params.description,
+        max_session_duration: req.rpc_params.max_session_duration ?? DEFAULT_MAX_SESSION_DURATION_SECS,
+        assume_role_policy_document: req.rpc_params.assume_role_policy_document,
+        iam_inline_policies: [],
+        creation_date: Date.now(),
+    }, _.isUndefined);
+    await system_store.make_changes({
+        insert: {
+            accounts: [new_role],
+        },
+    });
+    return _return_iam_role_info(new_role, account_id);
+}
+
+async function get_role(req) {
+    const action = IAM_ACTIONS.GET_ROLE;
+    const requesting_account = req.account;
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account,
+        { role_name: req.rpc_params.role_name, path: IAM_DEFAULT_PATH }, 'ROLE');
+    const account_id = String(requesting_account._id);
+    return _return_iam_role_info(
+        _get_iam_role_by_name_or_throw(req.rpc_params.role_name, account_id), account_id);
+}
+
+async function update_role(req) {
+    const action = IAM_ACTIONS.UPDATE_ROLE;
+    const requesting_account = req.account;
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account,
+        { role_name: req.rpc_params.role_name, path: IAM_DEFAULT_PATH }, 'ROLE');
+    const role_to_update = _get_iam_role_by_name_or_throw(
+        req.rpc_params.role_name, requesting_account._id);
+    const updates = _.omitBy({
+        description: req.rpc_params.description,
+        max_session_duration: req.rpc_params.max_session_duration,
+    }, _.isUndefined);
+    if (!_.isEmpty(updates)) {
+        await system_store.make_changes({
+            update: {
+                accounts: [{
+                    _id: role_to_update._id,
+                    $set: updates,
+                }]
+            }
+        });
+    }
+}
+
+async function delete_role(req) {
+    const action = IAM_ACTIONS.DELETE_ROLE;
+    const requesting_account = req.account;
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account,
+        { role_name: req.rpc_params.role_name, path: IAM_DEFAULT_PATH }, 'ROLE');
+    const role_to_delete = _get_iam_role_by_name_or_throw(
+        req.rpc_params.role_name, requesting_account._id);
+    const iam_inline_policies = role_to_delete.iam_inline_policies || [];
+    if (iam_inline_policies.length > 0) {
+        account_util._throw_error_delete_conflict(action, role_to_delete, 'policies');
+    }
+    await system_store.make_changes({
+        remove: {
+            accounts: [role_to_delete._id],
+        }
+    });
+}
+
+async function list_roles(req) {
+    const action = IAM_ACTIONS.LIST_ROLES;
+    const requesting_account = req.account;
+    const is_truncated = false;
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account);
+    // TODO: Pagination not supported - currently returns all roles, ignoring marker and max_items params
+    const account_id = String(requesting_account._id);
+    let members = account_util._list_iam_roles_by_owner(account_id);
+    if (req.rpc_params.iam_path_prefix) {
+        members = _.filter(members, role =>
+            (role.iam_path || IAM_DEFAULT_PATH).startsWith(req.rpc_params.iam_path_prefix));
+    }
+    members = members.sort((a, b) =>
+        account_util._get_role_name(a.name).localeCompare(account_util._get_role_name(b.name)));
+    members = members.map(role => _return_iam_role_info(role, account_id));
+    return { members, is_truncated };
+}
+
+async function put_role_policy(req) {
+    const action = IAM_ACTIONS.PUT_ROLE_POLICY;
+    const requesting_account = req.account;
+    dbg.log1(`AccountSpaceNB.${action}`, req.rpc_params);
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account,
+        { role_name: req.rpc_params.role_name, path: IAM_DEFAULT_PATH }, 'ROLE');
+    const role_to_update = _get_iam_role_by_name_or_throw(
+        req.rpc_params.role_name, requesting_account._id);
+    const iam_inline_policies = [...(role_to_update.iam_inline_policies || [])];
+    const index_of_iam_inline_policy = account_util._get_iam_policy_index(iam_inline_policies, req.rpc_params.policy_name);
+    const iam_inline_policy_to_add = {
+        policy_name: req.rpc_params.policy_name,
+        policy_document: req.rpc_params.policy_document,
+    };
+    if (index_of_iam_inline_policy === -1) {
+        iam_inline_policies.push(iam_inline_policy_to_add);
+    } else {
+        iam_inline_policies[index_of_iam_inline_policy] = iam_inline_policy_to_add;
+    }
+
+    account_util._check_total_policy_size(iam_inline_policies, req.rpc_params.role_name, 'role');
+    await system_store.make_changes({
+        update: {
+            accounts: [{
+                _id: role_to_update._id,
+                $set: {
+                    iam_inline_policies,
+                },
+            }]
+        }
+    });
+}
+
+async function get_role_policy(req) {
+    const action = IAM_ACTIONS.GET_ROLE_POLICY;
+    dbg.log1(`AccountSpaceNB.${action}`, req.rpc_params);
+    const requesting_account = req.account;
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account,
+        { role_name: req.rpc_params.role_name, path: IAM_DEFAULT_PATH }, 'ROLE');
+    const requested_role = _get_iam_role_by_name_or_throw(
+        req.rpc_params.role_name, requesting_account._id);
+    const iam_inline_policies = requested_role.iam_inline_policies || [];
+    const iam_inline_policy_index = account_util._check_iam_policy_exists(
+        action, iam_inline_policies, req.rpc_params.policy_name, 'role');
+    return {
+        role_name: req.rpc_params.role_name,
+        policy_name: req.rpc_params.policy_name,
+        policy_document: JSON.stringify(iam_inline_policies[iam_inline_policy_index].policy_document),
+    };
+}
+
+async function delete_role_policy(req) {
+    const action = IAM_ACTIONS.DELETE_ROLE_POLICY;
+    dbg.log1(`AccountSpaceNB.${action}`, req.rpc_params);
+    const requesting_account = req.account;
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account,
+        { role_name: req.rpc_params.role_name, path: IAM_DEFAULT_PATH }, 'ROLE');
+    const role_to_delete = _get_iam_role_by_name_or_throw(
+        req.rpc_params.role_name, requesting_account._id);
+    const iam_inline_policies = [...(role_to_delete.iam_inline_policies || [])];
+    const iam_inline_policy_index = account_util._check_iam_policy_exists(
+        action, iam_inline_policies, req.rpc_params.policy_name, 'role');
+    iam_inline_policies.splice(iam_inline_policy_index, 1);
+
+    await system_store.make_changes({
+        update: {
+            accounts: [{
+                _id: role_to_delete._id,
+                $set: {
+                    iam_inline_policies,
+                },
+            }]
+        }
+    });
+}
+
+async function list_role_policies(req) {
+    const action = IAM_ACTIONS.LIST_ROLE_POLICIES;
+    dbg.log1(`AccountSpaceNB.${action}`, req.rpc_params);
+    const requesting_account = req.account;
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account,
+        { role_name: req.rpc_params.role_name, path: IAM_DEFAULT_PATH }, 'ROLE');
+    // TODO: Pagination not supported - currently returns all role policies, ignoring marker and max_items params
+    const is_truncated = false;
+    const requested_role = _get_iam_role_by_name_or_throw(
+        req.rpc_params.role_name, requesting_account._id);
+    let members = _.map(requested_role.iam_inline_policies || [], iam_inline_policy => iam_inline_policy.policy_name);
+    members = members.sort((a, b) => a.localeCompare(b));
+    return {
+        is_truncated,
+        members
+    };
+}
+
+async function update_assume_role_policy(req) {
+    const action = IAM_ACTIONS.UPDATE_ASSUME_ROLE_POLICY;
+    const requesting_account = req.account;
+    account_util._check_if_requesting_account_is_root_account(action, requesting_account,
+        { role_name: req.rpc_params.role_name, path: IAM_DEFAULT_PATH }, 'ROLE');
+    const role_to_update = _get_iam_role_by_name_or_throw(
+        req.rpc_params.role_name, requesting_account._id);
+    await system_store.make_changes({
+        update: {
+            accounts: [{
+                _id: role_to_update._id,
+                $set: {
+                    assume_role_policy_document: req.rpc_params.policy_document,
+                },
+            }]
+        }
+    });
 }
 
 // EXPORTS
@@ -1513,7 +1978,6 @@ exports.create_account = create_account;
 exports.create_external_user_account = create_external_user_account;
 exports.read_account = read_account;
 exports.update_account = update_account;
-exports.reset_password = reset_password;
 exports.delete_account = delete_account;
 exports.delete_account_by_property = delete_account_by_property;
 exports.generate_account_keys = generate_account_keys;
@@ -1532,3 +1996,31 @@ exports.ensure_support_account = ensure_support_account;
 exports.verify_authorized_account = verify_authorized_account;
 exports.get_account_usage = get_account_usage;
 exports.read_account_by_access_key = read_account_by_access_key;
+exports.read_role_by_name = read_role_by_name;
+exports.create_role = create_role;
+exports.get_role = get_role;
+exports.update_role = update_role;
+exports.delete_role = delete_role;
+exports.list_roles = list_roles;
+exports.put_role_policy = put_role_policy;
+exports.get_role_policy = get_role_policy;
+exports.delete_role_policy = delete_role_policy;
+exports.list_role_policies = list_role_policies;
+exports.update_assume_role_policy = update_assume_role_policy;
+exports.create_user = create_user;
+exports.get_user = get_user;
+exports.update_user = update_user;
+exports.delete_user = delete_user;
+exports.list_users = list_users;
+exports.create_access_key = create_access_key;
+exports.update_access_key = update_access_key;
+exports.delete_access_key = delete_access_key;
+exports.tag_user = tag_user;
+exports.untag_user = untag_user;
+exports.list_user_tags = list_user_tags;
+exports.list_access_keys = list_access_keys;
+exports.put_user_policy = put_user_policy;
+exports.get_user_policy = get_user_policy;
+exports.delete_user_policy = delete_user_policy;
+exports.list_user_policies = list_user_policies;
+exports.get_access_key_last_used = get_access_key_last_used;

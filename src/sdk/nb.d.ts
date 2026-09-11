@@ -5,8 +5,9 @@ import * as mongodb from 'mongodb';
 import { EventEmitter } from 'events';
 import { Readable, Writable } from 'stream';
 import { IncomingMessage, ServerResponse } from 'http';
+import { ObjectPart, Checksum } from '@aws-sdk/client-s3';
 
-type Semaphore = import('../util/semaphore');
+type Semaphore = import('../util/semaphore').Semaphore;
 type KeysSemaphore = import('../util/keys_semaphore');
 type SensitiveString = import('../util/sensitive_string');
 
@@ -16,7 +17,7 @@ type DigestType = 'sha1' | 'sha256' | 'sha384' | 'sha512';
 type CompressType = 'snappy' | 'zlib';
 type CipherType = 'aes-256-gcm';
 type ParityType = 'isa-c1' | 'isa-rs' | 'cm256';
-type StorageClass = 'STANDARD' | 'GLACIER' | 'GLACIER_IR';
+type StorageClass = 'STANDARD' | 'GLACIER' | 'GLACIER_IR' | 'DEEP_ARCHIVE';
 type ResourceType = 'HOSTS' | 'CLOUD' | 'INTERNAL';
 type NodeType =
     'BLOCK_STORE_S3' |
@@ -26,9 +27,30 @@ type NodeType =
     'BLOCK_STORE_FS' |
     'ENDPOINT_S3';
 
-type S3Response = ServerResponse;
 type S3Request = IncomingMessage & {
+    path: any;
+    query: any;
+    body?: any;
+    params: {
+        bucket: string;
+        key: string;
+    },
+    op_name: string;
+    request_id: string;
+    start_time: number;
     object_sdk: ObjectSDK;
+    virtual_hosted_bucket?: string;
+    content_md5?: Buffer;
+    content_sha256_buf?: Buffer;
+    content_sha256_sig?: string;
+    chunked_content?: boolean;
+    s3_event_method?: string;
+};
+
+type S3Response = ServerResponse & {
+    // notifications fields:
+    size_for_notif?: number;
+    seq?: number; // TODO rename for clarity
 };
 
 type ReplicationLogAction = 'copy' | 'delete' | 'conflict';
@@ -48,6 +70,9 @@ interface Base {
 type ID = mongodb.ObjectID;
 type DBBuffer = mongodb.Binary | Buffer;
 
+type LockType = "EXCLUSIVE" | "SHARED" | undefined;
+type IdentityType = 'ACCOUNT' | 'USER' | 'ROLE';
+
 interface System extends Base {
     _id: ID;
     name: string;
@@ -62,17 +87,40 @@ interface System extends Base {
 
 interface Account extends Base {
     _id: ID;
+    owner?: ID;
     name: string;
     system: System;
     email: SensitiveString;
     next_password_change: Date;
     is_support?: boolean;
+    identity_type?: IdentityType;
     access_keys: Array<{
         access_key: SensitiveString;
         secret_key: SensitiveString;
     }>;
     master_key_id: ID;
+    iam_path?: string;
+    iam_inline_policies?: object[];
+    description?: string; // role-only fields for identity_type ROLE
+    max_session_duration?: number; // role-only fields for identity_type ROLE
+    assume_role_policy_document?: object; // role-only fields for identity_type ROLE
+    creation_date?: number;
+    deleted?: Date;
 }
+
+/** IAM user identity stored in accounts with identity_type === 'USER' */
+type IamUser = Account & {
+    identity_type: 'USER';
+    owner: ID;
+};
+
+/** IAM role identity stored in accounts with identity_type === 'ROLE' */
+type IamRole = Account & {
+    identity_type: 'ROLE';
+    owner: ID;
+    assume_role_policy_document?: object;
+    creation_date: number;
+};
 
 interface NodeAPI extends Base {
     _id: ID;
@@ -178,6 +226,7 @@ interface MirrorStatus {
 
 interface Bucket extends Base {
     _id: ID;
+    owner_account?: ID;
     deleted?: Date;
     name: SensitiveString;
     system: System;
@@ -195,8 +244,10 @@ interface Bucket extends Base {
         last_update: number;
     };
     lifecycle_configuration_rules?: object;
-    lambda_triggers?: object;
     master_key_id: ID;
+    archive_policy?: {
+        deep_archive_resource?: object;
+    };
 }
 
 interface CacheConfig {
@@ -364,8 +415,13 @@ interface ObjectMultipart {
     size: number;
     md5_b64?: string;
     sha256_b64?: string;
+    etag?: string;
     create_time?: Date;
     // partial
+}
+
+interface TargetDataInfo {
+    upload_id?: string;
 }
 
 interface ObjectMD {
@@ -392,11 +448,24 @@ interface ObjectMD {
     md5_b64: string;
     sha256_b64: string;
     storage_class?: StorageClass;
+    target_data_info?: TargetDataInfo;
     xattr: {};
     stats: { reads: number; last_read: Date; };
     encryption: { algorithm: string; kms_key_id: string; context_b64: string; key_md5_b64: string; key_b64: string; };
     tagging: Array<{ key: string; value: string; }>;
     lock_settings: { retention: { mode: string; retain_until_date: Date; }, legal_hold: { status: string } };
+    transition_info?: TransitionInfo;
+    restore_status?: RestoreStatus;
+}
+
+interface TransitionInfo {
+    status: TransitionStatus;
+    transition_start_ts?: Date;
+    transition_end_ts?: Date;
+    source_info?: {
+        storage_class: StorageClass;
+        reclaimed?: Date;
+    };
 }
 
 interface ObjectOwner {
@@ -434,11 +503,17 @@ interface ObjectInfo {
     capacity_size?: number;
     num_multiparts?: number;
     first_range_data?: Buffer;
+    prefetched_mappings?: ChunkInfo[];
     content_length?: number;
     content_range?: string;
     ns?: Namespace;
     storage_class?: StorageClass;
-    restore_status?: { ongoing?: boolean; expiry_time?: Date; };
+    target_data_info?: TargetDataInfo;
+    transition_info?: TransitionInfo;
+    restore_status?: RestoreStatus;
+    checksum?: Checksum;
+    object_parts?: GetObjectAttributesParts;
+    nc_noncurrent_time?: number;
 }
 
 
@@ -663,6 +738,7 @@ interface APIClient {
     readonly func: APIGroup;
     readonly func_node: APIGroup;
     readonly replication: APIGroup;
+    readonly archive: APIGroup;
 
     options: {
         auth_token?: string;
@@ -673,7 +749,6 @@ interface APIClient {
 
     RPC_BUFFERS: symbol;
 
-    create_auth_token(params: APIParams): Promise<object>;
     create_access_key_auth(params: APIParams): Promise<object>;
     create_k8s_auth(params: APIParams): Promise<object>;
 }
@@ -685,7 +760,7 @@ interface APIClient {
  *
  **********************************************************/
 
-type DBType = 'postgres' | 'mongodb' | 'none';
+type DBType = 'postgres' | 'none';
 
 interface DBClient {
     operators: Set<string>;
@@ -728,10 +803,37 @@ interface DBClient {
     check_entity_not_deleted(doc: object, entity: string): object;
     check_update_one(res: object, entity: string): void;
     make_object_diff(current: object, prev: object): object;
+
+    executeSQL<T>(query: string, params: Array<any>, options?: { query_name?: string, preferred_pool?: string }): Promise<sqlResult<T>>;
+
+    initializeMultiTableBulkOp(pool_name?: string): MultiTableBulkOp;
+}
+
+interface MultiTableBulkOp {
+    length: number;
+    insert_many(entries: { table: DBCollection, docs: object[] }[]): this;
+    add_query(sql: string): void;
+    execute(): Promise<BulkOpResult>;
+}
+
+interface BulkOpResult {
+    err: Error | undefined;
+    ok: boolean;
+    nInserted: number;
+    nMatched: number;
+    nModified: number;
+    nRemoved: number;
 }
 
 interface DBSequence {
+    seqname(): string;
     nextsequence(): Promise<number>;
+    nextNsequences(n: number): Promise<{ start: number; end: number}>;
+}
+
+interface sqlResult<T> {
+    rows: T[],
+    rowCount: number | null,
 }
 
 interface DBCollection {
@@ -758,6 +860,10 @@ interface DBCollection {
     stats(): Promise<mongodb.CollStats>;
 
     validate(doc: object, warn?: 'warn'): object;
+    get_id(data: object): string;
+    get_pool(): string;
+    name: any;
+    schema: any;
 }
 
 type DBDoc = any;
@@ -814,14 +920,18 @@ interface Namespace {
     get_blob_block_lists(params: object, object_sdk: ObjectSDK): Promise<any>;
 
     restore_object(params: object, object_sdk: ObjectSDK): Promise<any>;
+    get_object_attribute?(params: object, object_sdk: ObjectSDK): Promise<any>;
 }
 
 interface BucketSpace {
 
     read_account_by_access_key({ access_key: string }): Promise<any>;
+    read_role_by_name({ role_name, owner_account_id }: { role_name: string; owner_account_id: string }): Promise<any>;
     read_bucket_sdk_info({ name: string }): Promise<any>;
+    check_same_stat_bucket(bucket_name: string, bucket_stat: nb.NativeFSStats); // only implemented in bucketspace_fs
+    check_same_stat_account(account_name: string | Symbol, account_stat: nb.NativeFSStats); // only implemented in bucketspace_fs
 
-    list_buckets(object_sdk: ObjectSDK): Promise<any>;
+    list_buckets(params: object, object_sdk: ObjectSDK): Promise<any>;
     read_bucket(params: object): Promise<any>;
     create_bucket(params: object, object_sdk: ObjectSDK): Promise<any>;
     delete_bucket(params: object, object_sdk: ObjectSDK): Promise<any>;
@@ -832,7 +942,7 @@ interface BucketSpace {
 
     set_bucket_versioning(params: object, object_sdk: ObjectSDK): Promise<any>;
 
-    put_bucket_tagging(params: object): Promise<any>;
+    put_bucket_tagging(params: object, object_sdk: ObjectSDK): Promise<any>;
     delete_bucket_tagging(params: object): Promise<any>;
     get_bucket_tagging(params: object): Promise<any>;
 
@@ -852,11 +962,37 @@ interface BucketSpace {
     delete_bucket_policy(params: object): Promise<any>;
     get_bucket_policy(params: object, object_sdk: ObjectSDK): Promise<any>;
 
+    put_vector_bucket_policy(params: object): Promise<any>;
+    delete_vector_bucket_policy(params: object): Promise<any>;
+    get_vector_bucket_policy(params: object): Promise<any>;
+
+    put_bucket_notification(params: object): Promise<any>;
+    get_bucket_notification(params: object): Promise<any>;
+
+    put_bucket_cors(params: object): Promise<any>;
+    delete_bucket_cors(params: object): Promise<any>;
+    get_bucket_cors(params: object): Promise<any>;
+
     get_object_lock_configuration(params: object, object_sdk: ObjectSDK): Promise<any>;
     put_object_lock_configuration(params: object, object_sdk: ObjectSDK): Promise<any>;
 
     is_nsfs_containerized_user_anonymous(token: string): boolean;
     is_nsfs_non_containerized_user_anonymous(token: string): boolean;
+
+    get_public_access_block({ bucket_name }): Promise<any>;
+    put_public_access_block({ bucket_name, public_access_block }): Promise<any>;
+    delete_public_access_block({ bucket_name }): Promise<any>;
+
+    create_vector_bucket(params: object): Promise<any>;
+    get_vector_bucket({ vector_bucket_name }): Promise<any>;
+    delete_vector_bucket({ vector_bucket_name }): Promise<any>;
+    list_vector_buckets({ max_results, prefix, next_token }): Promise<any>;
+
+    create_vector_index(params: object): Promise<any>;
+    get_vector_index({ vector_bucket_name, vector_index_name }): Promise<any>;
+    list_vector_indices({ vector_bucket_name, max_results, prefix, next_token }): Promise<any>;
+    delete_vector_index({ vector_bucket_name, vector_index_name }): Promise<any>;
+    add_rows_since_reindex({vector_bucket_name, vector_index_name, delta}): Promise<any>;
 }
 
 /**********************************************************
@@ -883,6 +1019,27 @@ interface AccountSpace {
     get_access_key_last_used(params: object, account_sdk: AccountSDK): Promise<any>;
     delete_access_key(params: object, account_sdk: AccountSDK): Promise<any>;
     list_access_keys(params: object, account_sdk: AccountSDK): Promise<any>;
+    // user tagging
+    tag_user(params: object, account_sdk: AccountSDK): Promise<any>;
+    untag_user(params: object, account_sdk: AccountSDK): Promise<any>;
+    list_user_tags(params: object, account_sdk: AccountSDK): Promise<any>;
+    // inline user policy
+    put_user_policy(params: object, account_sdk: AccountSDK): Promise<any>;
+    get_user_policy(params: object, account_sdk: AccountSDK): Promise<any>;
+    delete_user_policy(params: object, account_sdk: AccountSDK): Promise<any>;
+    list_user_policies(params: object, account_sdk: AccountSDK): Promise<any>;
+    // role (CRUD)
+    create_role(params: object, account_sdk: AccountSDK): Promise<any>;
+    get_role(params: object, account_sdk: AccountSDK): Promise<any>;
+    update_role(params: object, account_sdk: AccountSDK): Promise<any>;
+    delete_role(params: object, account_sdk: AccountSDK): Promise<any>;
+    list_roles(params: object, account_sdk: AccountSDK): Promise<any>;
+    // role policy
+    put_role_policy(params: object, account_sdk: AccountSDK): Promise<any>;
+    get_role_policy(params: object, account_sdk: AccountSDK): Promise<any>;
+    delete_role_policy(params: object, account_sdk: AccountSDK): Promise<any>;
+    list_role_policies(params: object, account_sdk: AccountSDK): Promise<any>;
+    update_assume_role_policy(params: object, account_sdk: AccountSDK): Promise<any>;
 }
 
 
@@ -920,6 +1077,10 @@ interface Native {
 
     S3Select: { new(options: S3SelectOptions): S3Select };
     select_parquet: boolean;
+
+    CuObjServerNapi: { new(params: CuObjServerNapiParams): CuObjServerNapi };
+    CuObjClientNapi: { new(): CuObjClientNapi };
+    CudaMemory: { new(size: number): CudaMemory };
 }
 
 interface NativeFS {
@@ -940,6 +1101,8 @@ interface NativeFS {
     checkAccess(fs_context: NativeFSContext, path: string): Promise<void>;
     getsinglexattr(fs_context: NativeFSContext, path: string, key: string): Promise<string>;
     getpwname(fs_context: NativeFSContext, user: string): Promise<NativeFSUserObject>;
+    getSupplementalGroupsByUid(fs_context: NativeFSContext, uid: number): Promise<number[]>;
+    getSupplementalGroupsByUserName(fs_context: NativeFSContext, username: string, primaryGid: number): Promise<number[]>;
 
     readFile(
         fs_context: NativeFSContext,
@@ -961,6 +1124,7 @@ interface NativeFS {
         xattr_clear_prefix?: string;
     }): Promise<void>;
     fsync(fs_context: NativeFSContext, path: string): Promise<void>;
+    fcntlgetlock(fs_context: NativeFSContext, path: string): Promise<LockType>;
 
     rename(fs_context: NativeFSContext, from_path: string, to_path: string): Promise<void>;
     link(fs_context: NativeFSContext, from_path: string, to_path: string): Promise<void>;
@@ -977,7 +1141,7 @@ interface NativeFS {
 
     dio_buffer_alloc(size: number): Buffer;
     set_debug_level(level: number);
-    set_log_config(stderr_enabled: boolean, syslog_enabled: boolean);
+    set_log_config(stderr_enabled: boolean, syslog_enabled: boolean, debug_facility: string);
 
     S_IFMT: number;
     S_IFDIR: number;
@@ -990,6 +1154,7 @@ interface NativeFS {
 
     gpfs?: {
         register_gpfs_noobaa(gpfs_noobaa_args: GPFSNooBaaArgs);
+        rdma_enabled?: boolean;
     };
 }
 
@@ -1000,11 +1165,37 @@ interface NativeFile {
     write(fs_context: NativeFSContext, buffer: Buffer, len: number, offset?: number): Promise<void>;
     writev(fs_context: NativeFSContext, buffers: Buffer[], offset?: number): Promise<void>;
     replacexattr(fs_context: NativeFSContext, xattr: NativeFSXattr, clear_prefix?: string): Promise<void>;
-    linkfileat(fs_context: NativeFSContext, path: string, fd?: number): Promise<void>;
+    linkfileat(fs_context: NativeFSContext, path: string, fd?: number, should_not_override?: boolean): Promise<void>;
     fsync(fs_context: NativeFSContext): Promise<void>;
     fd: number;
     flock(fs_context: NativeFSContext, operation: "EXCLUSIVE" | "SHARED" | "UNLOCK"): Promise<void>;
     fcntllock(fs_context: NativeFSContext, operation: "EXCLUSIVE" | "SHARED" | "UNLOCK"): Promise<void>;
+    /**
+     * NOTE: This function in most cases must NOT be called from the
+     * same fd from which a lock was acquired earlier as the locks
+     * are associated with the FD itself and the result of this
+     * function in those cases would be meaningless.
+     * @param fs_context 
+     */
+    fcntlgetlock(fs_context: NativeFSContext): Promise<LockType>;
+    read_rdma(
+        fs_context: NativeFSContext,
+        client_buf_desc: string,
+        client_buf_offset: number,
+        pos: number,
+        size: number,
+        dc_key: number,
+        fabnum: number)
+        : Promise<number>;
+    write_rdma(
+        fs_context: NativeFSContext,
+        client_buf_desc: string,
+        client_buf_offset: number,
+        pos: number,
+        size: number,
+        dc_key: number,
+        fabnum: number)
+        : Promise<number>;
 }
 
 interface NativeDir {
@@ -1019,9 +1210,11 @@ interface NativeFSContext {
     uid?: number;
     gid?: number;
     backend?: string;
+    supplemental_groups?: number[];
     warn_threshold_ms?: number;
     report_fs_stats?: Function;
     do_ctime_check?: boolean;
+    use_dmapi?: boolean,
 }
 
 type GPFSNooBaaArgs = {
@@ -1096,7 +1289,7 @@ interface X509Name {
     O: string;
 }
 
-type select_input_format =  'CSV' | 'JSON' | 'Parquet';
+type select_input_format = 'CSV' | 'JSON' | 'Parquet';
 interface S3SelectOptions {
     query: string;
     input_format: select_input_format;
@@ -1117,12 +1310,112 @@ interface S3Select {
     select_parquet(): Promise<Buffer>;
 }
 
+//////////
+// RDMA //
+//////////
+
+interface RdmaInfo {
+    desc: string; // rdma buffer descriptor (token)
+    offset: number; // byte offset in the buffer
+    size: number; // max buffer size in bytes
+    ip: string; // rdma interface ip
+}
+
+interface RdmaReply {
+    status_code: number; // 501 for not supported, 200,204,206 for success
+    num_bytes?: number;
+}
+
+interface CuObjServerNapiParams {
+    ip: string;
+    port: number;
+    log_level?: 'ERROR' | 'INFO' | 'DEBUG';
+    use_telemetry?: boolean;
+    use_async_events?: boolean;
+    num_dcis?: number;
+    cq_depth?: number;
+    dc_key?: number;
+    ibv_poll_max_comp_event?: number;
+    service_level?: number;
+    hop_limit?: number;
+    pkey_index?: number;
+    max_wr?: number;
+    max_sge?: number;
+    delay_mode?: number;
+    delay_interval?: number;
+    qp_reset_on_failure?: boolean;
+    retry_count?: number;
+}
+
+interface CuObjServerNapi {
+    register_buffer(server_buf: Buffer): void;
+    deregister_buffer(server_buf: Buffer): void;
+    is_registered_buffer(server_buf: Buffer): boolean;
+    rdma(
+        op_type: 'GET' | 'PUT',
+        op_key: string,
+        client_buf_desc: string,
+        client_buf_offset: number,
+        server_buf: Buffer,
+        server_buf_offset: number,
+        max_size: number,
+    ): Promise<number>;
+}
+
+interface CuObjClientNapi {
+    register_buffer(client_buf: Buffer): void;
+    deregister_buffer(client_buf: Buffer): void;
+    is_registered_buffer(client_buf: Buffer): boolean;
+    rdma(
+        op_type: 'GET' | 'PUT',
+        client_buf: Buffer,
+        func: (rdma_info: RdmaInfo, callback: NodeCallback<number>) => void,
+    ): Promise<number>;
+}
+
+interface CudaMemory {
+    free(): void;
+    fill(value: number, start?: number, end?: number): number;
+    as_buffer(start?: number, end?: number): Buffer;
+    copy_to_host_new(start?: number, end?: number): Buffer;
+    copy_to_host(buffer: Buffer, start?: number, end?: number): number;
+    copy_from_host(buffer: Buffer, start?: number, end?: number): number;
+}
+
 type NodeCallback<T = void> = (err: Error | null, res?: T) => void;
 
 type RestoreState = 'CAN_RESTORE' | 'ONGOING' | 'RESTORED';
+type TransitionStatus = 'IN_PROGRESS' | 'DONE';
 
 interface RestoreStatus {
-  state: nb.RestoreState;
-  ongoing?: boolean;
-  expiry_time?: Date;
+    state?: nb.RestoreState; // currently used in NC Glacier only
+    ongoing?: boolean;
+    ongoing_since?: Date;
+    expiry_time?: Date;
+    days?: number; // currently used in MSC only
+
+    tape_info?: TapeInfo[];
+}
+
+interface TapeInfo {
+    volser: string;
+    poolid: string;
+    libid: string;
+}
+
+/**********************************************************
+ *
+ * OTHER - S3 Structure
+ *
+ **********************************************************/
+
+// Since the interface is a bit different between the SDKs
+// we couldn't import and reuse
+interface GetObjectAttributesParts {
+    TotalPartsCount?: number;
+    PartNumberMarker?: string; // in AWS SDK V2 it is number
+    NextPartNumberMarker?: string; // in AWS SDK V2 it is number
+    MaxParts?: number;
+    IsTruncated?: boolean;
+    Parts?: ObjectPart[];
 }

@@ -1,30 +1,35 @@
 /* Copyright (C) 2016 NooBaa */
 'use strict';
 
+const mime = require('mime-types');
 const dbg = require('../../../util/debug_module')(__filename);
 const s3_utils = require('../s3_utils');
 const S3Error = require('../s3_errors').S3Error;
 const http_utils = require('../../../util/http_utils');
-const mime = require('mime');
+const rdma_utils = require('../../../util/rdma_utils');
 const config = require('../../../../config');
 
 const s3_error_options = {
     ErrorClass: S3Error,
     error_missing_content_length: S3Error.MissingContentLength
 };
+
 /**
  * http://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectPUT.html
  * http://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectCOPY.html
+ * @param {nb.S3Request} req
+ * @param {nb.S3Response} res
  */
 async function put_object(req, res) {
     const encryption = s3_utils.parse_encryption(req);
     const copy_source = s3_utils.parse_copy_source(req);
     const tagging = s3_utils.parse_tagging_header(req);
     const storage_class = s3_utils.parse_storage_class_header(req);
+    const rdma_info = rdma_utils.parse_rdma_info(req);
     if (config.DENY_UPLOAD_TO_STORAGE_CLASS_STANDARD && storage_class === s3_utils.STORAGE_CLASS_STANDARD) {
         throw new S3Error(S3Error.InvalidStorageClass);
     }
-    const lock_settings = config.WORM_ENABLED ? s3_utils.parse_lock_header(req) : undefined;
+    const lock_settings = s3_utils.parse_lock_header(req);
     // Copy request sends empty content and not relevant to the object data
     const { size, md5_b64, sha256_b64 } = copy_source ? {} : {
         size: http_utils.parse_content_length(req, s3_error_options),
@@ -34,15 +39,18 @@ async function put_object(req, res) {
 
     dbg.log0('PUT OBJECT', req.params.bucket, req.params.key,
         req.headers['x-amz-copy-source'] || '', encryption || '');
+    //for copy, use correct s3_event_method. otherwise, just use default (req.method)
+    req.s3_event_method = copy_source ? 'Copy' : undefined;
 
     const source_stream = req.chunked_content ? s3_utils.decode_chunked_upload(req) : req;
     const reply = await req.object_sdk.upload_object({
         bucket: req.params.bucket,
         key: req.params.key,
-        content_type: req.headers['content-type'] || (copy_source ? undefined : (mime.getType(req.params.key) || 'application/octet-stream')),
+        content_type: req.headers['content-type'] || (copy_source ? undefined : (mime.lookup(req.params.key) || 'application/octet-stream')),
         content_encoding: req.headers['content-encoding'],
         copy_source,
         source_stream,
+        rdma_info,
         size,
         md5_b64,
         sha256_b64,
@@ -55,18 +63,23 @@ async function put_object(req, res) {
         encryption,
         lock_settings,
         storage_class,
-        azure_invalid_md_header: req.headers['azure-metadata-handling'] || undefined
+        azure_invalid_md_header: req.headers['azure-metadata-handling'] || undefined,
     });
 
     if (reply.version_id && reply.version_id !== 'null') {
         res.setHeader('x-amz-version-id', reply.version_id);
     }
     s3_utils.set_encryption_response_headers(req, res, reply.encryption);
+    rdma_utils.set_rdma_response_headers(req, res, rdma_info, reply.rdma_reply);
+
+    res.size_for_notif = size || reply.size;
 
     if (copy_source) {
         // TODO: This needs to be checked regarding copy between diff namespaces
         // In that case we do not have the copy_source property and just read and upload the stream
-        if (reply.copy_source && reply.copy_source.version_id) res.setHeader('x-amz-copy-source-version-id', reply.copy_source.version_id);
+        if (reply.copy_source && reply.copy_source.version_id) {
+            res.setHeader('x-amz-copy-source-version-id', reply.copy_source.version_id);
+        }
         return {
             CopyObjectResult: {
                 // TODO S3 last modified and etag should be for the new part
@@ -76,6 +89,19 @@ async function put_object(req, res) {
         };
     }
     res.setHeader('ETag', `"${reply.etag}"`);
+
+    const object_info = {
+        key: req.params.key,
+        create_time: new Date().getTime(),
+        size: size,
+        tagging: tagging,
+    };
+    await http_utils.set_expiration_header(req, res, object_info); // setting expiration header for bucket lifecycle
+
+    if (reply.seq) {
+        res.seq = reply.seq;
+        delete reply.seq;
+    }
 }
 
 

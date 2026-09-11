@@ -54,20 +54,17 @@ function select_mirror_for_write(tier, tiering, tiering_status, location_info) {
     for (const mirror of tier.mirrors) {
         const mirror_status = tier_status.mirrors_storage[mirror_index];
         const local_pool = find_local_pool(mirror.spread_pools, location_info);
-        const is_mongo_included = mirror.spread_pools.some(pool => Boolean(pool.mongo_pool_info));
         const is_local_pool_valid = local_pool && tier_status.pools[local_pool._id.toHexString()].valid_for_allocation;
         const is_regular_pools_valid = size_utils.json_to_bigint(mirror_status.regular_free).greater(config.MIN_TIER_FREE_THRESHOLD);
         const is_redundant_pools_valid = size_utils.json_to_bigint(mirror_status.redundant_free).greater(config.MIN_TIER_FREE_THRESHOLD);
 
         let weight = 0;
-        if (is_mongo_included) {
-            weight = 1;
-        } else if (is_local_pool_valid) {
-            weight = 4;
-        } else if (is_regular_pools_valid) {
+        if (is_local_pool_valid) {
             weight = 3;
-        } else if (is_redundant_pools_valid) {
+        } else if (is_regular_pools_valid) {
             weight = 2;
+        } else if (is_redundant_pools_valid) {
+            weight = 1;
         }
 
         if (!selected || weight > selected_weight || (weight === selected_weight && Math.random() > 0.5)) {
@@ -186,7 +183,7 @@ function map_chunk(chunk, tier, tiering, tiering_status, location_info) {
         }
 
         /**
-         * @param {nb.TierMirror} mirror 
+         * @param {nb.TierMirror} mirror
          */
         function map_frag_in_mirror(mirror) {
             const used_blocks = [];
@@ -291,6 +288,13 @@ function is_chunk_good_for_dedup(chunk) {
     if (!chunk.is_accessible) return false;
     if (chunk.is_building_blocks) return false;
     if (chunk.is_building_frags) return false;
+
+    // reject chunks that are not at least config.MIN_CHUNK_AGE_FOR_DEDUP old
+    // this is to avoid deduping chunks that might be from a previous attempt to write the same object
+    // see https://bugzilla.redhat.com/show_bug.cgi?id=2256223
+    const chunk_age = Date.now() - chunk._id.getTimestamp().getTime();
+    if (chunk_age < config.MIN_CHUNK_AGE_FOR_DEDUP) return false;
+
     return true;
 }
 
@@ -360,15 +364,15 @@ function _block_sort_newer_first(block1, block2) {
 
 
 /**
- * @param {nb.Pool} pool 
+ * @param {nb.Pool} pool
  * @returns {boolean}
  */
 function _pool_has_redundancy(pool) {
-    return Boolean(pool.cloud_pool_info || pool.mongo_pool_info);
+    return Boolean(pool.cloud_pool_info);
 }
 
 // /**
-//  * 
+//  *
 //  * @param {nb.Chunk} chunk
 //  * @param {nb.LocationInfo} [location_info]
 //  */

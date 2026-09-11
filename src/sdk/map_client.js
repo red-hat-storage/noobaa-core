@@ -16,7 +16,7 @@ const LRUCache = require('../util/lru_cache');
 const s3_utils = require('../endpoint/s3/s3_utils');
 const db_client = require('../util/db_client');
 const nb_native = require('../util/nb_native');
-const Semaphore = require('../util/semaphore');
+const semaphore = require('../util/semaphore');
 const KeysSemaphore = require('../util/keys_semaphore');
 const block_store_client = require('../agent/block_store_services/block_store_client').instance();
 const system_store = require('../server/system_services/system_store').get_instance();
@@ -25,9 +25,9 @@ const { ChunkAPI } = require('./map_api_types');
 const { RpcError, RPC_BUFFERS } = require('../rpc');
 
 // semphores global to the client
-const block_write_sem_global = new Semaphore(config.IO_WRITE_CONCURRENCY_GLOBAL);
-const block_replicate_sem_global = new Semaphore(config.IO_REPLICATE_CONCURRENCY_GLOBAL);
-const block_read_sem_global = new Semaphore(config.IO_READ_CONCURRENCY_GLOBAL);
+const block_write_sem_global = new semaphore.Semaphore(config.IO_WRITE_CONCURRENCY_GLOBAL);
+const block_replicate_sem_global = new semaphore.Semaphore(config.IO_REPLICATE_CONCURRENCY_GLOBAL);
+const block_read_sem_global = new semaphore.Semaphore(config.IO_READ_CONCURRENCY_GLOBAL);
 
 // semphores specific to an agent
 const block_write_sem_agent = new KeysSemaphore(config.IO_WRITE_CONCURRENCY_AGENT);
@@ -89,9 +89,11 @@ class MapClient {
      * @param {Partial<nb.ObjectInfo>} [props.object_md]
      * @param {number} [props.read_start]
      * @param {number} [props.read_end]
+     * @param {nb.ChunkInfo[]} [props.prefetched_chunks]
      * @param {nb.LocationInfo} [props.location_info]
      * @param {nb.Tier} [props.move_to_tier]
      * @param {boolean} [props.check_dups]
+     * @param {boolean} [props.skip_put_mapping]
      * @param {boolean} [props.verification_mode]
      * @param {Object} props.rpc_client
      * @param {string} [props.desc]
@@ -103,9 +105,11 @@ class MapClient {
         this.object_md = props.object_md;
         this.read_start = props.read_start;
         this.read_end = props.read_end;
+        this.prefetched_chunks = props.prefetched_chunks;
         this.location_info = props.location_info;
         this.move_to_tier = props.move_to_tier;
         this.check_dups = Boolean(props.check_dups);
+        this.skip_put_mapping = Boolean(props.skip_put_mapping);
         this.rpc_client = props.rpc_client;
         this.desc = props.desc;
         this.report_error = props.report_error;
@@ -121,7 +125,10 @@ class MapClient {
         this.chunks = chunks;
         await this.process_mapping();
         await this.move_blocks_to_storage_class();
-        await this.put_mapping();
+        // Deferred simple upload: caller persists mappings (complete_object_upload or staged put_mapping).
+        if (!this.skip_put_mapping) {
+            await this.put_mapping();
+        }
     }
 
     /**
@@ -390,9 +397,11 @@ class MapClient {
             obj_id: this.object_md.obj_id,
             bucket: this.object_md.bucket,
             key: this.object_md.key,
+            size: this.object_md.size,
             start: this.read_start,
             end: this.read_end,
             location_info: this.location_info,
+            prefetched_chunks: this.prefetched_chunks,
         });
         return res.chunks.map(chunk_info => {
             // TODO: Maybe move this to map_reader?
@@ -652,7 +661,7 @@ class MapClient {
                 });
                 dbg.log1('MapClient: move_blocks_to_storage_class SUCCEEDED', 'ADDR:', agent_address, 'MOVED:', moved);
             } catch (err) {
-                dbg.error('MapClient: move_blocks_to_storage_class FAILED', 'ADDR:', agent_address, 'ERROR', err,);
+                dbg.error('MapClient: move_blocks_to_storage_class FAILED', 'ADDR:', agent_address, 'ERROR', err);
             }
         });
     }

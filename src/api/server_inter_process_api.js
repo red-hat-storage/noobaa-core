@@ -17,24 +17,10 @@ module.exports = {
             params: {
                 type: 'object',
                 properties: {
-                    since: { idate: true }
-                }
-            },
-            auth: {
-                system: false
-            }
-        },
-
-        update_mongo_connection_string: {
-            method: 'POST',
-            params: {
-                type: 'object',
-                properties: {
-                    rs_name: {
+                    since: { idate: true },
+                    load_source: {
                         type: 'string',
-                    },
-                    skip_load_system_store: {
-                        type: 'boolean'
+                        enum: ['DB', 'CORE']
                     }
                 }
             },
@@ -43,22 +29,5 @@ module.exports = {
             }
         },
 
-        update_master_change: {
-            method: 'POST',
-            params: {
-                type: 'object',
-                properties: {
-                    is_master: {
-                        type: 'boolean'
-                    },
-                    master_address: {
-                        type: 'string',
-                    },
-                }
-            },
-            auth: {
-                system: false
-            }
-        }
     }
 };

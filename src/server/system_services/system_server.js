@@ -5,7 +5,6 @@ require('../../util/dotenv').load();
 
 const _ = require('lodash');
 const net = require('net');
-const ip_module = require('ip');
 const moment = require('moment');
 const util = require('util');
 
@@ -18,8 +17,9 @@ const cutil = require('../utils/clustering_utils');
 const config = require('../../../config');
 const { BucketStatsStore } = require('../analytic_services/bucket_stats_store');
 const { EndpointStatsStore } = require('../analytic_services/endpoint_stats_store');
+const net_utils = require('../../util/net_utils');
 const os_utils = require('../../util/os_utils');
-const { RpcError } = require('../../rpc');
+const { RpcError, RPC_BUFFERS } = require('../../rpc');
 const nb_native = require('../../util/nb_native');
 const Dispatcher = require('../notifications/dispatcher');
 const size_utils = require('../../util/size_utils');
@@ -27,7 +27,6 @@ const server_rpc = require('../server_rpc');
 const pool_server = require('./pool_server');
 const tier_server = require('./tier_server');
 const auth_server = require('../common_services/auth_server');
-const node_server = require('../node_services/node_server');
 const nodes_client = require('../node_services/nodes_client');
 const system_store = require('../system_services/system_store').get_instance();
 const system_utils = require('../utils/system_utils');
@@ -155,9 +154,6 @@ function new_system_defaults(name, owner_account_id) {
             udp_port: true,
         },
         debug_level: 0,
-        mongo_upgrade: {
-            blocks_to_buckets: true
-        },
         last_stats_report: 0,
         freemium_cap: {
             phone_home_upgraded: false,
@@ -188,14 +184,10 @@ function new_system_changes(req, name, owner_account_id) {
     system.master_key_id = m_key._id;
 
     let default_pool;
-    if (config.DEFAULT_POOL_TYPE === 'INTERNAL') {
-        const pool_name = `${config.INTERNAL_STORAGE_POOL_NAME}-${system._id}`;
-        const mongo_pool = pool_server.new_pool_defaults(pool_name, system._id, 'INTERNAL', 'BLOCK_STORE_MONGO', owner_account_id);
-        mongo_pool.mongo_pool_info = {};
-        default_pool = mongo_pool;
-    } else if (config.DEFAULT_POOL_TYPE === 'HOSTS') {
+    if (config.DEFAULT_POOL_TYPE === 'HOSTS') {
         const pool_name = config.DEFAULT_POOL_NAME;
         const fs_pool = pool_server.new_pool_defaults(pool_name, system._id, 'HOSTS', 'BLOCK_STORE_FS', owner_account_id);
+        fs_pool.is_default_pool = true;
         fs_pool.hosts_pool_info = { is_managed: false, host_count: 0 };
         default_pool = fs_pool;
     } else {
@@ -301,6 +293,16 @@ function get_system_status(req) {
         state: state.mode,
         last_state_change: state.last_update
     };
+}
+
+async function get_system_store() {
+    try {
+        return {
+            [RPC_BUFFERS]: {data: Buffer.from(JSON.stringify(await system_store.recent_db_data()))},
+        };
+    } catch (e) {
+        dbg.error("Failed getting system store", e);
+    }
 }
 
 
@@ -491,7 +493,6 @@ async function read_system(req) {
         nodes_aggregate_pool_with_cloud_no_mongo,
         hosts_aggregate_pool,
         accounts,
-        funcs,
         buckets_stats,
         endpoint_groups
     } = await P.map_props({
@@ -517,15 +518,6 @@ async function read_system(req) {
 
         refresh_system_alloc_unused: node_allocator.refresh_system_alloc(system),
 
-        funcs: P.resolve()
-            // using default domain - will serve the list_funcs from web_server so if
-            // endpoint is down it will not fail the read_system
-            .then(() => server_rpc.client.func.list_funcs({}, {
-                auth_token: req.auth_token,
-                domain: 'default'
-            }))
-            .then(res => res.functions),
-
         buckets_stats: BucketStatsStore.instance().get_all_buckets_stats({ system: system._id }),
         endpoint_groups: _get_endpoint_groups()
 
@@ -545,7 +537,7 @@ async function read_system(req) {
             (bucket.storage_stats && bucket.storage_stats.objects_count) || 0
         );
     });
-    const ip_address = ip_module.address();
+    const ip_address = net_utils.get_local_address();
     const n2n_config = system.n2n_config;
     const debug_time = system.debug_mode ?
         Math.max(0, config.DEBUG_MODE_PERIOD - (Date.now() - system.debug_mode)) :
@@ -605,12 +597,10 @@ async function read_system(req) {
             bucket => {
                 const tiering_pools_status = node_allocator.get_tiering_status(bucket.tiering);
                 Object.assign(tiering_status_by_tier, tiering_pools_status);
-                const func_configs = funcs.map(func => func.config);
                 const b = bucket_server.get_bucket_info({
                     bucket,
                     nodes_aggregate_pool: nodes_aggregate_pool_with_cloud_and_mongo,
                     hosts_aggregate_pool,
-                    func_configs,
                     bucket_stats: stats_by_bucket[bucket.name],
                 });
 
@@ -619,14 +609,13 @@ async function read_system(req) {
         namespace_resources: _.map(system.namespace_resources_by_name,
             ns => pool_server.get_namespace_resource_info(ns)),
         pools: _.filter(system.pools_by_name,
-                pool => (!_.get(pool, 'cloud_pool_info.pending_delete') && !_.get(pool, 'mongo_pool_info.pending_delete')))
+                pool => (!_.get(pool, 'cloud_pool_info.pending_delete')))
             .map(pool => pool_server.get_pool_info(pool, nodes_aggregate_pool_with_cloud_and_mongo, hosts_aggregate_pool)),
         tiers: _.map(system.tiers_by_name,
             tier => tier_server.get_tier_info(tier,
                 nodes_aggregate_pool_with_cloud_and_mongo,
                 tiering_status_by_tier[String(tier._id)])),
         accounts: accounts,
-        functions: funcs,
         storage: size_utils.to_bigint_storage(_.defaults({
             used: objects_sys.size,
         }, nodes_aggregate_pool_with_cloud_no_mongo.storage, SYS_STORAGE_DEFAULTS)),
@@ -707,17 +696,6 @@ function set_maintenance_mode(req) {
             });
         });
 }
-
-function set_webserver_master_state(req) {
-    if (req.rpc_params.is_master) {
-        //Going Master //TODO:: add this one we get back to HA
-        node_server.start_monitor();
-    } else {
-        //Stepping Down
-        node_server.stop_monitor();
-    }
-}
-
 
 /**
  *
@@ -880,21 +858,6 @@ async function _ensure_internal_structure(system_id) {
 
     const support_account = _.find(system_store.data.accounts, account => account.is_support);
     if (!support_account) throw new Error('SUPPORT ACCOUNT DOES NOT EXIST');
-    // Skip creation of agent on PostgreSQL
-    if (config.DB_TYPE !== 'mongodb') return;
-    try {
-        server_rpc.client.hosted_agents.create_pool_agent({
-            pool_name: `${config.INTERNAL_STORAGE_POOL_NAME}-${system_id}`
-        }, {
-            auth_token: auth_server.make_auth_token({
-                system_id,
-                role: 'admin',
-                account_id: support_account._id
-            })
-        });
-    } catch (err) {
-        throw new Error('MONGO POOL CREATION FAILURE:' + err);
-    }
 }
 
 async function get_join_cluster_yaml(req) {
@@ -1604,7 +1567,6 @@ exports.log_client_console = log_client_console;
 
 exports.update_n2n_config = update_n2n_config;
 exports.set_maintenance_mode = set_maintenance_mode;
-exports.set_webserver_master_state = set_webserver_master_state;
 exports.get_join_cluster_yaml = get_join_cluster_yaml;
 exports.update_endpoint_group = update_endpoint_group;
 exports.get_endpoints_history = get_endpoints_history;
@@ -1613,3 +1575,5 @@ exports.rotate_master_key = rotate_master_key;
 exports.disable_master_key = disable_master_key;
 exports.enable_master_key = enable_master_key;
 exports.upgrade_master_keys = upgrade_master_keys;
+
+exports.get_system_store = get_system_store;

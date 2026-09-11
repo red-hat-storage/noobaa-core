@@ -55,6 +55,8 @@ const PARTIAL_STATS_REQUESTED_GRACE_TIME = 30 * 1000;
 let nsfs_io_counters = _new_namespace_nsfs_stats();
 // Will hold the op stats (op name, min/max/avg time, count, error count)
 let op_stats = {};
+// Will hold the iam op stats (op name, min/max/avg time, count, error count)
+let iam_stats = {};
 let fs_workers_stats = {};
 
 /*
@@ -296,8 +298,10 @@ async function get_partial_providers_stats(req) {
         'AWS',
         'AWSSTS',
         'AZURE',
+        'AZURESTS',
         'S3_COMPATIBLE',
         'GOOGLE',
+        'GOOGLE_STS',
     ];
     try {
         for (const bucket of system_store.data.buckets) {
@@ -309,8 +313,8 @@ async function get_partial_providers_stats(req) {
                 const pool = system_store.data.pools.find(pool_rec => String(pool_rec._id) === String(key));
                 // TODO: Handle deleted pools
                 if (!pool) continue;
-                if (pool.mongo_pool_info) continue;
                 let type = 'KUBERNETES';
+                if (pool.is_default_pool) continue;
                 if (pool.cloud_pool_info) {
                     type = (supported_cloud_types.includes(pool.cloud_pool_info.endpoint_type)) ?
                         pool.cloud_pool_info.endpoint_type : 'OTHERS';
@@ -419,6 +423,19 @@ async function get_partial_systems_stats(req) {
     }
 }
 
+function _get_bucket_quota_info(bucket) {
+    const quota = new Quota(bucket.quota);
+    const { size_used_percent, quantity_used_percent } = quota.get_bucket_quota_usages_percent(bucket);
+    const quota_max_objects = quota.get_quota_by_quantity() === '0' ? 0 : parseInt(quota.get_quota_by_quantity(), 10);
+    const quota_max_bytes = quota.get_quota_by_size() === '0' ? 0 : size_utils.json_to_bigint(quota.get_quota_by_size()).toJSNumber();
+
+    return {
+        size_used_percent,
+        quantity_used_percent,
+        quota_max_objects,
+        quota_max_bytes
+    };
+}
 
 async function _partial_buckets_info(req) {
     const buckets_stats = _.cloneDeep(PARTIAL_BUCKETS_STATS_DEFAULTS);
@@ -463,7 +480,7 @@ async function _partial_buckets_info(req) {
                 'OPTIMAL',
                 'NO_RESOURCES_INTERNAL',
                 'DATA_ACTIVITY',
-                'APPROUCHING_QUOTA',
+                'APPROACHING_QUOTA',
                 'TIER_LOW_CAPACITY',
                 'LOW_CAPACITY',
                 'TIER_NO_CAPACITY',
@@ -476,6 +493,7 @@ async function _partial_buckets_info(req) {
                 const ns_bucket_mode_optimal = bucket_info.mode === 'OPTIMAL';
                 namespace_buckets_stats.namespace_buckets.push({
                     bucket_name: bucket_info.name.unwrap(),
+                    mode: bucket_info.mode,
                     is_healthy: ns_bucket_mode_optimal,
                     tagging: bucket_info.tagging || []
                 });
@@ -515,16 +533,21 @@ async function _partial_buckets_info(req) {
             const bucket_available = size_utils.json_to_bigint(_.get(bucket_info, 'data.free') || 0);
             const bucket_total = bucket_used.plus(bucket_available);
             const is_capacity_relevant = _.includes(CAPACITY_MODES, bucket_info.mode);
-            const { size_used_percent, quantity_used_percent } = new Quota(bucket.quota).get_bucket_quota_usages_percent(bucket);
+            const { size_used_percent, quantity_used_percent, quota_max_objects, quota_max_bytes } = _get_bucket_quota_info(bucket);
+
             buckets_stats.buckets.push({
                 bucket_name: bucket_info.name.unwrap(),
-                quota_size_precent: size_used_percent,
+                mode: bucket_info.mode,
+                quota_size_percent: size_used_percent,
                 quota_quantity_percent: quantity_used_percent,
-                capacity_precent: (is_capacity_relevant && bucket_total > 0) ? size_utils.bigint_to_json(bucket_used.multiply(100)
+                capacity_percent: (is_capacity_relevant && bucket_total > 0) ? size_utils.bigint_to_json(bucket_used.multiply(100)
                     .divide(bucket_total)) : 0,
                 is_healthy: _.includes(OPTIMAL_MODES, bucket_info.mode),
                 tagging: bucket_info.tagging || [],
-                bucket_used_bytes: bucket_used.valueOf()
+                bucket_used_bytes: bucket_used.valueOf(),
+                object_count: bucket_info.num_objects.value || 0,
+                quota_max_objects: quota_max_objects,
+                quota_max_bytes: quota_max_bytes
             });
         }
 
@@ -703,15 +726,19 @@ async function get_cloud_pool_stats(req) {
     const OPTIMAL_MODES = [
         'OPTIMAL',
         'DATA_ACTIVITY',
-        'APPROUCHING_QUOTA',
+        'APPROACHING_QUOTA',
         'RISKY_TOLERANCE',
         'NO_RESOURCES_INTERNAL',
         'TIER_LOW_CAPACITY',
         'LOW_CAPACITY',
     ];
+    const LOW_CAPACITY_MODES = [
+        'TIER_LOW_CAPACITY',
+        'LOW_CAPACITY',
+    ];
     //Per each system fill out the needed info
     for (const pool of system_store.data.pools) {
-        if (pool.mongo_pool_info) continue;
+        if (pool.is_default_pool) continue;
         const pool_info = await server_rpc.client.pool.read_pool({ name: pool.name }, {
             auth_token: req.auth_token
         });
@@ -737,6 +764,7 @@ async function get_cloud_pool_stats(req) {
                         cloud_pool_stats.unhealthy_pool_target.amazon_unhealthy += 1;
                     }
                     break;
+                case 'AZURESTS':
                 case 'AZURE':
                     cloud_pool_stats.pool_target.azure += 1;
                     if (!_.includes(OPTIMAL_MODES, pool_info.mode)) {
@@ -744,6 +772,7 @@ async function get_cloud_pool_stats(req) {
                     }
                     break;
                 case 'GOOGLE':
+                case 'GOOGLE_STS':
                     cloud_pool_stats.pool_target.gcp += 1;
                     if (!_.includes(OPTIMAL_MODES, pool_info.mode)) {
                         cloud_pool_stats.unhealthy_pool_target.gcp_unhealthy += 1;
@@ -777,6 +806,7 @@ async function get_cloud_pool_stats(req) {
         cloud_pool_stats.resources.push({
             resource_name: pool_info.name,
             is_healthy: _.includes(OPTIMAL_MODES, pool_info.mode),
+            is_low_capacity: _.includes(LOW_CAPACITY_MODES, pool_info.mode),
         });
     }
 
@@ -1248,17 +1278,20 @@ async function update_nsfs_stats(req) {
     const _nsfs_counters = req.rpc_params.nsfs_stats || {};
     if (_nsfs_counters.io_stats) _update_io_stats(_nsfs_counters.io_stats);
     if (_nsfs_counters.op_stats) _update_ops_stats(_nsfs_counters.op_stats);
+    if (_nsfs_counters.iam_stats) _update_iam_stats(_nsfs_counters.iam_stats);
     if (_nsfs_counters.fs_workers_stats) _update_fs_stats(_nsfs_counters.fs_workers_stats);
 }
 
-async function standalon_update_nsfs_stats(_nsfs_counters = {}) {
-    dbg.log1(`standalon_update_nsfs_stats. nsfs_stats =`, _nsfs_counters);
+async function standalone_update_nsfs_stats(_nsfs_counters = {}) {
+    dbg.log1(`standalone_update_nsfs_stats. nsfs_stats =`, _nsfs_counters);
     if (_nsfs_counters.io_stats) _update_io_stats(_nsfs_counters.io_stats);
     if (_nsfs_counters.op_stats) _update_ops_stats(_nsfs_counters.op_stats);
+    if (_nsfs_counters.iam_stats) _update_iam_stats(_nsfs_counters.iam_stats);
     if (_nsfs_counters.fs_workers_stats) _update_fs_stats(_nsfs_counters.fs_workers_stats);
     if (cluster_module.isWorker) {
         process.send({ io_stats: _nsfs_counters.io_stats });
         process.send({ op_stats: _nsfs_counters.op_stats });
+        process.send({ iam_stats: _nsfs_counters.iam_stats });
         process.send({ fs_workers_stats: _nsfs_counters.fs_workers_stats });
     }
 }
@@ -1275,6 +1308,15 @@ function _update_ops_stats(stats) {
     for (const op_name of stats_collector_utils.op_names) {
         if (op_name in stats) {
             stats_collector_utils.update_nsfs_stats(op_name, op_stats, stats[op_name]);
+        }
+    }
+}
+
+function _update_iam_stats(stats) {
+    //Go over the iam_stats
+    for (const iam_op_name of stats_collector_utils.iam_op_names) {
+        if (iam_op_name in stats) {
+            stats_collector_utils.update_nsfs_stats(iam_op_name, iam_stats, stats[iam_op_name]);
         }
     }
 }
@@ -1313,6 +1355,15 @@ function get_op_stats(reset_nsfs_counters = true) {
     return nsfs_op_stats;
 }
 
+// Will return the current iam_stats and reset it.
+function get_iam_stats(reset_nsfs_counters = true) {
+    const nsfs_iam_stats = iam_stats;
+    if (reset_nsfs_counters) {
+        iam_stats = {};
+    }
+    return nsfs_iam_stats;
+}
+
 // Will return the current fs_workers_stats and reset it.
 function get_fs_workers_stats(reset_nsfs_counters = true) {
     const nsfs_fs_workers_stats = fs_workers_stats;
@@ -1340,6 +1391,7 @@ exports.get_bucket_sizes_stats = get_bucket_sizes_stats;
 exports.get_object_usage_stats = get_object_usage_stats;
 exports.get_nsfs_io_stats = get_nsfs_io_stats;
 exports.get_op_stats = get_op_stats;
+exports.get_iam_stats = get_iam_stats;
 exports.get_fs_workers_stats = get_fs_workers_stats;
 //OP stats collection
 exports.register_histogram = register_histogram;
@@ -1348,4 +1400,4 @@ exports.object_usage_scrubber = object_usage_scrubber;
 exports.send_stats = background_worker;
 exports.background_worker = background_worker;
 exports.update_nsfs_stats = update_nsfs_stats;
-exports.standalon_update_nsfs_stats = standalon_update_nsfs_stats;
+exports.standalone_update_nsfs_stats = standalone_update_nsfs_stats;

@@ -23,6 +23,7 @@ const os = require('os');
 const fs = require('fs');
 const util = require('util');
 const minimist = require('minimist');
+const { ConfigFS } = require('../sdk/config_fs');
 
 if (process.env.LOCAL_MD_SERVER === 'true') {
     require('../server/system_services/system_store').get_instance({ standalone: true });
@@ -31,22 +32,19 @@ if (process.env.LOCAL_MD_SERVER === 'true') {
 //const js_utils = require('../util/js_utils');
 const nb_native = require('../util/nb_native');
 //const schema_utils = require('../util/schema_utils');
-const RpcError = require('../rpc/rpc_error');
-const ObjectSDK = require('../sdk/object_sdk');
 const { cluster } = require('../util/fork_utils');
-const NamespaceFS = require('../sdk/namespace_fs');
 const BucketSpaceSimpleFS = require('../sdk/bucketspace_simple_fs');
 const BucketSpaceFS = require('../sdk/bucketspace_fs');
 const SensitiveString = require('../util/sensitive_string');
 const endpoint_stats_collector = require('../sdk/endpoint_stats_collector');
-const path = require('path');
-const json_utils = require('../util/json_utils');
 //const { RPC_BUFFERS } = require('../rpc');
-const pkg = require('../../package.json');
 const AccountSDK = require('../sdk/account_sdk');
+const NsfsObjectSDK = require('../sdk/nsfs_object_sdk');
+const StsSDK = require('../sdk/sts_sdk');
 const AccountSpaceFS = require('../sdk/accountspace_fs');
 const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
 const { set_debug_level } = require('../manage_nsfs/manage_nsfs_cli_utils');
+const { NCUpgradeManager } = require('../upgrade/nc_upgrade_manager');
 
 const HELP = `
 Help:
@@ -72,32 +70,34 @@ Arguments:
 const OPTIONS = `
 Options:
 
-    --http_port <port>         (default 6001)   Set the S3 endpoint listening HTTP port to serve.
-    --https_port <port>        (default 6443)   Set the S3 endpoint listening HTTPS port to serve.
-    --https_port_sts <port>    (default -1)     Set the S3 endpoint listening HTTPS port for STS.
-    --https_port_iam <port>    (default -1)     Set the endpoint listening HTTPS port for IAM.
-    --metrics_port <port>      (default -1)     Set the metrics listening port for prometheus.
-    --forks <n>                (default none)   Forks spread incoming requests (config.ENDPOINT_FORKS used if flag is not provided).
-    --debug <level>            (default 0)      Increase debug level.
+    --http_port <port>          (default 6001)       Set the S3 endpoint listening HTTP port to serve.
+    --https_port <port>         (default 6443)       Set the S3 endpoint listening HTTPS port to serve.
+    --https_port_sts <port>     (default 7443)       Set the S3 endpoint listening HTTPS port for STS.
+    --https_port_iam <port>     (default -1)         Set the endpoint listening HTTPS port for IAM.
+    --https_port_vector <port>  (default 14443)      Set the endpoint listening HTTPS port for Vector.
+    --http_metrics_port <port>  (default 7004)       Set the metrics listening HTTP port for prometheus.
+    --https_metrics_port <port> (default 9443)       Set the metrics listening HTTPS port for prometheus.
+    --forks <n>                 (default none)       Forks spread incoming requests (config.ENDPOINT_FORKS used if flag is not provided).
+    --debug <level>             (default 0)          Increase debug level.
 
     ## single user mode
 
-    --simple <boolean>   (default false)        Starts a single user/fs mode
-    --uid <uid>          (default as process)   Send requests to the Filesystem with uid.
-    --gid <gid>          (default as process)   Send requests to the Filesystem with gid.
-    --access_key <key>      (default none)      Authenticate incoming requests for this access key only (default is no auth).
-    --secret_key <key>      (default none)      The secret key pair for the access key.
+    --simple <boolean>          (default false)      Starts a single user/fs mode
+    --uid <uid>                 (default as process) Send requests to the Filesystem with uid.
+    --gid <gid>                 (default as process) Send requests to the Filesystem with gid.
+    --access_key <key>          (default none)       Authenticate incoming requests for this access key only (default is no auth).
+    --secret_key <key>          (default none)       The secret key pair for the access key.
 
     ## multi user mode
 
-    --config_root <dir>     (default ${config.NSFS_NC_DEFAULT_CONF_DIR})    Configuration files for Noobaa standalon NSFS. It includes config files for environment variables(<config_root>/.env), 
-                                                            local configuration(<config_root>/config-local.js), authentication (<config_root>/accounts/<access-key>.json) and 
-                                                            bucket schema (<config_root>/buckets/<bucket-name>.json).
+    --config_root <dir> (default ${config.NSFS_NC_DEFAULT_CONF_DIR}) Configuration files for Noobaa standalon NSFS. It includes config files for environment variables(<config_root>/.env), 
+                                                     local configuration(<config_root>/config-local.js), authentication (<config_root>/accounts/<access-key>.json) and 
+                                                     bucket schema (<config_root>/buckets/<bucket-name>.json).
 
     ## features
 
-    --backend <fs>          (default none)      Use custom backend fs to CEPH_FS 'GPFS', 'NFSv4').
-    --versioning <mode>   (default DISABLED)    Set versioning mode to DISABLED | ENABLED | SUSPENDED.
+    --backend <fs>              (default none)       Use custom backend fs to CEPH_FS 'GPFS', 'NFSv4').
+    --versioning <mode>         (default DISABLED)   Set versioning mode to DISABLED | ENABLED | SUSPENDED.
 
 `;
 
@@ -121,97 +121,6 @@ function print_usage() {
 
 let nsfs_config_root;
 
-class NsfsObjectSDK extends ObjectSDK {
-    constructor(fs_root, fs_config, account, versioning, config_root) {
-        // const rpc_client_hooks = new_rpc_client_hooks();
-        // rpc_client_hooks.account.read_account_by_access_key = async ({ access_key }) => {
-        //     if (access_key) {
-        //         return { access_key };
-        //     }
-        // };
-        // rpc_client_hooks.bucket.read_bucket_sdk_info = async ({ name }) => {
-        //     if (name) {
-        //         return { name };
-        //     }
-        // };
-        let bucketspace;
-        if (config_root) {
-            bucketspace = new BucketSpaceFS({ config_root }, endpoint_stats_collector.instance());
-        } else {
-            bucketspace = new BucketSpaceSimpleFS({ fs_root });
-        }
-        super({
-            rpc_client: null,
-            internal_rpc_client: null,
-            object_io: null,
-            bucketspace,
-            stats: endpoint_stats_collector.instance(),
-        });
-        this.nsfs_config_root = nsfs_config_root;
-        this.nsfs_fs_root = fs_root;
-        this.nsfs_fs_config = fs_config;
-        this.nsfs_account = account;
-        this.nsfs_versioning = versioning;
-        this.nsfs_namespaces = {};
-        if (!config_root) {
-            this._get_bucket_namespace = bucket_name => this._simple_get_single_bucket_namespace(bucket_name);
-            this.load_requesting_account = auth_req => this._simple_load_requesting_account(auth_req);
-            this.read_bucket_sdk_policy_info = bucket_name => this._simple_read_bucket_sdk_policy_info(bucket_name);
-            this.read_bucket_sdk_config_info = () => undefined;
-            this.read_bucket_usage_info = () => undefined;
-            this.read_bucket_sdk_website_info = () => undefined;
-            this.read_bucket_sdk_namespace_info = () => undefined;
-            this.read_bucket_sdk_caching_info = () => undefined;
-        }
-    }
-
-    async _simple_get_single_bucket_namespace(bucket_name) {
-        const existing_ns = this.nsfs_namespaces[bucket_name];
-        if (existing_ns) return existing_ns;
-        const ns_fs = new NamespaceFS({
-            fs_backend: this.nsfs_fs_config.backend,
-            bucket_path: this.nsfs_fs_root + '/' + bucket_name,
-            bucket_id: 'nsfs',
-            namespace_resource_id: undefined,
-            access_mode: undefined,
-            versioning: this.nsfs_versioning,
-            stats: endpoint_stats_collector.instance(),
-            force_md5_etag: false,
-        });
-        this.nsfs_namespaces[bucket_name] = ns_fs;
-        return ns_fs;
-    }
-
-    async _simple_load_requesting_account(auth_req) {
-        const access_key = this.nsfs_account.access_keys?.[0]?.access_key;
-        if (access_key) {
-            const token = this.get_auth_token();
-            if (!token) {
-                throw new RpcError('UNAUTHORIZED', `Anonymous access to bucket not allowed`);
-            }
-            if (token.access_key !== access_key.unwrap()) {
-                throw new RpcError('INVALID_ACCESS_KEY_ID', `Account with access_key not found`);
-            }
-        }
-        this.requesting_account = this.nsfs_account;
-    }
-
-    async _simple_read_bucket_sdk_policy_info(bucket_name) {
-        return {
-            s3_policy: {
-                Version: '2012-10-17',
-                Statement: [{
-                    Effect: 'Allow',
-                    Action: ['*'],
-                    Resource: ['*'],
-                    Principal: [new SensitiveString('*')],
-                }]
-            },
-            bucket_owner: new SensitiveString('nsfs'),
-            owner_account: new SensitiveString('nsfs-id'), // temp
-        };
-    }
-}
 
 // NsfsAccountSDK was based on NsfsObjectSDK
 // simple flow was not implemented
@@ -231,6 +140,7 @@ class NsfsAccountSDK extends AccountSDK {
             internal_rpc_client: null,
             bucketspace: bucketspace,
             accountspace: accountspace,
+            stats: endpoint_stats_collector && endpoint_stats_collector.instance(),
         });
         this.nsfs_config_root = nsfs_config_root;
         this.nsfs_fs_root = fs_root;
@@ -240,38 +150,11 @@ class NsfsAccountSDK extends AccountSDK {
     }
 }
 
-async function init_nsfs_system(config_root) {
-    const system_data_path = path.join(config_root, 'system.json');
-    const system_data = new json_utils.JsonFileWrapper(system_data_path);
-
-    const data = await system_data.read();
-    const hostname = os.hostname();
-    // If the system data already exists, we should not create it again
-    if (data?.[hostname]?.current_version) return;
-
-    try {
-        await system_data.update({
-            ...data,
-            [hostname]: {
-                current_version: pkg.version,
-                upgrade_history: {
-                    successful_upgrades: [],
-                    last_failure: undefined
-                }
-            }
-        });
-        console.log('created NSFS system data with version: ', pkg.version);
-    } catch (err) {
-        const msg = 'failed to create NSFS system data due to - ' + err.message;
-        const error = new Error(msg);
-        console.error(msg, err);
-        throw error;
-    }
-}
-
+/* eslint-disable max-statements */
 async function main(argv = minimist(process.argv.slice(2))) {
     try {
         config.DB_TYPE = 'none';
+        config.EVENT_LOGGING_ENABLED = true;
         config.NSFS_VERSIONING_ENABLED = true;
         // when using data buckets on noobaa standalone we should set it to true
         config.ENABLE_OBJECT_IO_SEMAPHORE_MONITOR = false;
@@ -292,7 +175,9 @@ async function main(argv = minimist(process.argv.slice(2))) {
         const https_port = Number(argv.https_port) || config.ENDPOINT_SSL_PORT;
         const https_port_sts = Number(argv.https_port_sts) || config.ENDPOINT_SSL_STS_PORT;
         const https_port_iam = Number(argv.https_port_iam) || config.ENDPOINT_SSL_IAM_PORT;
-        const metrics_port = Number(argv.metrics_port) || config.EP_METRICS_SERVER_PORT;
+        const https_port_vector = Number(argv.https_port_vector) || config.ENDPOINT_SSL_VECTOR_PORT;
+        const http_metrics_port = Number(argv.http_metrics_port) || config.EP_METRICS_SERVER_PORT;
+        const https_metrics_port = Number(argv.https_metrics_port) || config.EP_METRICS_SERVER_SSL_PORT;
         const forks = Number(argv.forks) || config.ENDPOINT_FORKS;
         if (forks > 0) process.env.ENDPOINT_FORKS = forks.toString(); // used for argv.forks to take effect
         const uid = Number(argv.uid) || process.getuid();
@@ -338,7 +223,9 @@ async function main(argv = minimist(process.argv.slice(2))) {
             https_port,
             https_port_sts,
             https_port_iam,
-            metrics_port,
+            https_port_vector,
+            http_metrics_port,
+            https_metrics_port,
             backend,
             forks,
             access_key,
@@ -348,7 +235,18 @@ async function main(argv = minimist(process.argv.slice(2))) {
             nsfs_config_root,
         });
 
-        if (!simple_mode) await init_nsfs_system(nsfs_config_root);
+        let system_data;
+        if (!simple_mode) {
+            // Do not move this function - we need to create/update RPM changes before starting the endpoint
+            const config_fs = new ConfigFS(nsfs_config_root);
+            system_data = await config_fs.get_system_config_file({ silent_if_missing: true });
+            if (system_data && system_data[os.hostname()]) {
+                const nc_upgrade_manager = new NCUpgradeManager(config_fs);
+                await nc_upgrade_manager.update_rpm_upgrade();
+            } else {
+                system_data = await config_fs.register_hostname_in_system_json();
+            }
+        }
 
         const endpoint = require('../endpoint/endpoint');
         await endpoint.main({
@@ -356,12 +254,18 @@ async function main(argv = minimist(process.argv.slice(2))) {
             https_port,
             https_port_sts,
             https_port_iam,
-            metrics_port,
+            https_port_vector,
+            http_metrics_port,
+            https_metrics_port,
             forks,
             nsfs_config_root,
             init_request_sdk: (req, res) => {
-                req.object_sdk = new NsfsObjectSDK(fs_root, fs_config, account, versioning, nsfs_config_root);
+                req.object_sdk = new NsfsObjectSDK(fs_root, fs_config, account, versioning, nsfs_config_root, system_data);
                 req.account_sdk = new NsfsAccountSDK(fs_root, fs_config, account, nsfs_config_root);
+                const sts_bucketspace = nsfs_config_root ?
+                    new BucketSpaceFS({ config_root: nsfs_config_root }, endpoint_stats_collector.instance()) :
+                    new BucketSpaceSimpleFS({ fs_root });
+                req.sts_sdk = new StsSDK(null, null, sts_bucketspace, req.object_sdk.accountspace);
             }
         });
         if (config.ALLOW_HTTP) {
@@ -370,6 +274,9 @@ async function main(argv = minimist(process.argv.slice(2))) {
         console.log('nsfs: listening on', util.inspect(`https://localhost:${https_port}`));
         if (https_port_iam > 0) {
             console.log('nsfs: IAM listening on', util.inspect(`https://localhost:${https_port_iam}`));
+        }
+        if (https_port_vector > 0) {
+            console.log('nsfs: vectors listening on', util.inspect(`https://localhost:${https_port_vector}`));
         }
     } catch (err) {
         console.error('nsfs: exit on error', err.stack || err);

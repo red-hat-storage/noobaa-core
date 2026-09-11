@@ -2,7 +2,7 @@
 'use strict';
 
 const _ = require('lodash');
-const mime = require('mime');
+const mime = require('mime-types');
 
 const dbg = require('../util/debug_module')(__filename);
 const prom_report = require('../server/analytic_services/prometheus_reporting');
@@ -10,7 +10,8 @@ const stats_aggregator = require('../server/system_services/stats_aggregator');
 const DelayedCollector = require('../util/delayed_collector');
 const config = require('../../config');
 const cluster = /** @type {import('node:cluster').Cluster} */ (
-    /** @type {unknown} */ (require('node:cluster'))
+    /** @type {unknown} */
+    (require('node:cluster'))
 );
 
 /**
@@ -41,6 +42,7 @@ const cluster = /** @type {import('node:cluster').Cluster} */ (
  * @typedef {{
  *      io_stats?: IoStats;
  *      op_stats?: { [op: string]: OpStats }
+ *      iam_stats?: { [op: string]: OpStats }
  *      fs_workers_stats?: { [op: string]: OpStats }
  * }} NsfsStats
  * 
@@ -90,6 +92,7 @@ class EndpointStatsCollector {
         this.prom_metrics_report = prom_report.get_endpoint_report();
         this.semaphore_reports = {
             object_io: [],
+            nsfs_xl: [],
             nsfs_l: [],
             nsfs_m: [],
             nsfs_s: [],
@@ -158,6 +161,9 @@ class EndpointStatsCollector {
         for (const [k, v] of Object.entries(data.op_stats ?? {})) {
             dbg.log0(`nsfs stats - S3 op=${k} :`, v);
         }
+        for (const [k, v] of Object.entries(data.iam_stats ?? {})) {
+            dbg.log0(`nsfs stats - IAM op=${k} :`, v);
+        }
         for (const [k, v] of Object.entries(data.fs_workers_stats ?? {})) {
             dbg.log0(`nsfs stats - FS op=${k} :`, v);
         }
@@ -168,7 +174,7 @@ class EndpointStatsCollector {
                 timeout: SEND_STATS_TIMEOUT
             });
         } else {
-            await stats_aggregator.standalon_update_nsfs_stats(data);
+            await stats_aggregator.standalone_update_nsfs_stats(data);
         }
     }
 
@@ -223,10 +229,10 @@ class EndpointStatsCollector {
         }
     }
 
-    update_ops_counters({ time, op_name, error = 0, trigger_send = true }) {
+    update_ops_counters({ time, stats_type, op_name, error = 0, trigger_send = true }) {
         // trigger_send is for ops that we want to collect metrics but avoid sending it (upload part for example).
         this.nsfs_stats_collector.update({
-            op_stats: {
+            [stats_type]: {
                 [op_name]: {
                     count: 1,
                     error_count: error,
@@ -239,16 +245,20 @@ class EndpointStatsCollector {
     }
 
     update_bucket_read_counters({ bucket_name, key, content_type, }) {
-        content_type = content_type || mime.getType(key) || 'application/octet-stream';
+        content_type = content_type || mime.lookup(key) || 'application/octet-stream';
         this.endpoint_stats_collector.update({
-            bucket_counters: { [bucket_name]: { [content_type]: { read_count: 1 } } }
+            bucket_counters: {
+                [bucket_name]: {
+                    [content_type]: { read_count: 1 } } }
         });
     }
 
     update_bucket_write_counters({ bucket_name, key, content_type, }) {
-        content_type = content_type || mime.getType(key) || 'application/octet-stream';
+        content_type = content_type || mime.lookup(key) || 'application/octet-stream';
         this.endpoint_stats_collector.update({
-            bucket_counters: { [bucket_name]: { [content_type]: { write_count: 1 } } }
+            bucket_counters: {
+                [bucket_name]: {
+                    [content_type]: { write_count: 1 } } }
         });
     }
 
@@ -361,7 +371,43 @@ class EndpointStatsCollector {
     update_fork_counter() {
         // add fork related metrics to prometheus
         const code = `worker_${cluster.worker.id}`;
-        this.prom_metrics_report.inc('fork_counter', {code});
+        this.prom_metrics_report.inc('fork_counter', { code });
+    }
+
+    /**
+     * Calls the op and report time and error to stats collector.
+     * on_success can be added to update read/write stats (but on_success shouldn't throw)
+     *
+     * @template T
+     * @param {{
+     *      service?: 's3' | 'iam';
+     *      op_name: string;
+     *      op_func: () => Promise<T>;
+     *      on_success?: () => void;
+     * }} params
+     * @returns {Promise<T>}
+     */
+    async call_op_and_update_stats({ service, op_name, op_func, on_success = undefined }) {
+        const start_time = Date.now();
+        let error = 0;
+        try {
+            // cannot just return the promise from inside this try scope
+            // because rejections will not be caught unless we await.
+            // we could use `return await ...` too but wanted to make it more explicit.
+            const reply = await op_func();
+            if (on_success) on_success();
+            return reply;
+        } catch (e) {
+            error = 1;
+            throw e;
+        } finally {
+            this.update_ops_counters({
+                time: Date.now() - start_time,
+                stats_type: service === 'iam' ? 'iam_stats' : 'op_stats',
+                op_name,
+                error,
+            });
+        }
     }
 }
 if (cluster.isWorker) {
@@ -383,7 +429,6 @@ function merge_func(data, updates) {
         }
     });
 }
-
 
 // EXPORTS
 exports.EndpointStatsCollector = EndpointStatsCollector;

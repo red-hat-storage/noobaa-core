@@ -4,9 +4,15 @@
 const _ = require('lodash');
 const s3_utils = require('../s3/s3_utils');
 const { IamError } = require('./iam_errors');
-const { AWS_IAM_PATH_REGEXP, AWS_USERNAME_REGEXP, AWS_IAM_LIST_MARKER, AWS_IAM_ACCESS_KEY_INPUT_REGEXP } = require('../../util/string_utils');
+const { AWS_IAM_PATH_REGEXP, AWS_IAM_LIST_MARKER, AWS_IAM_ACCESS_KEY_INPUT_REGEXP, AWS_POLICY_NAME_REGEXP,
+    AWS_POLICY_DOCUMENT_REGEXP, AWS_POLICY_SID_REGEXP, AWS_ROLE_NAME_REGEXP, AWS_ROLE_DESCRIPTION_REGEXP,
+    AWS_OIDC_PROVIDER_ARN_REGEXP, AWS_LDAP_PROVIDER_ARN_REGEXP
+} = require('../../util/string_utils');
 const iam_constants = require('./iam_constants');
 const { RpcError } = require('../../rpc');
+const validation_utils = require('../../util/validation_utils');
+const dbg = require('../../util/debug_module')(__filename);
+const access_policy_utils = require('../../util/access_policy_utils');
 
 /**
  * format_iam_xml_date return the date without milliseconds
@@ -19,19 +25,97 @@ function format_iam_xml_date(input) {
 }
 
 /**
- * create_arn creates the AWS ARN for user
+ * create_arn_for_root creates the AWS ARN for root account user
+ * see: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html#identifiers-arns
+ * @param {string} account_id (the root user account id)
+ */
+function create_arn_for_root(account_id) {
+    return `arn:aws:iam::${account_id}:root`;
+
+}
+
+/**
+ * _create_arn_for_iam_entity creates the AWS ARN for IAM user/role
+ * @param {string} account_id
+ * @param {'user'|'role'} entity_type
+ * @param {string} entity_name
+ * @param {string} iam_path
+ */
+function _create_arn_for_iam_entity(account_id, entity_type, entity_name, iam_path) {
+    const basic_structure = `arn:aws:iam::${account_id}:${entity_type}`;
+    if (entity_name === undefined) return `${basic_structure}/`;
+    if (check_iam_path_was_set(iam_path)) {
+        return `${basic_structure}${iam_path}${entity_name}`;
+    }
+    return `${basic_structure}/${entity_name}`;
+}
+
+/**
+ * create_arn_for_user creates the AWS ARN for user
  * see: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html#identifiers-arns
  * @param {string} account_id (the root user account id)
  * @param {string} username
  * @param {string} iam_path
  */
-function create_arn(account_id, username, iam_path) {
-    const basic_structure = `arn:aws:iam::${account_id}:user`;
-    if (username === undefined) return `${basic_structure}/`;
-    if (check_iam_path_was_set(iam_path)) {
-        return `${basic_structure}${iam_path}${username}`;
+function create_arn_for_user(account_id, username, iam_path) {
+    return _create_arn_for_iam_entity(account_id, 'user', username, iam_path);
+}
+
+/**
+ * create_arn_for_role creates the AWS ARN for role
+ * see: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html#identifiers-arns
+ * @param {string} account_id
+ * @param {string} role_name
+ * @param {string} iam_path
+ */
+function create_arn_for_role(account_id, role_name, iam_path) {
+    return _create_arn_for_iam_entity(account_id, 'role', role_name, iam_path);
+}
+
+/**
+ * parse_role_arn extracts account id and role name from a role ARN
+ * @param {string} role_arn
+ * @returns {{account_id?: string, role_name?: string, error?: string}}
+ */
+function parse_role_arn(role_arn) {
+    if (!role_arn) return { error: 'MISSING_ROLE_ARN' };
+    const account_id = role_arn.split(':')[4];
+    const role_name = role_arn.slice(role_arn.lastIndexOf('/') + 1);
+    if (!account_id || !role_name) return { error: 'INVALID_ROLE_ARN' };
+    return { account_id, role_name };
+}
+
+/**
+ * resolve_iam_role_by_arn resolves IAM role entity from a role ARN via iam_roles_cache
+ * @param {string} role_arn
+ * @param {nb.BucketSpace} bucketspace
+ * @returns {Promise<{iam_role?: object, account_id?: string, role_name?: string, error?: string}>}
+ */
+async function resolve_iam_role_by_arn(role_arn, bucketspace) {
+    const parsed = parse_role_arn(role_arn);
+    if (parsed.error) return { error: parsed.error };
+
+    const { account_id, role_name } = parsed;
+    if (!bucketspace) {
+        return { error: 'NO_SUCH_ENTITY', account_id, role_name };
     }
-    return `${basic_structure}/${username}`;
+    try {
+        // Lazy-load to avoid pulling object_sdk (and namespace_cache) into server paths
+        // that only need ARN helpers from this module .
+        const { iam_roles_cache } = require('../../sdk/object_sdk');
+        const iam_role = await iam_roles_cache.get_with_cache({
+            bucketspace,
+            role_name,
+            owner_account_id: String(account_id),
+        });
+        if (!iam_role) return { error: 'NO_SUCH_ROLE', account_id, role_name };
+        return { iam_role, account_id, role_name };
+    } catch (err) {
+        if (err.rpc_code === 'NO_SUCH_ENTITY' || err.rpc_code === 'NO_SUCH_ROLE') {
+            return { error: 'NO_SUCH_ROLE', account_id, role_name };
+        }
+        throw err;
+    }
 }
 
 /**
@@ -51,6 +135,34 @@ function check_iam_path_was_set(iam_path) {
 }
 
 /**
+ * create_detailed_message_for_iam_user_access returns a detailed message with details needed for user who
+ * tried to perform S3 operation
+ *  - resource_arn is only relevant for operations related to a bucket
+ * @param {object} user_account
+ * @param {string|string[]} method
+ * @param {string} resource_arn
+ * @param {string} [principal_arn]
+ */
+function create_detailed_message_for_iam_user_access(user_account, method, resource_arn, principal_arn) {
+    const owner_account_id = get_owner_account_id(user_account);
+    const arn_for_requesting_account = principal_arn || create_arn_for_user(owner_account_id,
+        user_account.name.unwrap(), user_account.iam_path);
+    const full_action_name = Array.isArray(method) && method.length > 1 ? method[1] : method; // special case for get_object_attributes
+
+    const message_start = `User: ${arn_for_requesting_account} is not authorized to perform: ${full_action_name} `;
+    const message_resource = `on resource: ${resource_arn} `;
+    const message_end = `because no identity-based policy allows the ${full_action_name} action`;
+
+    let message_with_details;
+    if (full_action_name === 's3:ListAllMyBuckets' || full_action_name === 's3vectors:ListVectorBuckets') {
+        message_with_details = message_start + message_end;
+    } else {
+        message_with_details = message_start + message_resource + message_end;
+    }
+    return message_with_details;
+}
+
+/**
  * parse_max_items converts the input to the needed type
  * assuming that we've got only sting type
  * @param {any} input_max_items
@@ -62,87 +174,33 @@ function parse_max_items(input_max_items) {
     const value_as_number = Number(input_max_items);
     if (Number.isNaN(value_as_number)) {
         const message_with_details = `1 validation error detected: Value ${input_max_items} at ` +
-        `'${parameter_name}' failed to satisfy constraint: Member must be ${input_type}`;
+            `'${parameter_name}' failed to satisfy constraint: Member must be ${input_type}`;
         const { code, http_code, type } = IamError.ValidationError;
         throw new IamError({ code, message: message_with_details, http_code, type });
     }
     return value_as_number;
 }
 
-
 /**
- * _type_check_input checks that the input is the same as needed
- * @param {string} input_type
- * @param {string | number} input_value
- * @param {string} parameter_name
- */
-function _type_check_input(input_type, input_value, parameter_name) {
-    if (typeof input_value !== input_type) {
-        const message_with_details = `1 validation error detected: Value ${input_value} at ` +
-            `'${parameter_name}'  failed to satisfy constraint: Member must be ${input_type}`;
-        const { code, http_code, type } = IamError.ValidationError;
-        throw new IamError({ code, message: message_with_details, http_code, type });
-    }
-}
-
-/**
- * _length_min_check_input checks if the input is lower than the min length
- * @param {number} min_length
- * @param {any} input_value
- * @param {string} parameter_name
- */
-function _length_min_check_input(min_length, input_value, parameter_name) {
-    const input_length = input_value.length;
-    if (input_length < min_length) {
-        const message_with_details = `Invalid length for parameter ${parameter_name}, ` +
-            `value: ${input_length}, valid min length: ${min_length}`;
-        const { code, http_code, type } = IamError.ValidationError;
-        throw new IamError({ code, message: message_with_details, http_code, type });
-    }
-}
-
-/**
- * _length_max_check_input checks if the input is higher than the max length
- * @param {number} max_length
- * @param {any} input_value
- * @param {string} parameter_name
- */
-function _length_max_check_input(max_length, input_value, parameter_name) {
-    const input_length = input_value.length;
-    if (input_length > max_length) {
-        const message_with_details = `1 validation error detected: Value ${input_value} at ` +
-            `'${parameter_name}' failed to satisfy constraint:` +
-            `Member must have length less than or equal to ${max_length}`;
-        const { code, http_code, type } = IamError.ValidationError;
-        throw new IamError({ code, message: message_with_details, http_code, type });
-    }
-}
-
-/**
- * _length_check_input checks that the input length is between the min and the max value
- * @param {number} min_length
- * @param {number} max_length
- * @param {string} input_value
- * @param {string} parameter_name
- */
-function _length_check_input(min_length, max_length, input_value, parameter_name) {
-    _length_min_check_input(min_length, input_value, parameter_name);
-    _length_max_check_input(max_length, input_value, parameter_name);
-}
-
-/**
- * validate_params will call the aquivalent function in user or access key
+ * validate_params will call the equivalent function (for example: user, access key, tagging, etc.)
+ * Note: The order of conditions matters - check 'tag' before 'user' to avoid misrouting
  * @param {string} action
  * @param {object} params
  */
 function validate_params(action, params) {
-        if (action.includes('user')) {
-            validate_user_params(action, params);
-        } else if (action.includes('access_key')) {
-            validate_access_keys_params(action, params);
-        } else {
-            throw new RpcError('INTERNAL_ERROR', `${action} is not supported`);
-        }
+    if (action.includes('tag')) {
+        validate_tagging_params(action, params);
+    } else if (action.includes('policy') || action.includes('policies')) {
+        validate_policy_params(action, params);
+    } else if (action.includes('user')) {
+        validate_user_params(action, params);
+    } else if (action.includes('access_key')) {
+        validate_access_keys_params(action, params);
+    } else if (action.includes('role')) {
+        validate_role_params(action, params);
+    } else {
+        throw new RpcError('INTERNAL_ERROR', `${action} is not supported`);
+    }
 }
 
 /**
@@ -154,22 +212,22 @@ function validate_user_params(action, params) {
     switch (action) {
         case iam_constants.IAM_ACTIONS.CREATE_USER:
             validate_create_user(params);
-          break;
+            break;
         case iam_constants.IAM_ACTIONS.GET_USER:
             validate_get_user(params);
-          break;
+            break;
         case iam_constants.IAM_ACTIONS.UPDATE_USER:
             validate_update_user(params);
-          break;
+            break;
         case iam_constants.IAM_ACTIONS.DELETE_USER:
             validate_delete_user(params);
-          break;
+            break;
         case iam_constants.IAM_ACTIONS.LIST_USERS:
             validate_list_users(params);
-          break;
+            break;
         default:
-          throw new RpcError('INTERNAL_ERROR', `${action} is not supported`);
-      }
+            throw new RpcError('INTERNAL_ERROR', `${action} is not supported`);
+    }
 }
 
 /**
@@ -181,22 +239,109 @@ function validate_access_keys_params(action, params) {
     switch (action) {
         case iam_constants.IAM_ACTIONS.CREATE_ACCESS_KEY:
             validate_create_access_key(params);
-          break;
+            break;
         case iam_constants.IAM_ACTIONS.GET_ACCESS_KEY_LAST_USED:
             validate_get_access_key_last_used(params);
-          break;
+            break;
         case iam_constants.IAM_ACTIONS.UPDATE_ACCESS_KEY:
             validate_update_access_key(params);
-          break;
+            break;
         case iam_constants.IAM_ACTIONS.DELETE_ACCESS_KEY:
             validate_delete_access_key(params);
-          break;
+            break;
         case iam_constants.IAM_ACTIONS.LIST_ACCESS_KEYS:
             validate_list_access_keys(params);
-          break;
+            break;
         default:
-          throw new RpcError('INTERNAL_ERROR', `${action} is not supported`);
-      }
+            throw new RpcError('INTERNAL_ERROR', `${action} is not supported`);
+    }
+}
+
+/**
+ * validate_tagging_params will call the equivalent function for each action in tagging API
+ * @param {string} action
+ * @param {object} params
+ */
+function validate_tagging_params(action, params) {
+    switch (action) {
+        case iam_constants.IAM_ACTIONS.TAG_USER:
+            validate_tag_user_params(params);
+            break;
+        case iam_constants.IAM_ACTIONS.UNTAG_USER:
+            validate_untag_user_params(params);
+            break;
+        case iam_constants.IAM_ACTIONS.LIST_USER_TAGS:
+            validate_list_user_tags_params(params);
+            break;
+        default:
+            throw new RpcError('INTERNAL_ERROR', `${action} is not supported`);
+    }
+}
+
+/**
+ * validate_policy_params will call the equivalent function for each action in user and role policy APIs
+ * @param {string} action
+ * @param {object} params
+ */
+function validate_policy_params(action, params) {
+    switch (action) {
+        case iam_constants.IAM_ACTIONS.PUT_USER_POLICY:
+            validate_put_user_policy(params);
+            break;
+        case iam_constants.IAM_ACTIONS.GET_USER_POLICY:
+            validate_get_user_policy(params);
+            break;
+        case iam_constants.IAM_ACTIONS.DELETE_USER_POLICY:
+            validate_delete_user_policy(params);
+            break;
+        case iam_constants.IAM_ACTIONS.LIST_USER_POLICIES:
+            validate_list_user_policies(params);
+            break;
+        case iam_constants.IAM_ACTIONS.PUT_ROLE_POLICY:
+            validate_put_role_policy(params);
+            break;
+        case iam_constants.IAM_ACTIONS.GET_ROLE_POLICY:
+            validate_get_role_policy(params);
+            break;
+        case iam_constants.IAM_ACTIONS.DELETE_ROLE_POLICY:
+            validate_delete_role_policy(params);
+            break;
+        case iam_constants.IAM_ACTIONS.LIST_ROLE_POLICIES:
+            validate_list_role_policies(params);
+            break;
+        case iam_constants.IAM_ACTIONS.UPDATE_ASSUME_ROLE_POLICY:
+            validate_update_assume_role_policy(params);
+            break;
+        default:
+            throw new RpcError('INTERNAL_ERROR', `${action} is not supported`);
+    }
+}
+
+/**
+ * validate_role_params will call the equivalent function for each action in role API
+ * @param {string} action
+ * @param {object} params
+ */
+function validate_role_params(action, params) {
+    switch (action) {
+        case iam_constants.IAM_ACTIONS.CREATE_ROLE:
+            validate_create_role(params);
+            break;
+        case iam_constants.IAM_ACTIONS.GET_ROLE:
+            validate_get_role(params);
+            break;
+        case iam_constants.IAM_ACTIONS.UPDATE_ROLE:
+            validate_update_role(params);
+            break;
+        case iam_constants.IAM_ACTIONS.DELETE_ROLE:
+            validate_delete_role(params);
+            break;
+        case iam_constants.IAM_ACTIONS.LIST_ROLES:
+            validate_list_roles(params);
+            break;
+        default:
+            throw new RpcError('INTERNAL_ERROR', `${action} is not supported`);
+    }
 }
 
 /**
@@ -224,13 +369,46 @@ function check_required_status(params) {
 }
 
 /**
+ * check_required_policy_name checks if the policy name was set
+ * @param {object} params
+ */
+function check_required_policy_name(params) {
+    check_required_key(params.policy_name, 'policy-name');
+}
+
+/**
+ * check_required_policy_document checks if the policy document was set
+ * @param {object} params
+ */
+function check_required_policy_document(params) {
+    check_required_key(params.policy_document, 'policy-document');
+}
+
+/**
+ * check_required_role_name checks if the role name was set
+ * @param {object} params
+ */
+function check_required_role_name(params) {
+    check_required_key(params.role_name, iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME);
+}
+
+/**
+ * check_required_assume_role_policy_document checks if the assume role policy document was set
+ * @param {object} params
+ */
+function check_required_assume_role_policy_document(params) {
+    check_required_key(params.assume_role_policy_document,
+        iam_constants.IAM_ROLE_PARAMETER_NAME.ASSUME_ROLE_POLICY_DOCUMENT);
+}
+
+/**
  * check_required_key checks if a required key was set
  * @param {any} value
- * @param {string} flag_name
+ * @param {string} parameter_name
  */
-function check_required_key(value, flag_name) {
+function check_required_key(value, parameter_name) {
     if (value === undefined) {
-        const message_with_details = `the following arguments are required: --${flag_name}`; // copied from AWS CLI
+        const message_with_details = `the following arguments are required: --${parameter_name}`; // copied from AWS CLI
         const { code, http_code, type } = IamError.ValidationError;
         throw new IamError({ code, message: message_with_details, http_code, type });
     }
@@ -241,9 +419,13 @@ function check_required_key(value, flag_name) {
  * @param {object} params
  */
 function validate_create_user(params) {
-    check_required_username(params);
-    validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
-    validate_iam_path(params.iam_path, iam_constants.IAM_PARAMETER_NAME.IAM_PATH);
+    try {
+        check_required_username(params);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+        validate_iam_path(params.iam_path, iam_constants.IAM_PARAMETER_NAME.IAM_PATH);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
 }
 
 /**
@@ -251,7 +433,11 @@ function validate_create_user(params) {
  * @param {object} params
  */
 function validate_get_user(params) {
-    validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    try {
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
 }
 
 /**
@@ -259,10 +445,14 @@ function validate_get_user(params) {
  * @param {object} params
  */
 function validate_update_user(params) {
-    check_required_username(params);
-    validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
-    validate_username(params.new_username, iam_constants.IAM_PARAMETER_NAME.NEW_USERNAME);
-    validate_iam_path(params.new_iam_path, iam_constants.IAM_PARAMETER_NAME.NEW_IAM_PATH);
+    try {
+        check_required_username(params);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+        validation_utils.validate_username(params.new_username, iam_constants.IAM_PARAMETER_NAME.NEW_USERNAME);
+        validate_iam_path(params.new_iam_path, iam_constants.IAM_PARAMETER_NAME.NEW_IAM_PATH);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
 }
 
 /**
@@ -270,8 +460,12 @@ function validate_update_user(params) {
  * @param {object} params
  */
 function validate_delete_user(params) {
-    check_required_username(params);
-    validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    try {
+        check_required_username(params);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
 }
 
 /**
@@ -279,9 +473,13 @@ function validate_delete_user(params) {
  * @param {object} params
  */
 function validate_list_users(params) {
-    validate_marker(params.marker);
-    validate_max_items(params.max_items);
-    validate_iam_path(params.iam_path_prefix, iam_constants.IAM_PARAMETER_NAME.IAM_PATH_PREFIX);
+    try {
+        validate_marker(params.marker);
+        validate_max_items(params.max_items);
+        validate_iam_path(params.iam_path_prefix, iam_constants.IAM_PARAMETER_NAME.IAM_PATH_PREFIX);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
 }
 
 /**
@@ -289,7 +487,11 @@ function validate_list_users(params) {
  * @param {object} params
  */
 function validate_create_access_key(params) {
-    validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    try {
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
 }
 
 /**
@@ -297,8 +499,12 @@ function validate_create_access_key(params) {
  * @param {object} params
  */
 function validate_get_access_key_last_used(params) {
-    check_required_access_key_id(params);
-    validate_access_key_id(params.access_key);
+    try {
+        check_required_access_key_id(params);
+        validate_access_key_id(params.access_key);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
 }
 
 /**
@@ -306,11 +512,15 @@ function validate_get_access_key_last_used(params) {
  * @param {object} params
  */
 function validate_update_access_key(params) {
-    check_required_access_key_id(params);
-    check_required_status(params);
-    validate_access_key_id(params.access_key);
-    validate_status(params.status);
-    validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    try {
+        check_required_access_key_id(params);
+        check_required_status(params);
+        validate_access_key_id(params.access_key);
+        validate_status(params.status);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
 }
 
 /**
@@ -318,9 +528,13 @@ function validate_update_access_key(params) {
  * @param {object} params
  */
 function validate_delete_access_key(params) {
-    check_required_access_key_id(params);
-    validate_access_key_id(params.access_key);
-    validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    try {
+        check_required_access_key_id(params);
+        validate_access_key_id(params.access_key);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
 }
 
 /**
@@ -328,9 +542,226 @@ function validate_delete_access_key(params) {
  * @param {object} params
  */
 function validate_list_access_keys(params) {
-    validate_marker(params.marker);
-    validate_max_items(params.max_items);
-    validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    try {
+        validate_marker(params.marker);
+        validate_max_items(params.max_items);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_put_user_policy checks the params for put_user_policy action
+ * @param {object} params
+ */
+function validate_put_user_policy(params) {
+    try {
+        check_required_username(params);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+        check_required_policy_name(params);
+        validate_policy_name(params.policy_name, iam_constants.IAM_PARAMETER_NAME.POLICY_NAME);
+        check_required_policy_document(params);
+        validate_policy_document(params.policy_document, iam_constants.IAM_PARAMETER_NAME.POLICY_DOCUMENT);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_get_user_policy checks the params for get_user_policy action
+ * @param {object} params
+ */
+function validate_get_user_policy(params) {
+    try {
+        check_required_username(params);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+        check_required_policy_name(params);
+        validate_policy_name(params.policy_name, iam_constants.IAM_PARAMETER_NAME.POLICY_NAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_delete_user_policy checks the params for delete_user_policy action
+ * @param {object} params
+ */
+function validate_delete_user_policy(params) {
+    try {
+        check_required_username(params);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+        check_required_policy_name(params);
+        validate_policy_name(params.policy_name, iam_constants.IAM_PARAMETER_NAME.POLICY_NAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_list_user_policies checks the params for list_user_policies action
+ * @param {object} params
+ */
+function validate_list_user_policies(params) {
+    try {
+        validate_marker(params.marker);
+        validate_max_items(params.max_items);
+        check_required_username(params);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_create_role checks the params for create_role action
+ * @param {object} params
+ */
+function validate_create_role(params) {
+    try {
+        check_required_role_name(params);
+        check_required_assume_role_policy_document(params);
+        validate_role_name(params.role_name, iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME);
+        validate_iam_path(params.iam_path, iam_constants.IAM_ROLE_PARAMETER_NAME.IAM_PATH);
+        validate_role_description(params.description);
+        validate_assume_role_policy_document(params.assume_role_policy_document,
+            iam_constants.IAM_ROLE_PARAMETER_NAME.ASSUME_ROLE_POLICY_DOCUMENT);
+        validate_max_session_duration(params.max_session_duration);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_get_role checks the params for get_role action
+ * @param {object} params
+ */
+function validate_get_role(params) {
+    try {
+        check_required_role_name(params);
+        validate_role_name(params.role_name, iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_update_role checks the params for update_role action
+ * @param {object} params
+ */
+function validate_update_role(params) {
+    try {
+        check_required_role_name(params);
+        validate_role_name(params.role_name, iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME);
+        validate_role_description(params.description);
+        validate_max_session_duration(params.max_session_duration);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_delete_role checks the params for delete_role action
+ * @param {object} params
+ */
+function validate_delete_role(params) {
+    try {
+        check_required_role_name(params);
+        validate_role_name(params.role_name, iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_list_roles checks the params for list_roles action
+ * @param {object} params
+ */
+function validate_list_roles(params) {
+    try {
+        validate_marker(params.marker);
+        validate_max_items(params.max_items);
+        validate_iam_path(params.iam_path_prefix, iam_constants.IAM_ROLE_PARAMETER_NAME.IAM_PATH_PREFIX);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+ /**
+ * validate_put_role_policy checks the params for put_role_policy action
+ * @param {object} params
+ */
+function validate_put_role_policy(params) {
+    try {
+        check_required_role_name(params);
+        validate_role_name(params.role_name, iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME);
+        check_required_policy_name(params);
+        validate_policy_name(params.policy_name, iam_constants.IAM_ROLE_PARAMETER_NAME.POLICY_NAME);
+        check_required_policy_document(params);
+        validate_policy_document(params.policy_document, iam_constants.IAM_ROLE_PARAMETER_NAME.POLICY_DOCUMENT);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_delete_role_policy checks the params for delete_role_policy action
+ * @param {object} params
+ */
+function validate_delete_role_policy(params) {
+    try {
+        check_required_role_name(params);
+        validate_role_name(params.role_name, iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME);
+        check_required_policy_name(params);
+        validate_policy_name(params.policy_name, iam_constants.IAM_ROLE_PARAMETER_NAME.POLICY_NAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_get_role_policy checks the params for get_role_policy action
+ * @param {object} params
+ */
+function validate_get_role_policy(params) {
+    try {
+        check_required_role_name(params);
+        validate_role_name(params.role_name, iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME);
+        check_required_policy_name(params);
+        validate_policy_name(params.policy_name, iam_constants.IAM_ROLE_PARAMETER_NAME.POLICY_NAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_list_role_policies checks the params for list_role_policies action
+ * @param {object} params
+ */
+function validate_list_role_policies(params) {
+    try {
+        validate_marker(params.marker);
+        validate_max_items(params.max_items);
+        check_required_role_name(params);
+        validate_role_name(params.role_name, iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_update_assume_role_policy checks the params for update_assume_role_policy action
+ * @param {object} params
+ */
+function validate_update_assume_role_policy(params) {
+    try {
+        check_required_role_name(params);
+        validate_role_name(params.role_name, iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME);
+        check_required_policy_document(params);
+        validate_assume_role_policy_document(params.policy_document, iam_constants.IAM_ROLE_PARAMETER_NAME.POLICY_DOCUMENT);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
 }
 
 /**
@@ -342,64 +773,26 @@ function validate_list_access_keys(params) {
  * @param {string} parameter_name
  */
 function validate_iam_path(input_path, parameter_name = iam_constants.IAM_PARAMETER_NAME.IAM_PATH) {
-    if (input_path === undefined) return;
-    // type check
-    _type_check_input('string', input_path, parameter_name);
-    // length check
-    const min_length = 1;
-    const max_length = 512;
-    _length_check_input(min_length, max_length, input_path, parameter_name);
-    // regex check
-    const valid_aws_path = input_path.startsWith('/') && input_path.endsWith('/') && AWS_IAM_PATH_REGEXP.test(input_path);
-    if (!valid_aws_path) {
+    try {
+        if (input_path === undefined) return;
+        // type check
+        validation_utils._type_check_input('string', input_path, parameter_name);
+        // length check
+        const min_length = 1;
+        const max_length = 512;
+        validation_utils._length_check_input(min_length, max_length, input_path, parameter_name);
+        // regex check
+        const valid_aws_path = input_path.startsWith('/') && input_path.endsWith('/') && AWS_IAM_PATH_REGEXP.test(input_path);
+        if (!valid_aws_path) {
             const message_with_details = `The specified value for ${_.lowerFirst(parameter_name)} is invalid. ` +
-            `It must begin and end with / and contain only alphanumeric characters and/or / characters.`;
+                `It must begin and end with / and contain only alphanumeric characters and/or / characters.`;
             const { code, http_code, type } = IamError.ValidationError;
             throw new IamError({ code, message: message_with_details, http_code, type });
+        }
+        return true;
+    } catch (err) {
+        translate_rpc_error(err);
     }
-    return true;
-}
-
-/**
- * validate_username will validate:
- * 1. type
- * 2. length
- * 3. regex (from AWS docs)
- * 4. additional internal restrictions
- * @param {string} input_username
- * @param {string} parameter_name
- */
-function validate_username(input_username, parameter_name = iam_constants.IAM_PARAMETER_NAME.USERNAME) {
-    if (input_username === undefined) return;
-    // type check
-    _type_check_input('string', input_username, parameter_name);
-    // length check
-    const min_length = 1;
-    const max_length = 64;
-    _length_check_input(min_length, max_length, input_username, parameter_name);
-    // regex check
-    const valid_username = AWS_USERNAME_REGEXP.test(input_username);
-    if (!valid_username) {
-            const message_with_details = `The specified value for ${_.lowerFirst(parameter_name)} is invalid. ` +
-            `It must contain only alphanumeric characters and/or the following: +=,.@_-`;
-            const { code, http_code, type } = IamError.ValidationError;
-            throw new IamError({ code, message: message_with_details, http_code, type });
-    }
-    // internal limitations
-    const invalid_internal_names = new Set(['anonymous', '/', '.']);
-    if (invalid_internal_names.has(input_username)) {
-        const message_with_details = `The specified value for ${_.lowerFirst(parameter_name)} is invalid. ` +
-        `Should not be one of: ${[...invalid_internal_names].join(' ').toString()}`;
-        const { code, http_code, type } = IamError.ValidationError;
-        throw new IamError({ code, message: message_with_details, http_code, type });
-    }
-    if (input_username !== input_username.trim()) {
-        const message_with_details = `The specified value for ${_.lowerFirst(parameter_name)} is invalid. ` +
-        `Must not contain leading or trailing spaces`;
-        const { code, http_code, type } = IamError.ValidationError;
-        throw new IamError({ code, message: message_with_details, http_code, type });
-    }
-    return true;
 }
 
 /**
@@ -410,21 +803,25 @@ function validate_username(input_username, parameter_name = iam_constants.IAM_PA
  * @param {string} input_marker
  */
 function validate_marker(input_marker) {
-    const parameter_name = 'Marker';
-    if (input_marker === undefined) return;
-    // type check
-    _type_check_input('string', input_marker, parameter_name);
-    // length check
-    const min_length = 1;
-    _length_min_check_input(min_length, input_marker, parameter_name);
-    // regex check
-    const valid_marker = AWS_IAM_LIST_MARKER.test(input_marker);
-    if (!valid_marker) {
+    try {
+        const parameter_name = 'Marker';
+        if (input_marker === undefined) return;
+        // type check
+        validation_utils._type_check_input('string', input_marker, parameter_name);
+        // length check
+        const min_length = 1;
+        validation_utils._length_min_check_input(min_length, input_marker, parameter_name);
+        // regex check
+        const valid_marker = AWS_IAM_LIST_MARKER.test(input_marker);
+        if (!valid_marker) {
             const message_with_details = `The specified value for ${_.lowerFirst(parameter_name)} is invalid. `;
             const { code, http_code, type } = IamError.ValidationError;
             throw new IamError({ code, message: message_with_details, http_code, type });
+        }
+        return true;
+    } catch (err) {
+        translate_rpc_error(err);
     }
-    return true;
 }
 
 /**
@@ -438,7 +835,7 @@ function validate_max_items(input_max_items) {
     const parameter_name = 'MaxItems';
     if (input_max_items === undefined) return;
     // type check
-     _type_check_input('number', input_max_items, parameter_name);
+    validation_utils._type_check_input('number', input_max_items, parameter_name);
     // value check
     const min_value = 1;
     const max_value = 1000;
@@ -467,23 +864,27 @@ function validate_max_items(input_max_items) {
  * @param {string} input_access_key_id
  */
 function validate_access_key_id(input_access_key_id) {
-    const parameter_name = 'AccessKeyId';
-    if (input_access_key_id === undefined) return;
-    // type check
-    _type_check_input('string', input_access_key_id, parameter_name);
-    // length check
-    const min_length = 16;
-    const max_length = 128;
-    _length_check_input(min_length, max_length, input_access_key_id, parameter_name);
-    // regex check
-    const valid_access_key_id = AWS_IAM_ACCESS_KEY_INPUT_REGEXP.test(input_access_key_id);
-    if (!valid_access_key_id) {
+    try {
+        const parameter_name = 'AccessKeyId';
+        if (input_access_key_id === undefined) return;
+        // type check
+        validation_utils._type_check_input('string', input_access_key_id, parameter_name);
+        // length check
+        const min_length = 16;
+        const max_length = 128;
+        validation_utils._length_check_input(min_length, max_length, input_access_key_id, parameter_name);
+        // regex check
+        const valid_access_key_id = AWS_IAM_ACCESS_KEY_INPUT_REGEXP.test(input_access_key_id);
+        if (!valid_access_key_id) {
             const message_with_details = `The specified value for ${_.lowerFirst(parameter_name)} is invalid. ` +
-            `It must contain only alphanumeric characters`;
+                `It must contain only alphanumeric characters`;
             const { code, http_code, type } = IamError.ValidationError;
             throw new IamError({ code, message: message_with_details, http_code, type });
+        }
+        return true;
+    } catch (err) {
+        translate_rpc_error(err);
     }
-    return true;
 }
 
 /**
@@ -505,17 +906,562 @@ function validate_status(input_status) {
     return true;
 }
 
+/**
+ * validate_policy_document will validate:
+ * 1. type
+ * 2. length
+ * 3. regex (from AWS docs)
+ * 4. valid JSON (like we do in bucket policy)
+ * 5. structure - basic (currently - only that we don't have Principal NotPrincipal)
+ * @param {string} input_policy_document
+ * @param {string} parameter_name
+ */
+function validate_policy_document(input_policy_document, parameter_name = iam_constants.IAM_PARAMETER_NAME.POLICY_DOCUMENT) {
+    try {
+        if (input_policy_document === undefined) return;
+        // syntax + JSON validation
+        const policy_document = _validate_policy_document_syntax(input_policy_document, parameter_name);
+        _validate_policy_document_iam_structure(policy_document);
+        return true;
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_assume_role_policy_document validates policy document syntax for role trust policy input
+ * @param {string} input_policy_document
+ * @param {string} parameter_name
+ */
+function validate_assume_role_policy_document(
+    input_policy_document,
+    parameter_name = iam_constants.IAM_ROLE_PARAMETER_NAME.ASSUME_ROLE_POLICY_DOCUMENT
+) {
+    try {
+        if (input_policy_document === undefined) return;
+        const policy_document = _validate_policy_document_syntax(input_policy_document, parameter_name);
+        _validate_assume_role_policy_document_iam_structure(policy_document);
+        return true;
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_max_session_duration validates max session duration for role
+ * @param {number} max_session_duration
+ */
+function validate_max_session_duration(max_session_duration) {
+    if (max_session_duration === undefined) return;
+    const parameter_name = iam_constants.IAM_ROLE_PARAMETER_NAME.MAX_SESSION_DURATION;
+    validation_utils._type_check_input('number', max_session_duration, parameter_name);
+    const message_with_details = `1 validation error detected: Value ${max_session_duration} at ` +
+        `'${parameter_name}' failed to satisfy constraint: ` +
+        'Member must have value between 3600 and 43200';
+    if (!Number.isInteger(max_session_duration)) {
+        const { code, http_code, type } = IamError.ValidationError;
+        throw new IamError({ code, message: message_with_details, http_code, type });
+    }
+    try {
+        validation_utils._length_check_input(3600, 43200, max_session_duration, parameter_name);
+    } catch (err) {
+        const { code, http_code, type } = IamError.ValidationError;
+        throw new IamError({ code, message: message_with_details, http_code, type });
+    }
+}
+
+/**
+ * validate_role_description validates role description according to AWS rules
+ * @param {string} description
+ * @param {string} parameter_name
+ */
+function validate_role_description(description, parameter_name = iam_constants.IAM_ROLE_PARAMETER_NAME.DESCRIPTION) {
+    try {
+        if (description === undefined) return;
+        validation_utils._type_check_input('string', description, parameter_name);
+        validation_utils._length_max_check_input(1000, description, parameter_name);
+        if (!AWS_ROLE_DESCRIPTION_REGEXP.test(description)) {
+            const message_with_details = `The specified value for ${_.lowerFirst(parameter_name)} is invalid.`;
+            const { code, http_code, type } = IamError.ValidationError;
+            throw new IamError({ code, message: message_with_details, http_code, type });
+        }
+        return true;
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_role_name validates role name according to AWS naming rules
+ * @param {string} input_role_name
+ * @param {string} parameter_name
+ */
+function validate_role_name(input_role_name, parameter_name = iam_constants.IAM_ROLE_PARAMETER_NAME.ROLE_NAME) {
+    try {
+        if (input_role_name === undefined) return;
+        // type check
+        validation_utils._type_check_input('string', input_role_name, parameter_name);
+        // length check
+        const min_length = 1;
+        const max_length = 64;
+        validation_utils._length_check_input(min_length, max_length, input_role_name, parameter_name);
+        // regex check
+        const is_valid_role_name = AWS_ROLE_NAME_REGEXP.test(input_role_name);
+        if (!is_valid_role_name) {
+            const message_with_details = `The specified value for ${_.lowerFirst(parameter_name)} is invalid. ` +
+                `It must contain only alphanumeric characters and/or the following: +=,.@_-`;
+            const { code, http_code, type } = IamError.ValidationError;
+            throw new IamError({ code, message: message_with_details, http_code, type });
+        }
+        return true;
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_policy_name will validate:
+ * 1. type
+ * 2. length
+ * 3. regex (from AWS docs)
+ * @param {string} input_policy_name
+ * @param {string} parameter_name
+ */
+function validate_policy_name(input_policy_name, parameter_name = iam_constants.IAM_PARAMETER_NAME.POLICY_NAME) {
+    try {
+        if (input_policy_name === undefined) return;
+        // type check
+        validation_utils._type_check_input('string', input_policy_name, parameter_name);
+        // length check
+        const min_length = 1;
+        const max_length = 128;
+        validation_utils._length_check_input(min_length, max_length, input_policy_name, parameter_name);
+        // regex check
+        const is_valid_policy_name = AWS_POLICY_NAME_REGEXP.test(input_policy_name);
+        if (!is_valid_policy_name) {
+            const message_with_details = `The specified value for ${_.lowerFirst(parameter_name)} is invalid. ` +
+                `It must contain only alphanumeric characters and/or the following: +=,.@_-`;
+            const { code, http_code, type } = IamError.ValidationError;
+            throw new IamError({ code, message: message_with_details, http_code, type });
+        }
+        return true;
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * _validate_policy_document_syntax validates type/length/regex and JSON syntax for policy documents
+ * @param {string} input_policy_document
+ * @param {string} parameter_name
+ * @returns {object}
+ */
+function _validate_policy_document_syntax(input_policy_document, parameter_name) {
+    validation_utils._type_check_input('string', input_policy_document, parameter_name);
+    const min_length = 1;
+    const max_length = iam_constants.AWS_LIMIT_CHARS_POLICY_DOCUMENT;
+    try {
+        validation_utils._length_check_input(min_length, max_length, input_policy_document, parameter_name);
+    } catch (err) {
+        throw_malformed_policy_document_error('Syntax errors in policy.');
+    }
+    const is_valid_policy_document = AWS_POLICY_DOCUMENT_REGEXP.test(input_policy_document);
+    if (!is_valid_policy_document) {
+        throw_malformed_policy_document_error('Syntax errors in policy.');
+    }
+    return _validate_json_policy_document(input_policy_document);
+}
+
+/**
+ * _validate_json_policy_document will validate that the policy document is valid JSON
+ * @param {string} input_policy_document
+ */
+function _validate_json_policy_document(input_policy_document) {
+    try {
+        return JSON.parse(input_policy_document);
+    } catch (error) {
+        throw_malformed_policy_document_error('Syntax errors in policy.');
+    }
+}
+
+/**
+ * The function will validate the policy document basic structure
+ * 1. validate version
+ * 2. validate Statement is array and iterable
+ * 3. validate Statement IDs (SID) are unique
+ * 4. validate Principal NotPrincipal is not present in every Statement
+ * @param {object} policy_document
+ */
+
+function _validate_policy_document_iam_structure(policy_document) {
+    // validate version
+    if (policy_document.Version !== '2012-10-17' && policy_document.Version !== '2008-10-17') {
+        throw_malformed_policy_document_error('Syntax errors in policy.');
+    }
+    // as we check this before the schema check - here we ensure that we have the Statement as array and it is iterable
+    if (!policy_document.Statement || !Array.isArray(policy_document.Statement)) {
+        throw_malformed_policy_document_error('Syntax errors in policy.');
+    }
+    // validation inside the Statement array
+    const statement_ids = new Set();
+    for (const statement of policy_document.Statement) {
+        if (statement.Sid) {
+            _statement_id_is_valid(statement.Sid, statement_ids);
+        }
+        const statement_principal = statement.Principal || statement.NotPrincipal;
+        if (statement_principal) {
+            throw_malformed_policy_document_error('Policy document should not specify a principal.');
+        }
+    }
+}
+
+/**
+ * _validate_assume_role_policy_document_iam_structure validates the structural correctness of an
+ * assume-role trust policy document (which is allowed to have Principal / NotPrincipal).
+ *
+ * Specifically:
+ *  - Version must be '2012-10-17' or '2008-10-17'.
+ *  - Statement must be a non-empty array.
+ *  - Principal.Federated entries, when present, must conform to the OIDC-provider or LDAP-provider ARN format:
+ *      - OIDC ARN: arn:aws:iam::<12-digit-account-id>:oidc-provider/<provider-url> or arn:aws:iam:::oidc-provider/<provider-url>
+ *      - LDAP ARN: arn:aws:iam::<account-id?>:ldap-provider/<host>[:port]
+ *
+ * @param {object} policy_document - parsed trust policy JSON
+ */
+function _validate_assume_role_policy_document_iam_structure(policy_document) {
+    // validate version
+    if (policy_document.Version !== '2012-10-17' && policy_document.Version !== '2008-10-17') {
+        throw_malformed_policy_document_error('Syntax errors in policy.');
+    }
+    // ensure Statement is a non-empty array
+    if (!policy_document.Statement || !Array.isArray(policy_document.Statement) || policy_document.Statement.length === 0) {
+        throw_malformed_policy_document_error('Syntax errors in policy.');
+    }
+    // validate inside the Statement array
+    const statement_ids = new Set();
+    for (const statement of policy_document.Statement) {
+        if (statement.Sid) {
+            _statement_id_is_valid(statement.Sid, statement_ids);
+        }
+        const statement_principal = statement.Principal || statement.NotPrincipal;
+        if (!statement_principal) continue;
+
+        // Validate Principal.Federated ARN format when present
+        const federated = statement_principal.Federated;
+        if (federated !== undefined) {
+            const entries = Array.isArray(federated) ? federated : [federated];
+            for (const entry of entries) {
+                const is_oidc = typeof entry === 'string' && AWS_OIDC_PROVIDER_ARN_REGEXP.test(entry);
+                const is_ldap = typeof entry === 'string' && AWS_LDAP_PROVIDER_ARN_REGEXP.test(entry);
+                if (!is_oidc && !is_ldap) {
+                    throw_malformed_policy_document_error(
+                        'Invalid Federated principal. ' +
+                        'Expected format: arn:aws:iam::<12-digit-account-id>:oidc-provider/<provider-url> ' +
+                        'or arn:aws:iam::<account-id>:ldap-provider/<host>[:port] '
+                    );
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The function will validate the statement ID
+ * 1. regex check
+ * 2. check unique in the JSON policy document
+ * @param {string} statement_id
+ * @param {Set<string>} statement_ids
+ */
+function _statement_id_is_valid(statement_id, statement_ids) {
+    // regex check
+    const valid_sid = AWS_POLICY_SID_REGEXP.test(statement_id);
+    if (!valid_sid) {
+        throw_malformed_policy_document_error('Statement IDs (SID) must be alpha-numeric. ' +
+            'Check that your input satisfies the regular expression [0-9A-Za-z]*');
+    }
+    // check unique in the JSON policy document
+    if (statement_ids.has(statement_id)) {
+        throw_malformed_policy_document_error('Statement IDs (SID) in a single policy must be unique.');
+    }
+    statement_ids.add(statement_id);
+}
+/**
+ * translate_rpc_error is used to translate the RPC error in-place
+ * @param {{ rpc_code: string; message: string; }} err
+ */
+function translate_rpc_error(err) {
+    if (err.rpc_code === 'VALIDATION_ERROR') {
+        const { code, http_code, type } = IamError.ValidationError;
+        throw new IamError({ code, message: err.message, http_code, type });
+    }
+    if (err.rpc_code === 'INVALID_INPUT') {
+        const { code, http_code, type } = IamError.InvalidInput;
+        throw new IamError({ code, message: err.message, http_code, type });
+    }
+    throw err;
+}
+
+/**
+ * throw_malformed_policy_document_error throws MalformedPolicyDocument IAM error
+ * @param {string} [message_with_details]
+ */
+function throw_malformed_policy_document_error(message_with_details = 'Syntax errors in policy') {
+    const { code, http_code, type } = IamError.MalformedPolicyDocument;
+    throw new IamError({ code, message: message_with_details, http_code, type });
+}
+
+/**
+ * parse_indexed_members parses indexed array members
+ * generic parser for AWS-style indexed request parameters
+ * @param {object} body - request body
+ * @param {string} base_key - the base key pattern (e.g., 'tags_member_{index}_key)
+ * @param {Function} [mapper] - optional function to convert each item
+ */
+function parse_indexed_members(body, base_key, mapper) {
+    try {
+        const result = [];
+        let index = 1;
+        let check_key = base_key.replace('{index}', String(index));
+
+        while (body[check_key] !== undefined) {
+            result.push(mapper ? mapper(body, index) : body[check_key]);
+            index += 1;
+            check_key = base_key.replace('{index}', String(index));
+        }
+        return result;
+    } catch (err) {
+        throw new RpcError('INVALID_INPUT', `Error parsing request parameters: ${err.message}`);
+    }
+}
+
+/**
+ * parse_tags_from_request_body parses tags from request body
+ * converts AWS encoded indexed members to array of tag objects
+ * example input: { tags_member_1_key: 'env', tags_member_1_value: 'prod', tags_member_2_key: 'team', tags_member_2_value: 'backend' }
+ * example output: [{ key: 'env', value: 'prod' }, { key: 'team', value: 'backend' }]
+ * @param {object} body - request body
+ * @returns {Array<{key: string, value: string}>} array of tag objects
+ */
+function parse_tags_from_request_body(body) {
+    return parse_indexed_members(
+        body,
+        'tags_member_{index}_key',
+        (req_body, index) => ({
+            key: req_body[`tags_member_${index}_key`],
+            value: req_body[`tags_member_${index}_value`] || ''
+        })
+    );
+}
+
+/**
+ * parse_tag_keys_from_request_body parses tag keys from request body
+ * converts AWS encoded indexed members to array
+ * example input: { tag_keys_member_1: 'env', tag_keys_member_2: 'team' }
+ * example output: ['env', 'team']
+ * @param {object} body - request body
+ * @returns {Array<string>} array of tag keys
+ */
+function parse_tag_keys_from_request_body(body) {
+    return parse_indexed_members(body, 'tag_keys_member_{index}');
+}
+
+/**
+ * validate_tag_user_params checks the params for tag_user action
+ * @param {object} params
+ */
+function validate_tag_user_params(params) {
+    try {
+        check_required_username(params);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+        validation_utils.validate_iam_tags(params.tags);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_untag_user_params checks the params for untag_user action
+ * @param {object} params
+ */
+function validate_untag_user_params(params) {
+    try {
+        check_required_username(params);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+        validation_utils.validate_iam_tag_keys(params.tag_keys);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * validate_list_user_tags_params checks the params for list_user_tags action
+ * @param {object} params
+ */
+function validate_list_user_tags_params(params) {
+    try {
+        check_required_username(params);
+        validation_utils.validate_username(params.username, iam_constants.IAM_PARAMETER_NAME.USERNAME);
+        validate_marker(params.marker);
+        validate_max_items(params.max_items);
+    } catch (err) {
+        translate_rpc_error(err);
+    }
+}
+
+/**
+ * get_owner_account_id return owner account id
+ * @param {object} user_account
+ */
+function get_owner_account_id(user_account) {
+    let owner_account_id;
+    if (typeof user_account.owner === 'object') {
+        owner_account_id = String(user_account.owner._id);
+    } else {
+        owner_account_id = user_account.owner;
+    }
+    return owner_account_id;
+}
+
+/**
+ * @param {object} req - http request
+ * @param {String} bucket_name
+ * @param {String} service - Either s3 or vectors
+ * @returns resource arn for requested resource - either * if no bucket, with bucket, or with bucket and key
+ */
+function _get_resource_arn_from_req(req, bucket_name, service) {
+    if (!bucket_name) return "*"; // special case for list all buckets in an account
+    const key = req.params?.key;
+    let resource_arn = `arn:aws:${service}:::${bucket_name}`;
+    if (key) {
+        resource_arn += `/${key}`;
+    }
+    return resource_arn;
+}
+
+/**
+ * _get_assumed_role_session_info detects assumed-role session from the session token without resolving the role
+ * @param {object} req
+ * @returns {{is_assumed_role_session: boolean, assumed_role_arn?: string}}
+ */
+function _get_assumed_role_session_info(req) {
+    const session_token = req.session_token;
+    const is_assumed_role_session = Boolean(
+        session_token?.assumed_role_access_key && session_token?.assumed_role_arn
+    );
+    return {
+        is_assumed_role_session,
+        assumed_role_arn: is_assumed_role_session ? session_token.assumed_role_arn : undefined,
+    };
+}
+
+/**
+ * _get_identity_policies collects identity-based policies for an IAM user or assumed-role session
+ * resolves the IAM role only when authorizing an assumed-role session
+ * @param {object} account
+ * @param {boolean} is_iam_user
+ * @param {string} [assumed_role_arn]
+ * @param {nb.BucketSpace} [bucketspace]
+ * @returns {Promise<object[]|null>} policies, or null if assumed role could not be resolved
+ */
+async function _get_identity_policies(account, is_iam_user, assumed_role_arn, bucketspace) {
+    if (is_iam_user) {
+        return account.iam_inline_policies || [];
+    }
+    const resolved_role = await resolve_iam_role_by_arn(assumed_role_arn, bucketspace);
+    if (!resolved_role?.iam_role) return null;
+    return resolved_role.iam_role.iam_role_policies || [];
+}
+
+/**
+ * authorize_request_iam_policy_impl evaluates IAM inline policies for IAM users and assumed-role sessions on the requested action/resource
+ * returns true on allow, undefined when IAM policy auth is not applicable, or a deny context object
+ * @param {object} req - http request
+ * @param {Function} method - s3 method to authorize policy for
+ * @param {String} bucket_name
+ * @param {String} service - Either s3 or s3vectors, default is s3.
+ * @returns {Promise<true|undefined|{account: object, resource_arn: string, principal_arn?: string}>}
+ */
+async function authorize_request_iam_policy_impl(req, method, bucket_name, service = 's3') {
+    const auth_token = req.object_sdk.get_auth_token();
+    const is_anonymous = !(auth_token && auth_token.access_key);
+    if (is_anonymous) return;
+
+    const account = req.object_sdk.requesting_account;
+    const is_iam_user = account.owner !== undefined;
+    const { is_assumed_role_session, assumed_role_arn } = _get_assumed_role_session_info(req);
+    if (!is_iam_user && !is_assumed_role_session) return;
+
+    const iam_identity = is_iam_user ? 'user' : 'role';
+    const resource_arn = _get_resource_arn_from_req(req, bucket_name, service);
+    const deny_result = {
+        account,
+        resource_arn,
+        // Assumed-role sessions: put the role ARN in AccessDenied via 'principal_arn' field
+        // without this, the message builds a user ARN from requesting_account
+        // (the role owner, loaded via assumed_role_access_key)
+        principal_arn: assumed_role_arn,
+    };
+
+    const iam_policies = await _get_identity_policies(
+        account,
+        is_iam_user,
+        assumed_role_arn,
+        req.object_sdk?._get_bucketspace(),
+    );
+    if (iam_policies === null) {
+        dbg.error('authorize_request_iam_policy: failed to resolve IAM role for assumed session token');
+        return deny_result;
+    }
+    if (iam_policies.length === 0) {
+        dbg.error('authorize_request_iam_policy:', iam_identity, 'has no inline policies configured');
+        return deny_result;
+    }
+
+    const permission_results = await Promise.all(iam_policies.map(iam_policy =>
+        access_policy_utils.has_access_policy_permission(
+            iam_policy.policy_document, undefined, method, resource_arn, req,
+            { should_pass_principal: false }
+        )
+    ));
+    let has_allow_permission = false;
+    for (const permission of permission_results) {
+        if (permission === 'DENY') {
+            dbg.error('authorize_request_iam_policy:', iam_identity, 'has explicit DENY inline policy');
+            return deny_result;
+        }
+        if (permission === 'ALLOW') {
+            has_allow_permission = true;
+        }
+    }
+    if (has_allow_permission) return true;
+    dbg.error('authorize_request_iam_policy:', iam_identity, 'has inline policies but none matched the method');
+    return deny_result;
+}
 
 // EXPORTS
 exports.format_iam_xml_date = format_iam_xml_date;
-exports.create_arn = create_arn;
+exports.create_arn_for_user = create_arn_for_user;
+exports.create_arn_for_root = create_arn_for_root;
+exports.create_arn_for_role = create_arn_for_role;
 exports.get_action_message_title = get_action_message_title;
 exports.check_iam_path_was_set = check_iam_path_was_set;
 exports.parse_max_items = parse_max_items;
 exports.validate_params = validate_params;
 exports.validate_iam_path = validate_iam_path;
-exports.validate_username = validate_username;
 exports.validate_marker = validate_marker;
 exports.validate_access_key_id = validate_access_key_id;
 exports.validate_status = validate_status;
-
+exports.validate_policy_name = validate_policy_name;
+exports.validate_policy_document = validate_policy_document;
+exports.parse_indexed_members = parse_indexed_members;
+exports.parse_tags_from_request_body = parse_tags_from_request_body;
+exports.parse_tag_keys_from_request_body = parse_tag_keys_from_request_body;
+exports.validate_tag_user_params = validate_tag_user_params;
+exports.validate_untag_user_params = validate_untag_user_params;
+exports.validate_list_user_tags_params = validate_list_user_tags_params;
+exports.get_owner_account_id = get_owner_account_id;
+exports.parse_role_arn = parse_role_arn;
+exports.resolve_iam_role_by_arn = resolve_iam_role_by_arn;
+exports.throw_malformed_policy_document_error = throw_malformed_policy_document_error;
+exports.create_detailed_message_for_iam_user_access = create_detailed_message_for_iam_user_access;
+exports.authorize_request_iam_policy_impl = authorize_request_iam_policy_impl;

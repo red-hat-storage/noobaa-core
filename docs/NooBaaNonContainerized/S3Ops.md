@@ -52,7 +52,7 @@ The following lists describe the bucket and object operations available in NooBa
 - Bucket policies are an access policy option available to grant permission to buckets and objects (see [bucket policy](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html) in AWS documentation). You can use bucket policies to add or deny permissions for the objects in a bucket. Bucket policies can allow or deny requests based on the elements in the policy.
 - Bucket policies use JSON-based policy language (for more information see [basic elements in bucket policy](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-policy-language-overview.html) in AWS documentation)
 - Bucket policy can be added to a bucket using the S3 API or the noobaa-cli.
-- Bucket policy is an additional layer of permissions to the FS permissions (UID and GID), which means that if two accounts do not have the same permissions (UID, GID) just setting bucket policy on the bucket is not enough.
+- Bucket policy is an additional layer of permissions to the FS permissions (UID, GID, supplemental GIDs), which means that if two accounts do not have the same permissions (UID, GID, supplemental GIDs) just setting bucket policy on the bucket is not enough.
 
 #### Bucket Policy in NooBaa CLI
 1. Adding a bucket policy:
@@ -98,6 +98,14 @@ Currently we support a couple of options:
 1. All principals (includes anonymous account): either `"Principal": { "AWS": "*" }` or `"Principal": "*"`.
 2. Principal by account name: `"Principal": { "AWS": [ "<account-name-1>", "<account-name-2>", ... ,"<account-name-n>"] }`
 3. Principal by account ID: `"Principal": { "AWS": [ "<account-ID-1>", "<account-ID-2>", ... ,"<account-ID-n>"] }`
+
+### Presigned URL Support
+An account can use presigned URLs to grant time-limited access to objects in its bucket without updating the bucket policy. The credentials used by the presigned URL are those of the user who generated the URL (more information in [AWS docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)).  
+
+#### Simple Test Using AWS CLI and curl:
+1. Pre-requisites: Create account and a bucket, noobaa service should be running, and upload an object to the bucket. 
+2. Create a presigned URL for a minute (the expiration is in seconds): `aws s3 presign s3://<bucket-name>/<key-name> --expires-in 60 --endpoint-url <endpoint-address>` (if needed you can add `--region us-east-1`).
+3. Then you can use: `curl --insecure <URL>` to test the output (`-v` if you want verbose output).
 
 ### Anonymous Requests Support
 

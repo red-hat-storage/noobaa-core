@@ -7,6 +7,7 @@ const nb_native = require('../util/nb_native');
 const dbg = require('../util/debug_module')(__filename);
 const path = require('path');
 const config = require('../../config.js');
+const s3_utils = require('../endpoint/s3/s3_utils');
 const NamespaceFS = require('./namespace_fs');
 
 /**
@@ -23,6 +24,10 @@ class BucketSpaceNB {
         return this.internal_rpc_client.account.read_account_by_access_key({ access_key });
     }
 
+    async read_role_by_name({ role_name, owner_account_id }) {
+        return this.internal_rpc_client.account.read_role_by_name({ role_name, owner_account_id });
+    }
+
     async read_bucket_sdk_info({ name }) {
         return this.internal_rpc_client.bucket.read_bucket_sdk_info({ name });
     }
@@ -32,8 +37,9 @@ class BucketSpaceNB {
     // BUCKET //
     ////////////
 
-    async list_buckets(object_sdk) {
-        const { buckets } = (await this.rpc_client.bucket.list_buckets());
+    async list_buckets(params, object_sdk) {
+        const { buckets, continuation_token } = (await this.rpc_client.bucket.list_buckets(params));
+
         const has_access_buckets = (await P.all(_.map(
             buckets,
             async bucket => {
@@ -43,11 +49,13 @@ class BucketSpaceNB {
                     object_sdk.has_non_nsfs_bucket_access(object_sdk.requesting_account, ns);
                 return has_access_to_bucket && bucket;
             }))).filter(bucket => bucket);
-        return { buckets: has_access_buckets };
+        return { buckets: has_access_buckets, continuation_token };
     }
 
     async read_bucket(params) {
-        return this.rpc_client.bucket.read_bucket(params);
+        const bucket_info = await this.rpc_client.bucket.read_bucket(params);
+        bucket_info.supported_storage_classes = this._supported_storage_class(bucket_info.archive_policy);
+        return bucket_info;
     }
 
     async create_bucket(params, object_sdk) {
@@ -230,6 +238,46 @@ class BucketSpaceNB {
     }
 
     /////////////////////////
+    // BUCKET NOTIFICATION //
+    /////////////////////////
+
+    async put_bucket_notification(params) {
+        return this.rpc_client.bucket.put_bucket_notification({
+            name: params.bucket_name,
+            notifications: params.notifications
+        });
+    }
+
+    async get_bucket_notification(params) {
+        return this.rpc_client.bucket.get_bucket_notification({
+            name: params.bucket_name
+        });
+    }
+
+    ////////////////////
+    // BUCKET CORS //
+    ////////////////////
+
+    async put_bucket_cors(params) {
+        return this.rpc_client.bucket.put_bucket_cors({
+            name: params.name,
+            cors_rules: params.cors_rules
+        });
+    }
+
+    async delete_bucket_cors(params) {
+        return this.rpc_client.bucket.delete_bucket_cors({
+            name: params.name
+        });
+    }
+
+    async get_bucket_cors(params) {
+        return this.rpc_client.bucket.get_bucket_cors({
+            name: params.name
+        });
+    }
+
+    /////////////////////////
     // DEFAULT OBJECT LOCK //
     /////////////////////////
 
@@ -239,6 +287,22 @@ class BucketSpaceNB {
 
     async put_object_lock_configuration(params, object_sdk) {
         return this.rpc_client.bucket.put_object_lock_configuration(params);
+    }
+
+    /////////////////////////
+    // PUBLIC ACCESS BLOCK //
+    /////////////////////////
+
+    async get_public_access_block(params, object_sdk) {
+        return this.rpc_client.bucket.get_public_access_block(params);
+    }
+
+    async put_public_access_block(params, object_sdk) {
+        return this.rpc_client.bucket.put_public_access_block(params);
+    }
+
+    async delete_public_access_block(params, object_sdk) {
+        return this.rpc_client.bucket.delete_public_access_block(params);
     }
 
     //  nsfs
@@ -268,12 +332,99 @@ class BucketSpaceNB {
         }
     }
 
+    /**
+     * returns a list of storage classes supported by this bucket based on its archive policy
+     * @param {object} archive_policy
+     * @returns {Array<string>}
+     */
+    _supported_storage_class(archive_policy) {
+        const storage_classes = [s3_utils.STORAGE_CLASS_STANDARD];
+        if (archive_policy?.deep_archive_resource) {
+            storage_classes.push(s3_utils.STORAGE_CLASS_GLACIER);
+            storage_classes.push(s3_utils.STORAGE_CLASS_DEEP_ARCHIVE);
+        }
+        return storage_classes;
+    }
+
     is_nsfs_containerized_user_anonymous(token) {
         return !token && !process.env.NC_NSFS_NO_DB_ENV;
     }
 
     is_nsfs_non_containerized_user_anonymous(token) {
         return !token && process.env.NC_NSFS_NO_DB_ENV === 'true';
+    }
+
+    async create_vector_bucket(params) {
+        const resp = await this.rpc_client.bucket.create_vector_bucket(params);
+        return resp;
+    }
+
+    async get_vector_bucket(params) {
+        const resp = await this.rpc_client.bucket.get_vector_bucket(params);
+        return resp;
+    }
+
+    async list_vector_buckets(params) {
+        const resp = await this.rpc_client.bucket.list_vector_buckets(params);
+        return resp;
+    }
+
+    async delete_vector_bucket(params) {
+        const resp = await this.rpc_client.bucket.delete_vector_bucket(params);
+        return resp;
+    }
+
+    async create_vector_index(params) {
+         const resp = await this.rpc_client.bucket.create_vector_index(params);
+        return resp;
+    }
+
+    async get_vector_index(params) {
+        const resp = await this.rpc_client.bucket.get_vector_index(params);
+        return resp;
+    }
+
+    async list_vector_indices(params) {
+        const resp = await this.rpc_client.bucket.list_vector_indices(params);
+        return resp;
+    }
+
+    async delete_vector_index(params) {
+        const resp = await this.rpc_client.bucket.delete_vector_index(params);
+        return resp;
+    }
+
+    async add_rows_since_reindex({vector_bucket_name, vector_index_name, delta}) {
+        const resp = await this.rpc_client.bucket.update_rows_since_index({
+            vector_bucket_name,
+            vector_index_name,
+            op: 'ADD',
+            value: delta
+        });
+        return resp;
+    }
+
+    //////////////////////////////
+    // VECTOR BUCKET POLICY     //
+    //////////////////////////////
+
+    async put_vector_bucket_policy(params) {
+        return this.rpc_client.bucket.put_vector_bucket_policy({
+            vector_bucket_name: params.vector_bucket_name,
+            policy: params.policy
+        });
+    }
+
+    async delete_vector_bucket_policy(params) {
+        return this.rpc_client.bucket.delete_vector_bucket_policy({
+            vector_bucket_name: params.vector_bucket_name
+        });
+    }
+
+    async get_vector_bucket_policy(params) {
+        return this.rpc_client.bucket.get_vector_bucket_policy({
+            vector_bucket_name: params.vector_bucket_name
+        });
     }
 }
 

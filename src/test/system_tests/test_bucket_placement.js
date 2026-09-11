@@ -15,6 +15,7 @@ const _ = require('lodash');
 const test_utils = require('./test_utils');
 
 const dotenv = require('../../util/dotenv');
+const { make_auth_token } = require('../../server/common_services/auth_server');
 dotenv.load();
 
 
@@ -42,10 +43,10 @@ module.exports = {
 async function create_auth() {
     const auth_params = {
         email: 'demo@noobaa.com',
-        password: 'DeMo1',
-        system: 'demo'
+        role: 'admin',
+        system: 'demo',
     };
-    return client.create_auth_token(auth_params);
+    client.options.auth_token = make_auth_token(auth_params);
 }
 
 async function run_test() {
@@ -53,7 +54,7 @@ async function run_test() {
         await perform_placement_tests();
         await perform_quota_tests();
         rpc.disconnect_all();
-        return P.resolve("Test Passed! Everything Seems To Be Fine...");
+        return "Test Passed! Everything Seems To Be Fine...";
     } catch (err) {
         console.error('test_bucket_placement FAILED: ', err.stack || err);
         rpc.disconnect_all();
@@ -199,26 +200,24 @@ async function perform_quota_tests() {
     await update_quota_on_bucket();
 }
 
-function update_quota_on_bucket(limit_gb) {
-    return P.resolve()
-        .then(() => {
-            if (limit_gb) {
-                return client.bucket.update_bucket({
-                    name: TEST_QUOTA_BUCKET_NAME,
-                    quota: {
-                        size: limit_gb,
-                        unit: 'GIGABYTE'
-                    }
-                });
-            } else {
-                return client.bucket.update_bucket({
-                    name: TEST_QUOTA_BUCKET_NAME,
-                });
-            }
-        })
-        .catch(err => {
-            throw new Error(`Failed setting quota with ${limit_gb} - ${err}`);
-        });
+async function update_quota_on_bucket(limit_gb) {
+    try {
+        if (limit_gb) {
+            return await client.bucket.update_bucket({
+                name: TEST_QUOTA_BUCKET_NAME,
+                quota: {
+                    size: limit_gb,
+                    unit: 'GIGABYTE'
+                }
+            });
+        } else {
+            return await client.bucket.update_bucket({
+                name: TEST_QUOTA_BUCKET_NAME,
+            });
+        }
+    } catch (err) {
+        throw new Error(`Failed setting quota with ${limit_gb} - ${err}`);
+    }
 }
 
 function main() {

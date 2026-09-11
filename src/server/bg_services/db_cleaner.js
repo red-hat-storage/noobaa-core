@@ -8,6 +8,7 @@ const config = require('../../../config');
 const MDStore = require('../object_services/md_store').MDStore;
 const system_store = require('../system_services/system_store').get_instance();
 const nodes_store = require('../node_services/nodes_store').NodesStore.instance();
+const replication_store = require('../system_services/replication_store').instance();
 const system_utils = require('../utils/system_utils');
 const db_client = require('../../util/db_client');
 const md_aggregator = require('./md_aggregator');
@@ -47,6 +48,7 @@ async function background_worker() {
     await clean_md_store(last_date_to_remove);
     await clean_nodes_store(last_date_to_remove);
     await clean_system_store(last_date_to_remove);
+    await clean_replication_store(last_date_to_remove);
     dbg.log0('DB_CLEANER:', 'END');
     return config.DB_CLEANER_CYCLE;
 }
@@ -65,13 +67,25 @@ async function clean_md_store(last_date_to_remove) {
         await P.map_with_concurrency(10, objects_to_remove, obj => db_delete_object_parts(obj));
         await MDStore.instance().db_delete_objects(objects_to_remove);
     }
-    const blocks_to_remove = await MDStore.instance().find_deleted_blocks(last_date_to_remove, config.DB_CLEANER_DOCS_LIMIT);
+    let blocks_to_remove = await MDStore.instance().find_deleted_blocks(last_date_to_remove, config.DB_CLEANER_DOCS_LIMIT);
+    blocks_to_remove = blocks_to_remove.filter(block => {
+        const reclaimed = Boolean(block?.data?.reclaimed);
+        if (!reclaimed) {
+            dbg.warn("DB_CLEANER: found block which is not reclaimed yet, ", JSON.stringify(block?.data));
+        }
+        return reclaimed;
+    });
+    blocks_to_remove = db_client.instance().uniq_ids(blocks_to_remove, '_id');
     dbg.log2('DB_CLEANER: list blocks:', blocks_to_remove);
     if (blocks_to_remove.length) await MDStore.instance().db_delete_blocks(blocks_to_remove);
     const chunks_to_remove = await MDStore.instance().find_deleted_chunks(last_date_to_remove, config.DB_CLEANER_DOCS_LIMIT);
-    const filtered_chunks = chunks_to_remove.filter(async chunk =>
-        !(await MDStore.instance().has_any_blocks_for_chunk(chunk)) &&
-        !(await MDStore.instance().has_any_parts_for_chunk(chunk)));
+    const filtered_chunks = (
+        await Promise.all(chunks_to_remove.map(async chunk => {
+            const has_blocks_or_parts = await MDStore.instance().has_any_blocks_or_parts_for_chunk(chunk);
+            return has_blocks_or_parts ? null : chunk;
+        }))
+    ).filter(Boolean);
+
     dbg.log2('DB_CLEANER: list chunks with no blocks and no parts to be removed from DB', filtered_chunks);
     if (filtered_chunks.length) await MDStore.instance().db_delete_chunks(filtered_chunks);
     dbg.log0(`DB_CLEANER: removed ${objects_to_remove.length + blocks_to_remove.length + filtered_chunks.length} documents from md-store`);
@@ -107,40 +121,85 @@ async function clean_nodes_store(last_date_to_remove) {
     dbg.log0(`DB_CLEANER: removed ${filtered_nodes.length} documents from nodes-store`);
 }
 
+async function clean_replication_store(last_date_to_remove) {
+    const total_replication_rules_count = await replication_store.count_total_replication_rules();
+    if (total_replication_rules_count < config.DB_CLEANER_MAX_TOTAL_DOCS) {
+        dbg.log0(`DB_CLEANER: found less than ${config.DB_CLEANER_MAX_TOTAL_DOCS} replication rules in replication-store
+        ${total_replication_rules_count} replication rules - Skipping...`);
+        return;
+    }
+    dbg.log0('DB_CLEANER: checking replication-store for replication rules deleted before', new Date(last_date_to_remove));
+    const replication_rules = await replication_store.find_deleted_rules(last_date_to_remove, config.DB_CLEANER_DOCS_LIMIT);
+    if (replication_rules.length === 0) {
+        dbg.log0("No replication rules to delete.");
+        return;
+    }
+    const rr_ids = db_client.instance().uniq_ids(replication_rules, '_id');
+    dbg.log0('DB_CLEANER: found deleted replication rules:', rr_ids);
+    await replication_store.actual_delete_replication_by_id(rr_ids);
+    dbg.log0(`DB_CLEANER: removed ${rr_ids.length} replication rules from replication-store`);
+}
+
 async function clean_system_store(last_date_to_remove) {
     const total_accounts_count = await system_store.count_total_docs('accounts');
     const total_buckets_count = await system_store.count_total_docs('buckets');
+    const total_vector_buckets_count = await system_store.count_total_docs('vector_buckets');
+    const total_vector_indices_count = await system_store.count_total_docs('vector_indices');
     const total_pools_count = await system_store.count_total_docs('pools');
     if ((total_accounts_count < config.DB_CLEANER_MAX_TOTAL_DOCS) &&
         (total_buckets_count < config.DB_CLEANER_MAX_TOTAL_DOCS) &&
+        (total_vector_buckets_count < config.DB_CLEANER_MAX_TOTAL_DOCS) &&
+        (total_vector_indices_count < config.DB_CLEANER_MAX_TOTAL_DOCS) &&
         (total_pools_count < config.DB_CLEANER_MAX_TOTAL_DOCS)) {
         dbg.log0(`DB_CLEANER: found less than ${config.DB_CLEANER_MAX_TOTAL_DOCS} docs in system-store 
-        ${total_accounts_count} accounts, ${total_buckets_count} buckets, ${total_pools_count} pools - Skipping...`);
+        ${total_accounts_count} accounts, ${total_buckets_count} buckets, ${total_vector_buckets_count} vector bucket, 
+        ${total_vector_indices_count} vector indices, ${total_pools_count} pools - Skipping...`);
         return;
     }
     dbg.log0('DB_CLEANER: checking system_store for documents deleted before', new Date(last_date_to_remove));
-    const [accounts, buckets, pools] = await P.all([
+    const [accounts, buckets, vector_buckets, vector_indices, pools] = await P.all([
         system_store.find_deleted_docs('accounts', last_date_to_remove, config.DB_CLEANER_DOCS_LIMIT),
         system_store.find_deleted_docs('buckets', last_date_to_remove, config.DB_CLEANER_DOCS_LIMIT),
+        system_store.find_deleted_docs('vector_buckets', last_date_to_remove, config.DB_CLEANER_DOCS_LIMIT),
+        system_store.find_deleted_docs('vector_indices', last_date_to_remove, config.DB_CLEANER_DOCS_LIMIT),
         system_store.find_deleted_docs('pools', last_date_to_remove, config.DB_CLEANER_DOCS_LIMIT)
     ]);
     dbg.log2('DB_CLEANER: list accounts:', accounts);
     dbg.log2('DB_CLEANER: list buckets:', buckets);
+    dbg.log2('DB_CLEANER: list vector_buckets:', vector_buckets);
+    dbg.log2('DB_CLEANER: list vector_indices:', vector_indices);
     dbg.log2('DB_CLEANER: list pools:', pools);
-    const filtered_buckets = buckets.filter(async bucket =>
-        !(await MDStore.instance().has_any_objects_for_bucket_including_deleted(bucket)));
-    const filtered_pools = pools.filter(async pool =>
-        !(await nodes_store.has_any_nodes_for_pool(pool)));
-    if (accounts.length || filtered_buckets.length || filtered_pools.length) {
+    const filtered_buckets = (
+        await Promise.all(
+            buckets.map(async bucket => {
+                const hasObjects =
+                    await MDStore.instance().has_any_objects_for_bucket_including_deleted(bucket);
+                return hasObjects ? null : bucket;
+            })
+        )
+    ).filter(Boolean);
+
+    const filtered_pools = (
+        await Promise.all(
+            pools.map(async pool => {
+                const hasNodes = await nodes_store.has_any_nodes_for_pool(pool);
+                return hasNodes ? null : pool;
+            })
+        )
+    ).filter(Boolean);
+
+    if (accounts.length || filtered_buckets.length || filtered_pools.length || vector_buckets.length || vector_indices.length) {
         await system_store.make_changes({
             db_delete: {
                 accounts: accounts,
                 buckets: filtered_buckets,
+                vector_buckets: vector_buckets,
+                vector_indices: vector_indices,
                 pools: filtered_pools
             }
         });
     }
-    dbg.log0(`DB_CLEANER: removed ${accounts.length + filtered_buckets.length + filtered_pools.length} documents from system-store`);
+    dbg.log0(`DB_CLEANER: removed ${accounts.length + filtered_buckets.length + filtered_pools.length + vector_buckets.length + vector_indices.length} documents from system-store`);
 }
 
 // EXPORTS

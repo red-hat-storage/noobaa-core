@@ -4,9 +4,9 @@
 const _ = require('lodash');
 const fs = require('fs');
 const argv = require('minimist')(process.argv);
-const AWS = require('aws-sdk');
+const { S3 } = require('@aws-sdk/client-s3');
 const P = require('../../util/promise');
-const Semaphore = require('../../util/semaphore');
+const semaphore = require('../../util/semaphore');
 const os_utils = require('../../util/os_utils');
 
 const UL_TEST = {
@@ -30,6 +30,16 @@ const UL_TEST = {
     }
 };
 
+const s3bucket = new S3({
+    endpoint: UL_TEST.target,
+    credentials: {
+        accessKeyId: UL_TEST.access_key,
+        secretAccessKey: UL_TEST.secret_key,
+    },
+    forcePathStyle: true,
+    tls: false,
+});
+
 function show_usage() {
     console.log('usage: node test_files_ul.js --ip <S3 IP> --bucket <Bucket Name> --access <ACCESS_KEY> --secret <SECRET>');
     console.log('   example: node node test_files_ul.js --ip 10.0.0.1 --bucket files --access 123 --secret abc');
@@ -50,99 +60,77 @@ function pre_generation() {
         .then(function() {
             return os_utils.exec('rm -rf ' + UL_TEST.base_dir + '/*');
         })
-        .then(function() {
-            let i = 0;
-            return P.pwhile(
-                function() {
-                    return i < dirs;
-                },
-                function() {
+        .then(async function() {
+            try {
+                let i = 0;
+                while (i < dirs) {
                     i += 1;
-                    return os_utils.exec('mkdir -p ' + UL_TEST.base_dir + '/dir' + i);
-                });
+                    await os_utils.exec('mkdir -p ' + UL_TEST.base_dir + '/dir' + i);
+                }
+            } catch (err) {
+                console.error('Error creating directory structure', err, err.stack);
+                throw new Error('Error creating directory structure');
+            }
         })
-        .catch(function(err) {
-            console.error('Failed creating directory structure', err, err.stack);
-            throw new Error('Failed creating directory structure');
-        })
-        .then(function() {
-            console.log('Generating files (this might take some time) ...');
-            let d = 0;
-            return P.pwhile(
-                function() {
-                    return d < dirs;
-                },
-                function() {
+        .then(async function() {
+            try {
+                console.log('Generating files (this might take some time) ...');
+                let d = 0;
+                while (d < dirs) {
                     d += 1;
                     const files = (d === dirs) ? UL_TEST.num_files % UL_TEST.files_per_dir : UL_TEST.files_per_dir;
                     console.log(' generating batch', d, 'of', files, 'files');
                     for (let i = 1; i <= files; ++i) {
                         UL_TEST.files.push(UL_TEST.base_dir + '/dir' + d + '/file_' + i);
                     }
-                    return os_utils.exec('for i in `seq 1 ' + files + '` ; do' +
+                    await os_utils.exec('for i in `seq 1 ' + files + '` ; do' +
                         ' dd if=/dev/urandom of=' + UL_TEST.base_dir + '/dir' + d +
                         '/file_$i  bs=' + UL_TEST.file_size + 'k count=1 ; done');
-                });
-        })
-        .catch(function(err) {
-            console.error('Failed generating files', err, err.stack);
-            throw new Error('Failed generating files');
+                }
+            } catch (err) {
+                console.error('Error generating files', err, err.stack);
+                throw new Error('Error generating files');
+            }
         });
 }
 
 function upload_test() {
-    AWS.config.update({
-        accessKeyId: UL_TEST.access_key,
-        secretAccessKey: UL_TEST.secret_key,
-        Bucket: UL_TEST.bucket_name
-    });
 
-    const upload_semaphore = new Semaphore(UL_TEST.num_threads);
+    const upload_semaphore = new semaphore.Semaphore(UL_TEST.num_threads);
     return P.all(_.map(UL_TEST.files, function(f) {
-        return upload_semaphore.surround(function() {
-            return upload_file(f);
+        return upload_semaphore.surround(async function() {
+            return await upload_file(f);
         });
     }));
 }
 
-function upload_file(test_file) {
+async function upload_file(test_file) {
     let start_ts;
     console.log('Called upload_file with param', test_file);
-    return P.fcall(function() {
-            const s3bucket = new AWS.S3({
-                endpoint: UL_TEST.target,
-                s3ForcePathStyle: true,
-                sslEnabled: false,
-            });
-            const params = {
-                Bucket: UL_TEST.bucket_name,
-                Key: test_file,
-                Body: fs.createReadStream(test_file),
-            };
-            start_ts = Date.now();
-            return P.ninvoke(s3bucket, 'upload', params)
-                .then(function(res) {
-                    console.log('Done uploading', test_file);
-                    //TODO:: Add histogram as well
-                    UL_TEST.measurement.points += 1;
-                    UL_TEST.measurement.time += (Date.now() - start_ts) / 1000;
-
-                    if (UL_TEST.measurement.points === 1000) { //Save mid results per each 1K files
-                        UL_TEST.measurement.mid.push(UL_TEST.measurement.time / 1000);
-                        UL_TEST.measurement.points = 0;
-                        UL_TEST.measurement.time = 0;
-                    }
-                }, function(err) {
-                    console.log('failed to upload file', test_file, 'with error', err, err.stack);
-                });
-        })
-        .then(null, function(err) {
-            console.error('Error in upload_file', err);
-            UL_TEST.total_ul_errors += 1;
-            if (UL_TEST.total_ul_errors > UL_TEST.num_files * 0.1) {
-                throw new Error('Failed uploading ' + UL_TEST.total_ul_errors + ' files');
-            }
-        });
+    try {
+        const params = {
+            Bucket: UL_TEST.bucket_name,
+            Key: test_file,
+            Body: fs.createReadStream(test_file),
+        };
+        start_ts = Date.now();
+        await s3bucket.putObject(params);
+        console.log('Done uploading', test_file);
+        //TODO:: Add histogram as well
+        UL_TEST.measurement.points += 1;
+        UL_TEST.measurement.time += (Date.now() - start_ts) / 1000;
+        if (UL_TEST.measurement.points === 1000) { //Save mid results per each 1K files
+            UL_TEST.measurement.mid.push(UL_TEST.measurement.time / 1000);
+            UL_TEST.measurement.points = 0;
+            UL_TEST.measurement.time = 0;
+        }
+    } catch (err) {
+        console.error('Error in upload_file', err);
+        UL_TEST.total_ul_errors += 1;
+        if (UL_TEST.total_ul_errors > UL_TEST.num_files * 0.1) {
+            throw new Error('Failed uploading ' + UL_TEST.total_ul_errors + ' files');
+        }
+    }
 }
 
 function print_summary() {

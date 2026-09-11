@@ -5,9 +5,16 @@ const dbg = require('../../../util/debug_module')(__filename);
 const S3Error = require('../s3_errors').S3Error;
 const s3_utils = require('../s3_utils');
 const http_utils = require('../../../util/http_utils');
+const rdma_utils = require('../../../util/rdma_utils');
+const { throw_if_restore_incomplete } = require('../../../util/deep_archive_utils');
+const config = require('../../../../config');
+
+/* eslint-disable max-statements */
 
 /**
  * http://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectGET.html
+ * @param {nb.S3Request} req
+ * @param {nb.S3Response} res
  */
 async function get_object(req, res) {
 
@@ -16,6 +23,7 @@ async function get_object(req, res) {
     const noobaa_trigger_agent = agent_header && agent_header.includes('exec-env/NOOBAA_FUNCTION');
     const encryption = s3_utils.parse_encryption(req);
     const version_id = s3_utils.parse_version_id(req.query.versionId);
+    const rdma_info = rdma_utils.parse_rdma_info(req);
     let part_number;
     // If set, part_number should be positive integer from 1 to 10000
     if (req.query.partNumber) {
@@ -36,19 +44,17 @@ async function get_object(req, res) {
     if (part_number) {
         md_params.part_number = part_number;
     }
+    if (!part_number) {
+        md_params.should_prefetch_mappings = true;
+    }
 
     const object_md = await req.object_sdk.read_object_md(md_params);
 
     s3_utils.set_response_object_md(res, object_md);
     s3_utils.set_encryption_response_headers(req, res, object_md.encryption);
-    if (object_md.storage_class === s3_utils.STORAGE_CLASS_GLACIER) {
-        if (object_md.restore_status?.ongoing || !object_md.restore_status?.expiry_time) {
-            // Don't try to read the object if it's not restored yet
-            dbg.warn('Object is not restored yet', req.path, object_md.restore_status);
-            throw new S3Error(S3Error.InvalidObjectState);
-        }
-    }
-
+    throw_if_restore_incomplete(req.params.bucket, object_md);
+    http_utils.set_response_headers_from_request(req, res);
+    if (!version_id) await http_utils.set_expiration_header(req, res, object_md); // setting expiration header for bucket lifecycle
     const obj_size = object_md.size;
     const params = {
         object_md,
@@ -60,6 +66,7 @@ async function get_object(req, res) {
         noobaa_trigger_agent,
         md_conditions,
         encryption,
+        rdma_info,
     };
 
     if (md_params.get_from_cache) {
@@ -67,6 +74,9 @@ async function get_object(req, res) {
     }
     if (part_number) {
         params.part_number = part_number;
+    }
+    if (req.headers[config.NSFS_GLACIER_FORCE_EVICT_HTTP_HEADER] === 'true') {
+        params.glacier_force_evict = true;
     }
     try {
         const ranges = http_utils.normalize_http_ranges(
@@ -113,6 +123,14 @@ async function get_object(req, res) {
         }
     }
 
+    dbg.log2('GET read start', {
+        request_id: req.request_id,
+        bucket: req.params.bucket,
+        key: req.params.key,
+        start: params.start,
+        end: params.end,
+        content_length: req.headers['content-length'],
+    });
     const read_stream = await req.object_sdk.read_object_stream(params, res);
     if (read_stream) {
         // if read_stream supports closing, then we handle abort cases such as http disconnection
@@ -121,7 +139,12 @@ async function get_object(req, res) {
             read_stream.destroy(new Error('abort read stream'));
         });
         read_stream.on('error', err => {
-            dbg.log0('read stream error:', err, req.path);
+            dbg.log0('GET read stream error', {
+                request_id: req.request_id,
+                code: err.code,
+                path: req.path,
+                duration_ms: req.start_time ? Date.now() - req.start_time : undefined,
+            }, err.message);
             res.destroy(err);
         });
         read_stream.pipe(res);

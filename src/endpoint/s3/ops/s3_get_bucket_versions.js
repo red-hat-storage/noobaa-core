@@ -21,6 +21,9 @@ async function get_bucket_versions(req) {
         dbg.warn('A version-id marker cannot be specified without a key marker');
         throw new S3Error(S3Error.InvalidArgument);
     }
+
+    const restore_status_requested = s3_utils.parse_optional_object_attributes_header(req.headers);
+
     const version_id_marker = s3_utils.parse_version_id(req.query['version-id-marker'], S3Error.InvalidArgumentEmptyVersionIdMarker);
     const reply = await req.object_sdk.list_object_versions({
         bucket: req.params.bucket,
@@ -37,11 +40,11 @@ async function get_bucket_versions(req) {
     return {
         ListVersionsResult: [{
             Name: req.params.bucket,
-            Prefix: field_encoder(req.query.prefix),
+            Prefix: field_encoder(req.query.prefix) || '',
             Delimiter: field_encoder(req.query.delimiter),
             MaxKeys: max_keys_received,
-            KeyMarker: field_encoder(req.query['key-marker']),
-            VersionIdMarker: version_id_marker,
+            KeyMarker: field_encoder(req.query['key-marker']) || '',
+            VersionIdMarker: version_id_marker || '',
             IsTruncated: reply.is_truncated,
             NextKeyMarker: field_encoder(reply.next_marker),
             NextVersionIdMarker: reply.next_version_id_marker,
@@ -65,6 +68,7 @@ async function get_bucket_versions(req) {
                 Size: obj.size,
                 Owner: s3_utils.get_object_owner(obj) || default_object_owner,
                 StorageClass: s3_utils.parse_storage_class(obj.storage_class),
+                RestoreStatus: s3_utils.get_object_restore_status(obj, restore_status_requested),
             }
         }))),
         _.map(reply.common_prefixes, prefix => ({

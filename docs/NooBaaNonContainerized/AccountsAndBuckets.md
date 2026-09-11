@@ -29,9 +29,18 @@ See all available account properties - [NC Account Schema](../../src/server/syst
 #### Important properties  
   - `encrypted_secret_key` - Account's secrets will be kept encrypted in the account's configuration file.  
 
-  - `uid/gid/user` - An account's access key is mapped to a file system uid/gid (or user). Before performing any file system operation, NooBaa switches to the account's UID/GID, ensuring that accounts access to buckets and objects is enforced by the file system.
+  - `uid/gid/user` - An account's access key is mapped to a file system uid/gid (or user). Before performing any file system operation, NooBaa switches to the account's UID/GID, ensuring that accounts access to buckets and objects is enforced by the file system.  
+  
+  - `supplemental_groups` - In addition to the account main GID, an account can have supplementary group IDs that are used to determine permissions for accessing files. These GIDs are validated against a files group (GID) permissions.
+  By default, supplemental groups are based on user's groups in the filesystem. In case this value was set in the CLI it will override the user's groups in the filesystem. In case this value was not set in account configuration (in the CLI) and failed to fetch the user's group in the filesystem (either because no record exists or because the operation failed), supplemental groups will be unset. You can disable fetching groups from users record in the filesystem by setting NSFS_ENABLE_DYNAMIC_SUPPLEMENTAL_GROUPS to be `false` in config.json. In this case the default would be to unset supplemental groups entirely.
+  Note: Depending on the file system there may be 'sticky bit' enabled somewhere on the files path. 'sticky bit' is a user ownership access right flag that prevents other users than the file owner and root from deleting or moving files.
+  In that case some actions will still get access denied regardless of group permissions enabled. sticky bit is denoted by `t` at the end of the permissions list (example: `drwxrwxrwt`). see https://en.wikipedia.org/wiki/Sticky_bit
 
   - `new_buckets_path` - When an account creates a bucket using the S3 protocol, NooBaa will create the underlying file system directory. This directory will be created under new_buckets_path. Note that the account must have read and write access to its `new_buckets_path`.  Must be an absolute path.  
+
+  - `custom_bucket_path_allowed_list` - When an account creates a bucket using the S3 protocol, He can override the default bucket path location (under new_buckets_path) using `x-noobaa-custom-bucket-path` HTTP header. This directory will be created only if this path will be under one of the provided allowed list paths in custom_bucket_path_allowed_list. Must be a list of absolute paths (divided by colons). 
+
+  - `allow_bypass_governance` - Give permission to the user to bypass governance-mode retention object lock, allowing them to set the `x-amz-bypass-governance-retention` header for deleting the object and modifying retention lock. See https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html#object-lock-retention-modes 
 
 ### Account configuration  
 Currently, an account can be configured via NooBaa CLI, see - [NooBaa CLI](./NooBaaCLI.md).  

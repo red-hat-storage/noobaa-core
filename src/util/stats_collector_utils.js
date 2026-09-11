@@ -16,18 +16,37 @@ const op_names = [
     `complete_object_upload`,
 ];
 
+// Predefined iam_op_names
+const iam_op_names = [
+    `create_user`,
+    `get_user`,
+    `update_user`,
+    `delete_user`,
+    `list_users`,
+    `create_access_key`,
+    `get_access_key_last_used`,
+    `update_access_key`,
+    `delete_access_key`,
+    `list_access_keys`,
+];
+
 function update_nsfs_stats(op_name, stats, new_data) {
     //In the event of all of the same ops are failing (count = error_count) we will not masseur the op times
     // As this is intended as a timing masseur and not a counter.
     if (stats[op_name]) {
         const count = stats[op_name].count + new_data.count;
         const error_count = stats[op_name].error_count + new_data.error_count;
-        const old_sum_time = stats[op_name].avg_time_milisec * stats[op_name].count;
+        const prev_success_count = stats[op_name].count - stats[op_name].error_count;
+        const old_sum_time = stats[op_name].avg_time_milisec * prev_success_count;
         //Min time and Max time are not being counted in the endpoint stat collector if it was error
-        const min_time_milisec = Math.min(stats[op_name].min_time_milisec, new_data.min_time);
-        const max_time_milisec = Math.max(stats[op_name].max_time_milisec, new_data.max_time);
+        const min_time_milisec = (new_data.count - new_data.error_count) > 0 ?
+                                    Math.min(stats[op_name].min_time_milisec, new_data.min_time) :
+                                    stats[op_name].min_time_milisec;
+        const max_time_milisec = (new_data.count - new_data.error_count) > 0 ?
+                                    Math.max(stats[op_name].max_time_milisec, new_data.max_time) :
+                                    stats[op_name].max_time_milisec;
         // At this point, as we populate only when there is at least one successful op, there must be old_sum_time
-        const avg_time_milisec = Math.floor((old_sum_time + new_data.sum_time) / (count - error_count));
+        const avg_time_milisec = Math.floor((old_sum_time + (new_data.sum_time ?? 0)) / (count - error_count));
         stats[op_name] = {
             min_time_milisec,
             max_time_milisec,
@@ -41,7 +60,7 @@ function update_nsfs_stats(op_name, stats, new_data) {
         stats[op_name] = {
             min_time_milisec: new_data.min_time,
             max_time_milisec: new_data.max_time,
-            avg_time_milisec: Math.floor(new_data.sum_time / new_data.count),
+            avg_time_milisec: Math.floor(new_data.sum_time / (new_data.count - new_data.error_count)),
             count: new_data.count,
             error_count: new_data.error_count,
         };
@@ -49,4 +68,5 @@ function update_nsfs_stats(op_name, stats, new_data) {
 }
 
 exports.op_names = op_names;
+exports.iam_op_names = iam_op_names;
 exports.update_nsfs_stats = update_nsfs_stats;

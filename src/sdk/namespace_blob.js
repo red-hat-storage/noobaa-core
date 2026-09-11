@@ -17,6 +17,7 @@ const invalid_azure_md_regex = /[^a-zA-Z0-9_]/g;
 const invalid_azure_tag_regex = /[^a-zA-Z0-9 +-.:=_/]/g;
 const XATTR_RENAME_PREFIX = 'rename_';
 const XATTR_RENAME_KEY_PREFIX = 'rename_key_';
+const cloud_utils = require('../util/cloud_utils');
 
 /**
  * @implements {nb.Namespace}
@@ -31,6 +32,10 @@ class NamespaceBlob {
      *      account_name: string,
      *      account_key: string,
      *      access_mode: string,
+     *      endpoint: string,
+     *      endpoint_type: string,
+     *      azure_client_id: string,
+     *      azure_tenant_id: string,
      *      stats: import('./endpoint_stats_collector').EndpointStatsCollector,
      * }} params
      */
@@ -41,14 +46,24 @@ class NamespaceBlob {
         account_name,
         account_key,
         access_mode,
+        endpoint,
+        endpoint_type,
+        azure_client_id,
+        azure_tenant_id,
         stats,
     }) {
         this.namespace_resource_id = namespace_resource_id;
         this.connection_string = connection_string;
         this.container = container;
-        this.blob = azure_storage.BlobServiceClient.fromConnectionString(connection_string);
         this.account_name = account_name;
         this.account_key = account_key;
+        this.blob = cloud_utils.create_azure_blob_client({
+            endpoint: endpoint,
+            connection_string: this.connection_string,
+            access_key: this.account_name,
+            azure_client_id: azure_client_id,
+            azure_tenant_id: azure_tenant_id,
+        });
         this.container_client = azure_storage.get_container_client(this.blob, this.container);
         this.access_mode = access_mode;
         this.stats = stats;
@@ -232,9 +247,14 @@ class NamespaceBlob {
                 dbg.log0('NamespaceBlob.read_object_stream:',
                     this.container,
                     inspect(_.omit(params, 'object_md.ns')),
-                    'callback res', inspect(res)
-                );
+                    'callback res');
                 if (!res.readableStreamBody) throw new Error('NamespaceBlob.read_object_stream: download response is invalid');
+                // Add error handler to the Azure stream to catch AbortError
+                res.readableStreamBody.on('error', stream_err => {
+                    dbg.error('NamespaceBlob.read_object_stream: Azure stream error:', stream_err.name, stream_err.message);
+                    // Destroy count_stream with error - properly cleans up and propagates error
+                    count_stream.destroy(stream_err);
+                });
                 return resolve(res.readableStreamBody.pipe(count_stream));
             }).catch(err => {
                     this._translate_error_code(err);

@@ -1,14 +1,13 @@
 /* Copyright (C) 2016 NooBaa */
 'use strict';
 
-const fs = require('fs');
-const ncp = require('ncp').ncp;
+const fs = require('fs'); // For createWriteStream
+const fsp = require('fs/promises');
 const path = require('path');
-const { rimraf } = require('rimraf');
 const crypto = require('crypto');
 
 const P = require('./promise');
-const Semaphore = require('./semaphore');
+const semaphore = require('./semaphore');
 const os_utils = require('../util/os_utils');
 
 const PRIVATE_DIR_PERMISSIONS = 0o700; // octal 700
@@ -19,7 +18,7 @@ const PRIVATE_DIR_PERMISSIONS = 0o700; // octal 700
  *
  */
 function file_must_not_exist(file_path) {
-    return fs.promises.stat(file_path)
+    return fsp.stat(file_path)
         .then(function() {
             throw new Error(`${file_path} exists`);
         }, function(err) {
@@ -32,14 +31,14 @@ function file_must_not_exist(file_path) {
  * file_must_exist
  */
 async function file_must_exist(file_path) {
-    await fs.promises.stat(file_path);
+    await fsp.stat(file_path);
 }
 
 async function file_exists(file_path) {
     try {
         await file_must_exist(file_path);
         return true;
-    } catch (err) {
+    } catch {
         return false;
     }
 }
@@ -48,7 +47,7 @@ async function file_not_exists(file_path) {
     try {
         await file_must_not_exist(file_path);
         return true;
-    } catch (err) {
+    } catch {
         return false;
     }
 }
@@ -62,9 +61,9 @@ async function read_dir_recursive(options) {
     const root = options.root || '.';
     const depth = options.depth || Infinity;
     const level = options.level || 0;
-    const dir_sem = options.dir_semaphore || new Semaphore(32);
+    const dir_sem = options.dir_semaphore || new semaphore.Semaphore(32);
     options.dir_semaphore = dir_sem;
-    const stat_sem = options.stat_semaphore || new Semaphore(128);
+    const stat_sem = options.stat_semaphore || new semaphore.Semaphore(128);
     options.stat_semaphore = stat_sem;
     const sub_dirs = [];
 
@@ -78,12 +77,12 @@ async function read_dir_recursive(options) {
     await dir_sem.surround(async () => {
         if (!level) console.log(`read_dir_recursive: readdir ${root}`);
 
-        const entries = await fs.promises.readdir(root);
+        const entries = await fsp.readdir(root);
 
         await Promise.all(entries.map(async entry => {
             const entry_path = path.join(root, entry);
             try {
-                const stat = await stat_sem.surround(() => fs.promises.stat(entry_path));
+                const stat = await stat_sem.surround(() => fsp.stat(entry_path));
                 if (on_entry) {
                     const res = await on_entry({ path: entry_path, stat });
                     // when on_entry returns explicit false, we stop recursing.
@@ -135,25 +134,46 @@ async function disk_usage(root) {
     return { size, count };
 }
 
+// try to read a file synchronously. If the file does not exist, return undefined
+// if the file exists but is not readable, throw an error
+// if the file exists and is readable, return the content
+function try_read_file_sync(file_name) {
+    if (!file_name) return;
+    try {
+        return fs.readFileSync(file_name, 'utf8');
+    } catch (err) {
+        if (is_not_exist_err_code(err)) {
+            // file does not exist
+            return;
+        }
+        throw err;
+    }
+}
+
+// returns true if the error is ENOENT or ENOTDIR
+// ENOTDIR is relevant for cases where a directory in the middle of the path is a file and not a directory
+function is_not_exist_err_code(err) {
+    return err && (err.code === 'ENOENT' || err.code === 'ENOTDIR');
+}
 
 // returns the first line in the file that contains the substring
-function find_line_in_file(file_name, line_sub_string) {
-    return fs.promises.readFile(file_name, 'utf8')
-        .then(data => data.split('\n')
-            .find(line => line.indexOf(line_sub_string) > -1));
+async function find_line_in_file(file_name, line_sub_string) {
+    const data = await fsp.readFile(file_name, 'utf8');
+    return data.split('\n')
+        .find(line => line.includes(line_sub_string));
 }
 
 // returns all lines in the file that contains the substring
-function find_all_lines_in_file(file_name, line_sub_string) {
-    return fs.promises.readFile(file_name, 'utf8')
-        .then(data => data.split('\n')
-            .filter(function(line) {
-                return line.indexOf(line_sub_string) > -1;
-            }));
+async function find_all_lines_in_file(file_name, line_sub_string) {
+    const data = await fsp.readFile(file_name, 'utf8');
+    return data.split('\n')
+        .filter(function(line) {
+            return line.includes(line_sub_string);
+        });
 }
 
 function get_last_line_in_file(file_name) {
-    return fs.promises.readFile(file_name, 'utf8')
+    return fsp.readFile(file_name, 'utf8')
         .then(data => {
             const lines = data.split('\n');
             let idx = lines.length - 1;
@@ -164,14 +184,13 @@ function get_last_line_in_file(file_name) {
         });
 }
 
-function create_path(dir, mode) {
-    return fs.promises.mkdir(dir, { mode, recursive: true });
+async function create_path(dir, mode) {
+    return fsp.mkdir(dir, { mode, recursive: true });
 }
 
-function create_fresh_path(dir, mode) {
-    return P.resolve()
-        .then(() => folder_delete(dir))
-        .then(() => create_path(dir, mode));
+async function create_fresh_path(dir, mode) {
+    await folder_delete(dir);
+    await create_path(dir, mode);
 }
 
 function file_copy(src, dst) {
@@ -187,43 +206,88 @@ function file_copy(src, dst) {
     return os_utils.exec(cmd);
 }
 
-function folder_delete(dir) {
-    return rimraf(dir);
+
+/**
+ * folder_delete deletes a folder
+ * @param {string} dir - The directory path to delete
+ * @returns {Promise<void>}
+ */
+async function folder_delete(dir) {
+    return fsp.rm(dir, { recursive: true, force: true });
+}
+
+
+/**
+ * Deletes a folder, skipping if it does not exist.
+ * @param {string} dir - The directory path to delete.
+ * @returns {Promise<void>}
+ */
+async function folder_delete_skip_enoent(dir) {
+    if (!dir) return;
+    try {
+        return folder_delete(dir);
+    } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+    }
 }
 
 async function file_delete(file_name) {
     try {
-        await fs.promises.unlink(file_name);
+        await fsp.unlink(file_name);
     } catch (err) {
         ignore_enoent(err);
     }
 }
 
-function full_dir_copy(src, dst, filter_regex) {
-    return P.fromCallback(callback => {
-        ncp.limit = 10;
-        const ncp_options = {};
-        if (filter_regex) {
-            //this regexp will filter out files that matches, except path.
-            const ncp_filter_regex = new RegExp(filter_regex);
-            const ncp_filter_function = input => {
-                if (input.indexOf('/') > 0) {
-                    return false;
-                } else if (ncp_filter_regex.test(input)) {
-                    return false;
-                } else {
-                    return true;
-                }
-            };
-            ncp_options.filter = ncp_filter_function;
+/**
+ * Recursively copies files and directories from a source path to a destination path,
+ * while optionally filtering out files that match a given regular expression.
+ *
+ * @async
+ * @function _filtered_file_copy
+ * @param {string} src - The source directory path.
+ * @param {string} dst - The destination directory path.
+ * @param {RegExp} [filter_regex] - An optional regular expression to filter out files by name.
+ *                                   Files matching this regex will be skipped.
+ * @returns {Promise<void>} Resolves when the copy operation is complete.
+ */
+async function _filtered_file_copy(src, dst, filter_regex) {
+    await fsp.mkdir(dst, { recursive: true });
+    const files = await fsp.readdir(src, { withFileTypes: true });
+
+    for (const file of files) {
+        const src_path = path.join(src, file.name);
+        const dst_path = path.join(dst, file.name);
+
+        if (filter_regex && filter_regex.test(file.name)) {
+            continue;
         }
-        if (!src || !dst) {
-            throw new Error('Both src and dst must be given');
+
+        if (file.isDirectory()) {
+            await _filtered_file_copy(src_path, dst_path);
+        } else if (file.isFile()) {
+            await fsp.copyFile(src_path, dst_path);
         }
-        ncp(src, dst, ncp_options, callback);
-    }).then(() => {
-        // do nothing. 
-    });
+    }
+}
+
+/**
+ * Copies an entire directory from the source path to the destination path,
+ * optionally filtering files based on a regular expression.
+ *
+ * @param {string} src - The source directory path.
+ * @param {string} dst - The destination directory path.
+ * @param {RegExp | string | undefined} [filter_regex] - An optional regular expression or string to filter files.
+ * @returns {Promise<void>} Resolves when the copy operation is complete.
+ */
+async function full_dir_copy(src, dst, filter_regex) {
+
+    if (!src || !dst) {
+        throw new Error('Both src and dst must be given');
+    }
+
+    const cp_filter_regex = filter_regex ? new RegExp(filter_regex) : null;
+    await _filtered_file_copy(src, dst, cp_filter_regex);
 }
 
 function tar_pack(tar_file_name, source, ignore_file_changes) {
@@ -262,14 +326,14 @@ function replace_file(file_path, data) {
     const tmp_name = `${file_path}.${unique_suffix}`;
     const lock_key = path.resolve(file_path);
     if (!process_file_locks.has(lock_key)) {
-        process_file_locks.set(lock_key, new Semaphore(1));
+        process_file_locks.set(lock_key, new semaphore.Semaphore(1));
     }
     const lock = process_file_locks.get(lock_key);
     return lock.surround(() =>
             P.resolve()
-            .then(() => fs.promises.writeFile(tmp_name, data))
-            .then(() => fs.promises.rename(tmp_name, file_path))
-            .catch(err => fs.promises.unlink(tmp_name)
+            .then(() => fsp.writeFile(tmp_name, data))
+            .then(() => fsp.rename(tmp_name, file_path))
+            .catch(err => fsp.unlink(tmp_name)
                 .then(() => {
                     throw err;
                 })
@@ -304,6 +368,7 @@ exports.full_dir_copy = full_dir_copy;
 exports.file_copy = file_copy;
 exports.file_delete = file_delete;
 exports.folder_delete = folder_delete;
+exports.folder_delete_skip_enoent = folder_delete_skip_enoent;
 exports.tar_pack = tar_pack;
 exports.write_file_from_stream = write_file_from_stream;
 exports.replace_file = replace_file;
@@ -312,3 +377,5 @@ exports.ignore_enoent = ignore_enoent;
 exports.PRIVATE_DIR_PERMISSIONS = PRIVATE_DIR_PERMISSIONS;
 exports.file_exists = file_exists;
 exports.file_not_exists = file_not_exists;
+exports.try_read_file_sync = try_read_file_sync;
+exports.is_not_exist_err_code = is_not_exist_err_code;
