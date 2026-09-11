@@ -1,0 +1,55 @@
+name: Run PR Tests
+on: [pull_request, workflow_dispatch]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  actions: read # download-artifact
+  contents: read # required for actions/checkout
+jobs:
+  run-sanity-tests:
+    needs: build-noobaa-image
+    uses: ./.github/workflows/sanity.yaml
+
+  run-sanity-ssl-tests:
+    needs: build-noobaa-image
+    uses: ./.github/workflows/sanity-ssl.yaml
+
+  run-unit-tests-postgres:
+    needs: build-noobaa-image
+    uses: ./.github/workflows/postgres-unit-tests.yaml
+
+  run-nc-unit-tests:
+    needs: build-noobaa-image
+    uses: ./.github/workflows/nc_unit.yml
+
+  ceph-s3-tests:
+    needs: build-noobaa-image
+    uses: ./.github/workflows/ceph-s3-tests.yaml
+
+  ceph-nsfs-s3-tests:
+    needs: build-noobaa-image
+    uses: ./.github/workflows/ceph-nsfs-s3-tests.yaml
+
+  warp-tests:
+    needs: build-noobaa-image
+    uses: ./.github/workflows/warp-tests.yaml
+
+  warp-nc-tests:
+    needs: build-noobaa-image
+    uses: ./.github/workflows/warp-nc-tests.yaml
+
+  mint-tests:
+    needs: build-noobaa-image
+    uses: ./.github/workflows/mint-tests.yaml
+
+  mint-nc-tests:
+    needs: build-noobaa-image
+    uses: ./.github/workflows/mint-nc-tests.yaml
+
+  build-noobaa-image:
+    name: Build Noobaa Image
+    uses: ./.github/workflows/build-noobaa-image-reusable.yaml
+    with:
+      make_target: tester
+      upload_artifacts: true

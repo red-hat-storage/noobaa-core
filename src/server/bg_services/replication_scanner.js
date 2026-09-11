@@ -7,7 +7,7 @@ const dbg = require('../../util/debug_module')(__filename);
 const system_utils = require('../utils/system_utils');
 const config = require('../../../config');
 const P = require('../../util/promise');
-const Semaphore = require('../../util/semaphore');
+const semaphore = require('../../util/semaphore');
 const replication_store = require('../system_services/replication_store').instance();
 const cloud_utils = require('../../util/cloud_utils');
 const replication_utils = require('../utils/replication_utils');
@@ -24,7 +24,7 @@ class ReplicationScanner {
     constructor({ name, client }) {
         this.name = name;
         this.client = client;
-        this.scanner_semaphore = new Semaphore(config.REPLICATION_SEMAPHORE_CAP, {
+        this.scanner_semaphore = new semaphore.Semaphore(config.REPLICATION_SEMAPHORE_CAP, {
             timeout: config.REPLICATION_SEMAPHORE_TIMEOUT,
             timeout_error_code: 'REPLICATION_ITEM_TIMEOUT',
             verbose: true
@@ -35,15 +35,18 @@ class ReplicationScanner {
     async run_batch() {
         if (!this._can_run()) return;
         dbg.log0('replication_scanner: starting scanning bucket replications');
+        let worked_last_batch = false;
         try {
             if (!this.noobaa_connection) {
                 this.noobaa_connection = cloud_utils.set_noobaa_s3_connection(system_store.data.systems[0]);
             }
-            await this.scan();
+            worked_last_batch = await this.scan();
         } catch (err) {
             dbg.error('replication_scanner:', err, err.stack);
+            // Keep scanner responsive after partial progress or transient failures.
+            return config.BUCKET_REPLICATOR_BUSY_DELAY;
         }
-        return config.BUCKET_REPLICATOR_DELAY;
+        return worked_last_batch ? config.BUCKET_REPLICATOR_BUSY_DELAY : config.BUCKET_REPLICATOR_DELAY;
     }
 
     _can_run() {
@@ -60,8 +63,11 @@ class ReplicationScanner {
 
     async scan() {
         if (!this.noobaa_connection) throw new Error('noobaa endpoint connection is not started yet...');
+        await replication_utils.reconcile_replication_target_status();
         // find rule for each replication policy that was not updated for the longest period
         const least_recently_replicated_rules = await replication_store.find_rules_updated_longest_time_ago();
+
+        let worked_last_batch = false;
 
         await P.all(_.map(least_recently_replicated_rules, async replication_id_and_rule => {
             const { replication_id, rule } = replication_id_and_rule;
@@ -70,6 +76,23 @@ class ReplicationScanner {
             const { src_bucket, dst_bucket } = replication_utils.find_src_and_dst_buckets(rule.destination_bucket, replication_id);
             if (!src_bucket || !dst_bucket) {
                 dbg.error('replication_scanner: can not find src_bucket or dst_bucket object', src_bucket, dst_bucket);
+                if (!src_bucket) {
+                    replication_utils.clear_replication_target_status_for_orphan_policy(replication_id);
+                    return;
+                }
+                if (!dst_bucket) {
+                    const dst_bucket_name = await replication_utils.resolve_destination_bucket_name(rule.destination_bucket);
+                    replication_utils.update_replication_target_status(replication_id, src_bucket.name, dst_bucket_name, false);
+                    replication_utils.report_failed_replication_cycle(src_bucket.name, replication_id,
+                        rule.rule_id, _.get(src_bucket, 'storage_stats.objects_count', 0));
+                    // advance last_cycle_end for rule rotation; keep cont tokens so replication resumes where it left off
+                    await replication_store.update_replication_status_by_id(replication_id, rule.rule_id, {
+                        ...status,
+                        last_cycle_end: Date.now(),
+                        src_cont_token: (rule.rule_status && rule.rule_status.src_cont_token) || '',
+                        dst_cont_token: (rule.rule_status && rule.rule_status.dst_cont_token) || '',
+                    });
+                }
                 return;
             }
             const prefix = (rule.filter && rule.filter.prefix) || '';
@@ -83,21 +106,40 @@ class ReplicationScanner {
                 second_bucket: dst_bucket.name,
                 version: sync_versions,
                 connection: this.noobaa_connection,
-                for_replication: config.BUCKET_DIFF_FOR_REPLICATION
+                for_replication: config.BUCKET_DIFF_FOR_REPLICATION,
+                skip_user_metadata_check: config.BUCKET_REPLICATION_SKIP_METADATA_CHECK_NON_VERSIONED,
             });
             dbg.log1(`scan:: cur_src_cont_token: ${cur_src_cont_token},cur_dst_cont_token: ${cur_dst_cont_token}`);
-            const {
-                keys_diff_map,
-                first_bucket_cont_token: src_cont_token,
-                second_bucket_cont_token: dst_cont_token
-            } = await bucketDiff.get_buckets_diff({
-                prefix,
-                max_keys: Number(process.env.REPLICATION_MAX_KEYS) || 1000,
-                current_first_bucket_cont_token: cur_src_cont_token,
-                current_second_bucket_cont_token: cur_dst_cont_token,
-            });
+
+            let keys_diff_map;
+            let src_cont_token;
+            let dst_cont_token;
+
+            try {
+                const buckets_diff_result = await bucketDiff.get_buckets_diff({
+                    prefix,
+                    max_keys: Number(process.env.REPLICATION_MAX_KEYS) || 1000,
+                    current_first_bucket_cont_token: cur_src_cont_token,
+                    current_second_bucket_cont_token: cur_dst_cont_token,
+                });
+
+                keys_diff_map = buckets_diff_result.keys_diff_map;
+                src_cont_token = buckets_diff_result.first_bucket_cont_token;
+                dst_cont_token = buckets_diff_result.second_bucket_cont_token;
+            } catch (err) {
+                dbg.error('replication_scanner: failed to get buckets diff, target may be unreachable:',
+                    src_bucket.name, dst_bucket.name, err);
+                replication_utils.update_replication_target_status(replication_id, src_bucket.name, dst_bucket.name, false);
+                replication_utils.report_failed_replication_cycle(src_bucket.name, replication_id,
+                    rule.rule_id, _.get(src_bucket, 'storage_stats.objects_count', 0));
+                throw err;
+            }
 
             dbg.log1('scan:: keys_sizes_map_to_copy:', keys_diff_map, 'src_cont_token:', src_cont_token, 'dst_cont_token', dst_cont_token);
+
+            // Mark that this cycle has work: objects to copy or more pages to scan.
+            if (Object.keys(keys_diff_map).length || src_cont_token) worked_last_batch = true;
+
             let copy_res = {
                 num_of_objects: 0,
                 size_of_objects: 0
@@ -111,8 +153,12 @@ class ReplicationScanner {
                     src_bucket.name,
                     dst_bucket.name,
                     keys_diff_map,
+                    replication_id,
                 );
                 dbg.log0('replication_scanner: scan copy_res:', copy_res);
+            } else {
+                replication_utils.update_replication_target_status(
+                    replication_id, src_bucket.name, dst_bucket.name, true);
             }
 
             await replication_store.update_replication_status_by_id(replication_id,
@@ -126,11 +172,14 @@ class ReplicationScanner {
 
             // update the prometheus metrics only if we have diff
             if (Object.keys(keys_diff_map).length) {
-                const replication_status = replication_utils.get_rule_status(rule.rule_id, src_cont_token, keys_diff_map, copy_res);
+                const {rule_status, bucket_status} = replication_utils.get_rule_and_bucket_status(
+                    rule.rule_id, src_cont_token, keys_diff_map, copy_res);
 
-                replication_utils.update_replication_prom_report(src_bucket.name, replication_id, replication_status);
+                replication_utils.update_replication_prom_report(src_bucket.name, replication_id, rule_status, bucket_status);
             }
         }));
+
+        return worked_last_batch;
     }
 }
 

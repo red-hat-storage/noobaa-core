@@ -22,8 +22,8 @@ const auth_server = require('../common_services/auth_server');
 const HistoryDataStore = require('../analytic_services/history_data_store').HistoryDataStore;
 const IoStatsStore = require('../analytic_services/io_stats_store').IoStatsStore;
 const pool_ctrls = require('./pool_controllers');
-const func_store = require('../func_services/func_store');
 const { KubeStore } = require('../kube-store.js');
+const noobaa_s3_client = require('../../sdk/noobaa_s3_client/noobaa_s3_client');
 
 
 const POOL_STORAGE_DEFAULTS = Object.freeze({
@@ -92,6 +92,10 @@ function set_pool_controller_factory(pool_controller_factory) {
 // and only allows deletion in case that the owner is also the requester of the deletion
 function check_deletion_ownership(req, resource_owner_id) {
     if (config.RESTRICT_RESOURCE_DELETION) {
+        if (!resource_owner_id) {
+            dbg.error('check_deletion_ownership: pool has no owner');
+            throw new RpcError('INTERNAL_ERROR', 'The pool has no owner, and thus cannot be deleted');
+        }
         const requester_is_sys_owner = String(req.account._id) === String(req.system.owner._id);
         if (!requester_is_sys_owner && String(resource_owner_id) !== String(req.account._id)) {
             dbg.error('check_deletion_ownership: requester (', req.account._id, ') is not the owner (', resource_owner_id, ') of the resource');
@@ -116,16 +120,17 @@ function new_pool_defaults(name, system_id, resource_type, pool_node_type, owner
     };
 }
 
-function new_namespace_resource_defaults(name, system_id, account_id, connection, nsfs_config, access_mode) {
-    return {
+function new_namespace_resource_defaults(name, system_id, account_id, connection, nsfs_config, access_mode, archive) {
+    return _.omitBy({
         _id: system_store.new_system_store_id(),
         system: system_id,
         account: account_id,
         name,
         connection,
         nsfs_config,
-        access_mode
-    };
+        access_mode,
+        archive,
+    }, _.isUndefined);
 }
 
 async function create_hosts_pool(req) {
@@ -266,13 +271,63 @@ async function get_agent_install_conf(system, pool, account, routing_hint) {
     return Buffer.from(install_string).toString('base64');
 }
 
+/**
+ * Validates that the target bucket on a cloud connection supports returns x-noobaa-available-storage-classes
+ * header and has GLACIER storage class, which is required for a deep-archive namespace resource.
+ * @param {object} connection - unencrypted cloud connection from the account credentials cache
+ * @param {string} target_bucket - S3 bucket name to validate
+ */
+async function _check_archive_target_bucket(connection, target_bucket) {
+    const s3_params = {
+        endpoint: connection.endpoint,
+        credentials: {
+            accessKeyId: connection.access_key.unwrap(),
+            secretAccessKey: connection.secret_key.unwrap(),
+        },
+        signatureVersion: cloud_utils.get_s3_endpoint_signature_ver(connection.endpoint, connection.auth_method),
+        requestHandler: noobaa_s3_client.get_requestHandler_with_suitable_agent(connection.endpoint),
+        region: connection.region || config.DEFAULT_REGION,
+        forcePathStyle: true,
+    };
+    const s3 = noobaa_s3_client.get_s3_client_v3_params(s3_params);
+    const get_headers = noobaa_s3_client.add_response_header_capture(s3);
+    const timeout_err = Object.assign(new Error('Operation timeout'), { code: 'OperationTimeout' });
+    try {
+        await P.timeout(
+            15 * 1000,
+            s3.headBucket({ Bucket: target_bucket }),
+            () => timeout_err
+        );
+    } catch (err) {
+        dbg.warn('_check_archive_target_bucket: headBucket failed for', target_bucket,
+            ` error: ${err}, message: ${err.message}`
+        );
+        throw new RpcError('ARCHIVE_TARGET_ERROR',
+            `HeadBucket failed for archive target bucket ${target_bucket}: ${err.message}`
+        );
+    }
+    const storage_classes = get_headers()['x-noobaa-available-storage-classes'] || '';
+    if (!storage_classes.includes('GLACIER')) {
+        throw new RpcError(
+            'INVALID_ARCHIVE_TARGET',
+            `Target bucket ${target_bucket} does not support GLACIER storage class`
+        );
+    }
+}
+
 async function create_namespace_resource(req) {
     req.rpc_params.access_mode = req.rpc_params.access_mode || 'READ_WRITE';
     const name = req.rpc_params.name;
     let namespace_resource;
     if (req.rpc_params.nsfs_config) {
+        if (req.rpc_params.archive) {
+            throw new RpcError(
+                'INVALID_ARCHIVE_RESOURCE',
+                'An archive namespace resource must be a cloud resource, not an NSFS resource'
+            );
+        }
         namespace_resource = new_namespace_resource_defaults(name, req.system._id, req.account._id, undefined, req.rpc_params.nsfs_config,
-            req.rpc_params.access_mode);
+            req.rpc_params.access_mode, req.rpc_params.archive);
         const already_used_by = system_store.data.namespace_resources.find(cur_nsr => cur_nsr.nsfs_config &&
             (cur_nsr.nsfs_config.fs_root_path === namespace_resource.nsfs_config.fs_root_path));
         if (already_used_by) {
@@ -295,7 +350,13 @@ async function create_namespace_resource(req) {
                 azure_logs_analytics_workspace_id: connection.azure_log_access_keys.azure_logs_analytics_workspace_id
             };
         }
-
+        let azure_sts_credentials;
+        if (connection.azure_sts_credentials) {
+            azure_sts_credentials = {
+                azure_tenant_id: connection.azure_sts_credentials.azure_tenant_id,
+                azure_client_id: connection.azure_sts_credentials.azure_client_id,
+        };
+        }
         namespace_resource = new_namespace_resource_defaults(name, req.system._id, req.account._id, _.omitBy({
             aws_sts_arn: connection.aws_sts_arn,
             endpoint: connection.endpoint,
@@ -307,7 +368,8 @@ async function create_namespace_resource(req) {
             endpoint_type: connection.endpoint_type || 'AWS',
             region: connection.region,
             azure_log_access_keys,
-        }, _.isUndefined), undefined, req.rpc_params.access_mode);
+            azure_sts_credentials
+        }, _.isUndefined), undefined, req.rpc_params.access_mode, req.rpc_params.archive);
 
         const cloud_buckets = await server_rpc.client.bucket.get_cloud_buckets({
             connection: connection.name,
@@ -325,6 +387,9 @@ async function create_namespace_resource(req) {
         if (already_used_by) {
             dbg.error(`This endpoint is already being used by a ${already_used_by.usage_type}: ${already_used_by.source_name}`);
             throw new RpcError('IN_USE', 'Target already in use');
+        }
+        if (req.rpc_params.archive && config.ARCHIVE_TARGET_BUCKET_CHECK_ENABLED) {
+            await _check_archive_target_bucket(connection, req.rpc_params.target_bucket);
         }
     }
     if (req.rpc_params.namespace_store) {
@@ -370,6 +435,7 @@ async function create_cloud_pool(req) {
         backingstore: req.rpc_params.backingstore,
         available_capacity: req.rpc_params.available_capacity,
         storage_limit: req.rpc_params.storage_limit,
+        azure_sts_credentials: connection.azure_sts_credentials,
     }, _.isUndefined);
 
     const cloud_buckets = await server_rpc.client.bucket.get_cloud_buckets({
@@ -412,7 +478,9 @@ async function create_cloud_pool(req) {
         FLASHBLADE: 'BLOCK_STORE_S3',
         IBM_COS: 'BLOCK_STORE_S3',
         AZURE: 'BLOCK_STORE_AZURE',
-        GOOGLE: 'BLOCK_STORE_GOOGLE'
+        AZURESTS: 'BLOCK_STORE_AZURE',
+        GOOGLE: 'BLOCK_STORE_GOOGLE',
+        GOOGLE_STS: 'BLOCK_STORE_GOOGLE',
     };
 
     const pool_node_type = map_pool_type[connection.endpoint_type];
@@ -497,46 +565,6 @@ async function update_cloud_pool(req) {
             auth_token: req.auth_token
         });
     }
-}
-
-function create_mongo_pool(req) {
-    const name = req.rpc_params.name;
-    const mongo_info = {};
-
-    if (config.DB_TYPE !== 'mongodb') {
-        dbg.error(`Cannot create mongo pool with DB_TYPE=${config.DB_TYPE}`);
-        throw new Error(`Cannot create mongo pool with DB_TYPE=${config.DB_TYPE}`);
-    }
-
-    if (get_internal_mongo_pool(req.system)) {
-        dbg.error('System already has mongo pool');
-        throw new Error('System already has mongo pool');
-    }
-
-    const pool = new_pool_defaults(name, req.system._id, 'INTERNAL', 'BLOCK_STORE_MONGO');
-    dbg.log0('Creating new mongo_pool', pool);
-    pool.mongo_pool_info = mongo_info;
-
-    return system_store.make_changes({
-            insert: {
-                pools: [pool]
-            }
-        })
-        .then(res => server_rpc.client.hosted_agents.create_pool_agent({
-            pool_name: req.rpc_params.name,
-        }, {
-            auth_token: req.auth_token
-        }));
-    // .then(() => {
-    //     Dispatcher.instance().activity({
-    //         event: 'resource.cloud_create',
-    //         level: 'info',
-    //         system: req.system._id,
-    //         actor: req.account && req.account._id,
-    //         pool: pool._id,
-    //         desc: `${pool.name} was created by ${req.account && req.account.email.unwrap()}`,
-    //     });
-    // })
 }
 
 async function read_pool(req) {
@@ -652,7 +680,9 @@ async function update_hosts_pool(req) {
 
 function delete_pool(req) {
     const pool = find_pool_by_name(req);
-    check_deletion_ownership(req, pool.owner_id);
+    // rebuild_object_links() resolves the pool's owner_id to the account object
+    // which is why we have to access ._id to get the actual ID
+    check_deletion_ownership(req, pool.owner_id?._id);
     if (pool.hosts_pool_info) {
         return delete_hosts_pool(req, pool);
     } else {
@@ -662,7 +692,7 @@ function delete_pool(req) {
 
 function delete_namespace_resource(req) {
     const ns = find_namespace_resource_by_name(req);
-    check_deletion_ownership(req, ns.account);
+    check_deletion_ownership(req, ns.account._id);
     dbg.log0('Deleting namespace resource', ns.name);
     return P.resolve()
         .then(() => {
@@ -733,13 +763,6 @@ async function delete_hosts_pool(req, pool) {
             pool: pool._id,
             desc: `${pool.name} was emptyed and deleted`,
         });
-        const related_funcs = await func_store.instance().list_funcs_by_pool(req.system._id, pool._id);
-        for (const func of related_funcs) {
-            const new_pools_arr = func.pools.filter(function(obj) {
-                return obj.toString() !== (pool._id).toString();
-            });
-            await func_store.instance().update_func(func._id, { 'pools': new_pools_arr });
-        }
     }
 }
 
@@ -789,8 +812,7 @@ function delete_resource_pool(req, pool) {
                         _id: pool._id,
                         name: pool.name + '#' + pool._id
                     };
-                    const pending_del_property = pool.resource_type === 'INTERNAL' ?
-                        'mongo_pool_info.pending_delete' : 'cloud_pool_info.pending_delete';
+                    const pending_del_property = 'cloud_pool_info.pending_delete';
                     // mark the resource pool as pending delete
                     db_update[pending_del_property] = true;
                     return system_store.make_changes({
@@ -966,7 +988,7 @@ function get_associated_accounts(pool) {
 
 function find_pool_by_name(req) {
     const name = req.rpc_params.name;
-    const pool = req.system.pools_by_name[name];
+    const pool = req.system.pools_by_name?.[name];
     if (!pool) {
         throw new RpcError('NO_SUCH_POOL', 'No such pool: ' + name);
     }
@@ -1064,11 +1086,6 @@ function get_pool_info(pool, nodes_aggregate_pool, hosts_aggregate_pool) {
         info.undeletable = check_resource_pool_deletion(pool);
         info.mode = calc_cloud_pool_mode(p_nodes);
         info.is_managed = true;
-    } else if (_is_mongo_pool(pool)) {
-        info.mongo_info = {};
-        info.undeletable = check_resource_pool_deletion(pool);
-        info.mode = calc_mongo_pool_mode(p_nodes);
-        info.is_managed = true;
     } else {
         info.nodes = _.defaults({}, p_nodes.nodes, POOL_NODES_INFO_DEFAULTS);
         info.storage_nodes = _.defaults({}, p_nodes.storage_nodes, POOL_NODES_INFO_DEFAULTS);
@@ -1110,7 +1127,8 @@ function get_namespace_resource_info(namespace_resource) {
         name: namespace_resource.name,
         mode: calc_namespace_resource_mode(namespace_resource),
         undeletable: check_namespace_resource_deletion(namespace_resource),
-        access_mode: namespace_resource.access_mode
+        access_mode: namespace_resource.access_mode,
+        archive: namespace_resource.archive,
     }, _.isUndefined);
     return info;
 }
@@ -1127,10 +1145,12 @@ function calc_namespace_resource_mode(namespace_resource) {
     if (!map_issues_and_monitoring_report.has(namespace_resource_id)) {
         map_issues_and_monitoring_report.set(namespace_resource_id, { last_monitoring: undefined, issues: [] });
     }
-    const issues_report = map_issues_and_monitoring_report.get(namespace_resource_id).issues;
+
+    const nsr_report = map_issues_and_monitoring_report.get(namespace_resource_id);
+    const issues_report = nsr_report.issues;
     const errors_count = _.reduce(issues_report, (acc, issue) => {
         // skip if error timestamp is before of the latest monitoring
-        if (issue.time < namespace_resource.last_monitoring) {
+        if (issue.time < nsr_report.last_monitoring) {
             return acc;
         }
         const err_type = map_err_to_type_count[issue.error_code] || 'io_errors';
@@ -1202,6 +1222,7 @@ function get_namespace_resource_extended_info(namespace_resource) {
         secret_key: namespace_resource.connection.secret_key,
         access_mode: namespace_resource.access_mode,
         aws_sts_arn: namespace_resource.connection.aws_sts_arn || undefined,
+        azure_sts_credentials: namespace_resource.connection.azure_sts_credentials || undefined,
     };
     const nsfs_info = namespace_resource.nsfs_config && {
         fs_root_path: namespace_resource.nsfs_config.fs_root_path,
@@ -1228,19 +1249,6 @@ function calc_cloud_pool_mode(p) {
         'ALL_NODES_OFFLINE';
 }
 
-function calc_mongo_pool_mode(p) {
-    const { by_mode } = _.defaults({}, p.nodes, POOL_NODES_INFO_DEFAULTS);
-    const { free } = _.defaults({}, p.storage, { free: NO_CAPAITY_LIMIT + 1 });
-    return (!p.nodes && 'INITIALIZING') ||
-        (by_mode.OPTIMAL && 'OPTIMAL') ||
-        (by_mode.IO_ERRORS && 'IO_ERRORS') ||
-        (by_mode.INITIALIZING && 'INITIALIZING') ||
-        (by_mode.OFFLINE && 'ALL_NODES_OFFLINE') ||
-        (by_mode.LOW_CAPACITY && 'LOW_CAPACITY') ||
-        (free < NO_CAPAITY_LIMIT && 'NO_CAPACITY') ||
-        'ALL_NODES_OFFLINE';
-}
-
 /*eslint complexity: ["error", 60]*/
 function calc_hosts_pool_mode(pool_info, storage_by_mode, s3_by_mode) {
     const { hosts, storage, is_managed } = pool_info;
@@ -1249,10 +1257,13 @@ function calc_hosts_pool_mode(pool_info, storage_by_mode, s3_by_mode) {
     const storage_count = hosts.by_service.STORAGE;
     const storage_offline = storage_by_mode.OFFLINE || 0;
     const storage_optimal = storage_by_mode.OPTIMAL || 0;
+    const storage_low_capacity = storage_by_mode.LOW_CAPACITY || 0;
     const storage_offline_ratio = (storage_offline / host_count) * 100;
-    const storage_issues_ratio = ((storage_count - storage_optimal) / storage_count) * 100;
+    //don't count individual storage with low capacity as having issues.
+    //low capacity is handled for the entire BS by free_ratio check below
+    const storage_issues_ratio = ((storage_count - storage_optimal - storage_low_capacity) / storage_count) * 100;
     const hosts_initializing = hosts.by_mode.INITIALIZING || 0;
-    const hosts_migrating = (hosts.by_mode.INITIALIZING || 0) + (hosts.by_mode.DECOMMISSIONING || 0) + (hosts.by_mode.MIGRATING || 0);
+    const hosts_migrating = (hosts.by_mode.INITIALIZING || 0) + (hosts.by_mode.MIGRATING || 0);
     const s3_count = hosts.by_service.GATEWAY;
     const s3_optimal = s3_by_mode.OPTIMAL || 0;
     const s3_issues_ratio = ((s3_count - s3_optimal) / s3_count) * 100;
@@ -1341,40 +1352,57 @@ function check_resource_pool_deletion(pool) {
 function check_namespace_resource_deletion(ns) {
     //Verify namespace resource is not used by any namespace bucket
     const buckets = get_associated_buckets_ns(ns);
-    if (buckets.length) {
+    const vector_buckets = get_associated_vector_buckets_ns(ns);
+    if (buckets.length || vector_buckets.length) {
         return 'IN_USE';
     }
 }
 
 function get_associated_buckets_ns(ns) {
+    const ns_id = String(ns._id);
     const associated_buckets = _.filter(ns.system.buckets_by_name, bucket => {
-        if (!bucket.namespace) return;
-        return (_.find(bucket.namespace.read_resources, read_resource => String(ns._id) === String(read_resource.resource._id)) ||
-            (String(ns._id) === String(bucket.namespace.write_resource.resource._id)));
+        if (bucket.namespace) {
+            return (_.find(bucket.namespace.read_resources, read_resource => ns_id === String(read_resource.resource._id)) ||
+            (ns_id === String(bucket.namespace.write_resource.resource._id)));
+        }
+        const archive_res = bucket.archive_policy?.deep_archive_resource?.resource;
+        return Boolean(archive_res && ns_id === String(archive_res._id));
     });
 
     return _.map(associated_buckets, 'name');
+}
+
+function get_associated_vector_buckets_ns(ns) {
+    const associated_vector_buckets = _.filter(ns.system.vector_buckets_by_name, vector_bucket =>
+        (String(vector_bucket.namespace_resource?.resource?._id) === String(ns._id))
+    );
+
+    return _.map(associated_vector_buckets, 'name');
 }
 
 function _is_cloud_pool(pool) {
     return Boolean(pool.cloud_pool_info);
 }
 
-function _is_mongo_pool(pool) {
-    return Boolean(pool.mongo_pool_info);
+function get_default_pool(system) {
+    return system.pools_by_name[config.DEFAULT_POOL_NAME];
 }
 
-function get_internal_mongo_pool(system) {
-    return system.pools_by_name[`${config.INTERNAL_STORAGE_POOL_NAME}-${system._id}`];
+// update only bootstrap/default-pool accounts (legacy install state), not operator
+// skip no-op updates when account already points to the selected optimal pool
+function _is_default_resource_update_candidate(account, optimal_pool_id) {
+    return account.email.unwrap() !== config.OPERATOR_ACCOUNT_EMAIL &&
+        account.default_resource &&
+        account.default_resource.is_default_pool &&
+        String(account.default_resource._id) !== String(optimal_pool_id);
 }
 
-async function get_optimal_non_mongo_pool_id() {
+async function get_optimal_non_default_pool_id() {
     for (const pool of system_store.data.pools) {
-        // skip mongo pools.
-        if (_is_mongo_pool(pool)) {
+        // skip backingstore_pool.
+        if (pool.is_default_pool) {
             continue;
         }
-
         const aggr_nodes = await nodes_client.instance().aggregate_nodes_by_pool([pool.name], pool.system._id);
         const aggr_hosts = await nodes_client.instance().aggregate_hosts_by_pool([pool.name], pool.system._id);
         const { mode = '' } = get_pool_info(pool, aggr_nodes, aggr_hosts);
@@ -1389,15 +1417,11 @@ async function update_account_default_resource() {
         try {
             const system = system_store.data.systems[0];
             if (system) {
-                const optimal_pool_id = await get_optimal_non_mongo_pool_id();
+                const optimal_pool_id = await get_optimal_non_default_pool_id();
 
                 if (optimal_pool_id) {
                     const updates = system_store.data.accounts
-                        .filter(account =>
-                            account.email.unwrap() !== config.OPERATOR_ACCOUNT_EMAIL &&
-                            account.default_resource &&
-                            _is_mongo_pool(account.default_resource)
-                        )
+                        .filter(account => _is_default_resource_update_candidate(account, optimal_pool_id))
                         .map(account => ({
                             _id: account._id,
                             $set: {
@@ -1464,7 +1488,6 @@ function update_last_monitoring(req) {
 // EXPORTS
 exports._init = _init;
 exports.set_pool_controller_factory = set_pool_controller_factory;
-exports.get_internal_mongo_pool = get_internal_mongo_pool;
 exports.new_pool_defaults = new_pool_defaults;
 exports.get_pool_info = get_pool_info;
 exports.read_namespace_resource = read_namespace_resource;
@@ -1472,7 +1495,6 @@ exports.get_namespace_resource_info = get_namespace_resource_info;
 exports.create_hosts_pool = create_hosts_pool;
 exports.create_cloud_pool = create_cloud_pool;
 exports.create_namespace_resource = create_namespace_resource;
-exports.create_mongo_pool = create_mongo_pool;
 exports.read_pool = read_pool;
 exports.delete_pool = delete_pool;
 exports.delete_namespace_resource = delete_namespace_resource;
@@ -1486,9 +1508,9 @@ exports.assign_pool_to_region = assign_pool_to_region;
 exports.scale_hosts_pool = scale_hosts_pool;
 exports.update_hosts_pool = update_hosts_pool;
 exports.update_cloud_pool = update_cloud_pool;
-exports.get_optimal_non_mongo_pool_id = get_optimal_non_mongo_pool_id;
 exports.get_hosts_pool_agent_config = get_hosts_pool_agent_config;
 exports.update_issues_report = update_issues_report;
 exports.update_last_monitoring = update_last_monitoring;
 exports.calc_namespace_resource_mode = calc_namespace_resource_mode;
 exports.check_deletion_ownership = check_deletion_ownership;
+exports.get_default_pool = get_default_pool;

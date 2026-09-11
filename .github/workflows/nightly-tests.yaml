@@ -6,13 +6,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run Nightly Tests
         run: |
-          make test
+          make test-postgres
           docker run --rm -e NEWAWSPROJKEY=${{ secrets.NEWAWSPROJKEY }} \
           -e NEWAWSPROJSECRET=${{ secrets.NEWAWSPROJSECRET }} \
           -e NEWAZUREPROJKEY=${{ secrets.NEWAZUREPROJKEY }} \
           -e NEWAZUREPROJSECRET=${{ secrets.NEWAZUREPROJSECRET }} \
-          --name test1 noobaa-tester ./src/test/unit_tests/run_npm_test_on_test_container.sh -s test_s3_ops.js
+          --name test1 noobaa-tester ./src/test/framework/run_npm_test_on_test_container.sh -s test_s3_ops.js

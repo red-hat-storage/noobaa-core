@@ -120,14 +120,6 @@ class ServerRpc {
             require('./object_services/object_server'), options);
     }
 
-    register_func_services() {
-        const rpc = this.rpc;
-        const schema = rpc.schema;
-        const options = this.get_server_options();
-        rpc.register_service(schema.func_api,
-            require('./func_services/func_server'), options);
-    }
-
     register_bg_services() {
         const rpc = this.rpc;
         const schema = rpc.schema;
@@ -136,6 +128,8 @@ class ServerRpc {
             require('./bg_services/scrubber'), options);
         rpc.register_service(schema.replication_api,
             require('./bg_services/replication_server'), options);
+        rpc.register_service(schema.archive_api,
+            require('./bg_services/archive_server'), options);
     }
 
     register_hosted_agents_services() {

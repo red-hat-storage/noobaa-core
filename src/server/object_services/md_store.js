@@ -1,4 +1,5 @@
 /* Copyright (C) 2016 NooBaa */
+/*eslint max-lines: ["error", 3000]*/
 'use strict';
 
 /** @typedef {typeof import('../../sdk/nb')} nb */
@@ -7,13 +8,13 @@ const _ = require('lodash');
 const assert = require('assert');
 const moment = require('moment');
 const mongodb = require('mongodb');
-const mime = require('mime');
+const mime = require('mime-types');
 
-const P = require('../../util/promise');
 const dbg = require('../../util/debug_module')(__filename);
 const db_client = require('../../util/db_client');
+const { decode_json, escapeLiteral } = require('../../util/postgres_client.js');
 
-const mongo_functions = require('../../util/mongo_functions');
+const aggregate_functions = require('../../util/aggregate_functions');
 const object_md_schema = require('./schemas/object_md_schema');
 const object_md_indexes = require('./schemas/object_md_indexes');
 const object_part_schema = require('./schemas/object_part_schema');
@@ -25,38 +26,88 @@ const data_chunk_indexes = require('./schemas/data_chunk_indexes');
 const data_block_schema = require('./schemas/data_block_schema');
 const data_block_indexes = require('./schemas/data_block_indexes');
 const config = require('../../../config');
+const COMMON_CONSTANTS = require('../../common/constants');
 
+
+// const sql_or_conditions = (...conditions) => conditions.filter(Boolean).join(' OR ');
+const sql_and_conditions = (...conditions) => conditions.filter(Boolean).join(' AND ');
+
+/**
+ * Build parameterized SQL filter conditions for S3 lifecycle rule filters
+ * (prefix, object size, tags). All conditions are ANDed per the S3 spec.
+ *
+ * @param {{prefix?: string, size_less?: number, size_greater?: number, tags?: Array<{key: string, value: string}>}} filters
+ * @param {number} start_idx - next available parameterized query index ($N)
+ * @returns {{conditions: string[], values: any[], next_idx: number}}
+ */
+function build_lifecycle_filter_conditions(filters, start_idx) {
+    const conditions = [];
+    const values = [];
+    let idx = start_idx;
+
+    if (filters.prefix) {
+        conditions.push(`data->>'key' LIKE $${idx}`);
+        const escaped = filters.prefix.replace(/%/g, '\\%').replace(/_/g, '\\_');
+        values.push(escaped + '%');
+        idx += 1;
+    }
+    if (filters.size_greater !== undefined && filters.size_greater !== null) {
+        conditions.push(`(data->>'size')::BIGINT > $${idx}`);
+        values.push(filters.size_greater);
+        idx += 1;
+    }
+    if (filters.size_less !== undefined && filters.size_less !== null) {
+        conditions.push(`(data->>'size')::BIGINT < $${idx}`);
+        values.push(filters.size_less);
+        idx += 1;
+    }
+    if (filters.tags && filters.tags.length) {
+        conditions.push(`data->'tagging' @> $${idx}::jsonb`);
+        values.push(JSON.stringify(filters.tags));
+        idx += 1;
+    }
+    return { conditions, values, next_idx: idx };
+}
 
 class MDStore {
 
     constructor(test_suffix = '') {
+        this._test_suffix = test_suffix;
+        this._postgres_pool = 'md';
+
         this._objects = db_client.instance().define_collection({
             name: 'objectmds' + test_suffix,
             schema: object_md_schema,
             db_indexes: object_md_indexes,
+            postgres_pool: this._postgres_pool,
         });
         this._multiparts = db_client.instance().define_collection({
             name: 'objectmultiparts' + test_suffix,
             schema: object_multipart_schema,
             db_indexes: object_multipart_indexes,
+            postgres_pool: this._postgres_pool,
         });
         this._parts = db_client.instance().define_collection({
             name: 'objectparts' + test_suffix,
             schema: object_part_schema,
             db_indexes: object_part_indexes,
+            postgres_pool: this._postgres_pool,
         });
         this._chunks = db_client.instance().define_collection({
             name: 'datachunks' + test_suffix,
             schema: data_chunk_schema,
             db_indexes: data_chunk_indexes,
+            postgres_pool: this._postgres_pool,
         });
         this._blocks = db_client.instance().define_collection({
             name: 'datablocks' + test_suffix,
             schema: data_block_schema,
             db_indexes: data_block_indexes,
+            postgres_pool: this._postgres_pool,
         });
         this._sequences = db_client.instance().define_sequence({
             name: 'mdsequences' + test_suffix,
+            postgres_pool: this._postgres_pool,
         });
     }
 
@@ -94,6 +145,10 @@ class MDStore {
         return mongodb.ObjectId.isValid(id_str);
     }
 
+    is_err_duplicate_key(err) {
+        return db_client.instance().is_err_duplicate_key(err);
+    }
+
     /////////////
     // OBJECTS //
     /////////////
@@ -104,9 +159,84 @@ class MDStore {
         return this._objects.insertOne(info);
     }
 
+    /**
+     * All mapping inserts in a single batched transaction (BEGIN + INSERTs + COMMIT)
+     * to reduce WAL flushes. Optionally includes the object row for the first
+     * put_mapping with deferred_object_md.
+     */
+    async insert_mappings_in_transaction({ object_md, chunks, parts, blocks }) {
+        const entries = [];
+        if (object_md) entries.push({ table: this._objects, docs: [object_md] });
+        if (chunks && chunks.length) entries.push({ table: this._chunks, docs: chunks });
+        if (parts && parts.length) entries.push({ table: this._parts, docs: parts });
+        if (blocks && blocks.length) entries.push({ table: this._blocks, docs: blocks });
+        if (!entries.length) return;
+
+        const bulk = db_client.instance().initializeMultiTableBulkOp(this._postgres_pool);
+        bulk.insert_many(entries);
+        const res = await bulk.execute();
+        if (!res.ok) {
+            throw res.err || new Error('insert_mappings_in_transaction: bulk insert failed');
+        }
+    }
+
+    /**
+     * Soft-delete an existing object then insert a new object + deferred mappings
+     * in a single batched transaction (one round trip).
+     * Accepts either delete_obj_id (by id) or bucket_id + key (by key) for the soft-delete.
+     * When using bucket_id + key the separate find_object_null_version lookup is eliminated.
+     */
+    async delete_and_insert_deferred({ delete_obj_id, bucket_id, key, object_md, chunks, parts, blocks }) {
+        const bulk = db_client.instance().initializeMultiTableBulkOp(this._postgres_pool);
+        const deleted_json = JSON.stringify({ deleted: new Date().toISOString(), version_past: true });
+        if (delete_obj_id) {
+            bulk.add_query(
+                `UPDATE ${this._objects.name} SET data = data || ${escapeLiteral(deleted_json)}::jsonb` +
+                ` WHERE _id = ${escapeLiteral(String(delete_obj_id))}` +
+                ` AND (data->'deleted' IS NULL OR data->'deleted' = 'null'::jsonb)`
+            );
+        } else if (bucket_id && key) {
+            bulk.add_query(
+                `UPDATE ${this._objects.name} SET data = data || ${escapeLiteral(deleted_json)}::jsonb` +
+                ` WHERE data->>'bucket' = ${escapeLiteral(String(bucket_id))}` +
+                ` AND data->>'key' = ${escapeLiteral(key)}` +
+                ` AND (data->'deleted' IS NULL OR data->'deleted' = 'null'::jsonb)` +
+                ` AND (data->'upload_started' IS NULL OR data->'upload_started' = 'null'::jsonb)` +
+                ` AND (data->'version_enabled' IS NULL OR data->'version_enabled' = 'null'::jsonb)`
+            );
+        }
+        bulk.insert_many([
+            { table: this._objects, docs: [object_md] },
+            ...(chunks && chunks.length ? [{ table: this._chunks, docs: chunks }] : []),
+            ...(parts && parts.length ? [{ table: this._parts, docs: parts }] : []),
+            ...(blocks && blocks.length ? [{ table: this._blocks, docs: blocks }] : []),
+        ]);
+        const res = await bulk.execute();
+        if (!res.ok) {
+            throw res.err || new Error('delete_and_insert_deferred: bulk operation failed');
+        }
+    }
+
     async update_object_by_id(obj_id, set_updates, unset_updates, inc_updates) {
         dbg.log1('update_object_by_id:', obj_id, compact_updates(set_updates, unset_updates, inc_updates));
         const res = await this._objects.updateOne({ _id: obj_id },
+            compact_updates(set_updates, unset_updates, inc_updates)
+        );
+        db_client.instance().check_update_one(res, 'object');
+    }
+
+    /**
+     * Finds a single object matching the given filter and applies the specified updates.
+     *
+     * @param {Object} filter - A query object selecting the object document to update.
+     * @param {Object} [set_updates] - Fields to set on the matched object.
+     * @param {Object} [unset_updates] - Fields to remove from the matched object.
+     * @param {Object} [inc_updates] - Numeric fields to increment on the matched object.
+     * @returns {Promise<void>} A promise that resolves when the update has been applied or rejects if no object was updated.
+     */
+    async find_and_update_object(filter, set_updates, unset_updates, inc_updates) {
+        dbg.log1('find_and_update_object:', compact_updates(set_updates, unset_updates, inc_updates));
+        const res = await this._objects.updateOne(filter,
             compact_updates(set_updates, unset_updates, inc_updates)
         );
         db_client.instance().check_update_one(res, 'object');
@@ -165,7 +295,6 @@ class MDStore {
             deleted: null,
             upload_started: null,
         }, {
-            hint: 'latest_version_index',
             sort: { bucket: 1, key: 1, version_past: 1 },
         });
     }
@@ -180,7 +309,6 @@ class MDStore {
             deleted: null,
             upload_started: null,
         }, {
-            hint: 'null_version_index',
             sort: { bucket: 1, key: 1 },
         });
     }
@@ -208,7 +336,6 @@ class MDStore {
             deleted: null,
             upload_started: null,
         }, {
-            hint: 'version_seq_index',
             sort: { bucket: 1, key: 1, version_seq: -1 },
         });
     }
@@ -226,7 +353,6 @@ class MDStore {
             // so worst case we scan 2 docs before we find one with `version_past: true`
             version_past: true,
         }, {
-            hint: 'version_seq_index',
             sort: { bucket: 1, key: 1, version_seq: -1 },
         });
     }
@@ -248,19 +374,219 @@ class MDStore {
     async remove_objects_and_unset_latest(objs) {
         if (!objs || !objs.length) return;
 
-        await this._objects.updateMany(
-            {
-                _id: {
-                    $in: objs.map(obj => obj._id),
-                }
-            },
-            {
-                $set: {
-                    deleted: new Date(),
-                    version_past: true,
-                },
+        await this._objects.updateMany({
+            _id: {
+                $in: objs.map(obj => obj._id),
             }
-        );
+        }, {
+            $set: {
+                deleted: new Date(),
+                version_past: true,
+            },
+        });
+    }
+
+    /**
+     *
+     * @param {{
+     *  bucket_id: string,
+     *  prefix?: string,
+     *  days_after_initiation: number,
+     *  size_less?: number,
+     *  size_greater?: number,
+     *  tags?: Array<string>,
+     *  limit: number
+     * }} config
+     */
+    async remove_pending_multiparts({
+        bucket_id,
+        prefix,
+        days_after_initiation,
+        size_less,
+        size_greater,
+        tags,
+        limit,
+    }) {
+        const table_name = this._objects.name;
+
+        function convert_mongoid_to_timestamp_sql(field) {
+            return `(('x' || substring(${field} FROM 1 FOR 8))::bit(32)::bigint)`;
+        }
+
+        const sql_condition0 = prefix ? `data->>'key' LIKE '${prefix}%'` : "";
+        const sql_condition1 = size_less === undefined ? "" : `data->>'size' < ${size_less}`;
+        const sql_condition2 = size_greater === undefined ? "" : `data->>'size' > ${size_greater}`;
+        const sql_condition3 = tags && tags.length ? `ranked.tags @> '${JSON.stringify(tags)}'::jsonb` : "";
+
+        const query = `
+            UPDATE ${table_name}
+            SET data = jsonb_set(data, '{deleted}', to_jsonb($1::text), true)
+            WHERE
+                ${sql_and_conditions(
+                    `data->>'bucket' = '${bucket_id}'`,
+                    `(data->'deleted' IS NULL OR data->'deleted' = 'null'::jsonb)`,
+                    `data ? 'upload_started'`,
+                    `(EXTRACT(EPOCH FROM NOW()) - ${convert_mongoid_to_timestamp_sql("data->>'upload_started'")}) / 86400 > ${days_after_initiation}`,
+                    sql_condition0, sql_condition1, sql_condition2, sql_condition3,
+                )};`;
+
+        dbg.log1('[remove_pending_multiparts] generated query:', query);
+        const result = await db_client.instance().executeSQL(query, [new Date()], { preferred_pool: this._postgres_pool });
+        return result.rowCount;
+    }
+
+    /**
+     *
+     * @param {{
+     *  bucket_id: string,
+     *  noncurrent_days: number,
+     *  prefix?: string,
+     *  newer_noncurrent_versions?: number,
+     *  size_less?: number,
+     *  size_greater?: number,
+     *  tags?: Array<string>,
+     *  limit: number
+     * }} config
+     */
+    async remove_noncurrent_versions({
+        bucket_id,
+        noncurrent_days,
+        prefix,
+        newer_noncurrent_versions,
+        size_less,
+        size_greater,
+        tags,
+        limit,
+    }) {
+        const table_name = this._objects.name;
+
+        if (noncurrent_days === undefined) throw new Error('noncurrent_days is required');
+
+        const sql_condition0 = prefix ? `data->>'key' LIKE '${prefix}%'` : "";
+        const sql_condition1 = `(successor_time IS NOT NULL AND (CURRENT_TIMESTAMP - successor_time) >= interval '${noncurrent_days} days')`;
+        const sql_condition2 = newer_noncurrent_versions ? `(rn > (${newer_noncurrent_versions} + 1))` : "";
+
+        const sql_condition3 = size_less === undefined ? "" : `data->>'size' < ${size_less}`;
+        const sql_condition4 = size_greater === undefined ? "" : `data->>'size' > ${size_greater}`;
+        const sql_condition5 = tags && tags.length ? `ranked.tags @> '${JSON.stringify(tags)}'::jsonb` : "";
+        // Object Lock filter for this bulk lifecycle UPDATE (same SQL path that already
+        // filters by age/prefix/size/tags). Soft-delete only unlocked versions: skip
+        // legal hold ON and any retention whose retain_until_date is still in the future.
+        // Mode is not checked — any active retention date blocks delete. No governance bypass.
+        const sql_condition_unlocked = `(
+            (ranked.lock_settings IS NULL OR ranked.lock_settings = 'null'::jsonb)
+            OR (
+                (ranked.lock_settings->'legal_hold'->>'status' IS DISTINCT FROM 'ON')
+                AND (
+                    ranked.lock_settings->'retention' IS NULL
+                    OR ranked.lock_settings->'retention' = 'null'::jsonb
+                    OR (ranked.lock_settings->'retention'->>'retain_until_date')::timestamptz <= CURRENT_TIMESTAMP
+                )
+            )
+        )`;
+
+        const sql_limit = limit === undefined ? "" : `LIMIT ${limit}`;
+
+        const query = `
+            WITH ranked AS (
+                SELECT
+                    _id,
+                    (data->>'size')::BIGINT AS size,
+                    data->'tagging' AS tags,
+                    data->'lock_settings' AS lock_settings,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY data->>'key'
+                        ORDER BY (data->>'version_seq')::BIGINT DESC
+                    ) AS rn,
+                    LEAD((data->>'create_time')::timestamptz) OVER (
+                        PARTITION BY data->>'key'
+                        ORDER BY (data->>'version_seq')::BIGINT
+                    ) AS successor_time
+                FROM ${table_name}
+                WHERE
+                    ${sql_and_conditions(
+                        `data->>'bucket' = '${bucket_id}'`,
+                        sql_condition0,
+                        `(data->'deleted' IS NULL OR data->'deleted' = 'null'::jsonb)`
+                    )}
+            )
+            UPDATE ${table_name}
+            SET data = jsonb_set(data, '{deleted}', to_jsonb($1::text), true)
+            WHERE _id IN (
+                SELECT ranked._id FROM ranked
+                WHERE
+                    ${sql_and_conditions(
+                        sql_condition1, sql_condition2,
+                        sql_condition3, sql_condition4, sql_condition5,
+                        sql_condition_unlocked,
+                    )}
+                ${sql_limit}
+            );`;
+
+        dbg.log1('[remove_noncurrent_versions] generated query:', query);
+        const result = await db_client.instance().executeSQL(query, [new Date()], { preferred_pool: this._postgres_pool });
+        return result.rowCount;
+    }
+
+    /**
+     *
+     * @param {{
+     *  bucket_id: string,
+     *  prefix?: string,
+     *  size_less?: number,
+     *  size_greater?: number,
+     *  tags?: Array<string>,
+     *  limit: number
+     * }} config
+     *
+     * @returns {Promise<number>}
+     */
+    async delete_orphaned_delete_marker({
+        bucket_id,
+        prefix,
+        size_less,
+        size_greater,
+        tags,
+        limit,
+    }) {
+        const table_name = this._objects.name;
+
+        const sql_condition0 = prefix ? `data->>'key' LIKE '${prefix}%'` : "";
+        const sql_condition1 = size_less === undefined ? "" : `data->>'size' < ${size_less}`;
+        const sql_condition2 = size_greater === undefined ? "" : `data->>'size' > ${size_greater}`;
+        const sql_condition3 = tags && tags.length ? `data->'tagging' @> '${JSON.stringify(tags)}'::jsonb` : "";
+
+        const sql_limit = limit === undefined ? "" : `LIMIT ${limit}`;
+
+        const query = `
+        DELETE FROM ${table_name}
+        WHERE ctid in (
+            SELECT ctid
+            FROM ${table_name} t1
+            WHERE ${sql_and_conditions(
+                `t1.data->>'bucket' = '${bucket_id}'`,
+                `(t1.data->'deleted' IS NULL OR t1.data->'deleted' = 'null'::jsonb)`,
+                `t1.data->>'delete_marker' IS NOT NULL`,
+                `(t1.data->'version_past' IS NULL OR t1.data->'version_past' = 'null'::jsonb)`,
+                `NOT EXISTS (
+                    SELECT 1
+                    FROM ${table_name} t2
+                    WHERE t2.data->>'bucket' = t1.data->>'bucket'
+                        AND t2.data->>'key' = t1.data->>'key'
+                        AND t2._id <> t1._id
+                        AND (
+                            (t2.data->'deleted' IS NULL OR t2.data->'deleted' = 'null'::jsonb) -- is not deleted
+                            OR t2.data->>'delete_marker' IS NOT NULL -- is a delete marker
+                        )
+                )`,
+                sql_condition0, sql_condition1, sql_condition2, sql_condition3
+            )}
+            ${sql_limit}
+        );`;
+
+        dbg.log1('[delete_orphaned_delete_marker] generated query:', query);
+        const result = await db_client.instance().executeSQL(query, [], { preferred_pool: this._postgres_pool });
+        return result.rowCount;
     }
 
     // 2, 3, 4
@@ -274,7 +600,7 @@ class MDStore {
         if (!res.ok || res.nMatched !== 2 || res.nModified !== 2) {
             dbg.error('remove_object_move_latest: partial bulk update',
                 _.clone(res), old_latest_obj, new_latest_obj);
-            throw new Error('remove_object_move_latest: partial bulk update');
+            throw res.err || new Error('remove_object_move_latest: partial bulk update');
         }
     }
 
@@ -285,7 +611,7 @@ class MDStore {
             system: obj.system,
             bucket: obj.bucket,
             key: obj.key,
-            content_type: obj.content_type || mime.getType(obj.key) || 'application/octet-stream',
+            content_type: obj.content_type || mime.lookup(obj.key) || 'application/octet-stream',
             delete_marker: true,
             create_time: new Date(),
             version_seq,
@@ -310,7 +636,7 @@ class MDStore {
         if (!res.ok || res.nMatched !== 1 || res.nModified !== 1 || res.nInserted !== 1) {
             dbg.error('insert_object_delete_marker_move_latest: partial bulk update',
                 _.clone(res), obj, delete_marker);
-            throw new Error('insert_object_delete_marker_move_latest: partial bulk update');
+            throw res.err || new Error('insert_object_delete_marker_move_latest: partial bulk update');
         }
         return delete_marker;
     }
@@ -338,7 +664,39 @@ class MDStore {
         if (!res.ok || res.nMatched !== 2 || res.nModified !== 2) {
             dbg.error('complete_object_upload_latest_mark_remove_current: partial bulk update',
                 _.clone(res), unmark_obj, put_obj, set_updates, unset_updates);
-            throw new Error('complete_object_upload_latest_mark_remove_current: partial bulk update');
+            throw res.err || new Error('complete_object_upload_latest_mark_remove_current: partial bulk update');
+        }
+    }
+
+    /**
+     * Soft-delete the current null-version by bucket+key, then update put_obj with set/unset.
+     * Eliminates the separate find_object_null_version round trip when md_conditions are absent.
+     * The UPDATE-by-key is a no-op (0 rows) when no prior object exists.
+     */
+    async complete_object_upload_mark_remove_by_key({
+        bucket_id,
+        key,
+        put_obj,
+        set_updates,
+        unset_updates,
+    }) {
+        const bulk = this._objects.initializeOrderedBulkOp();
+        const deleted_json = JSON.stringify({ deleted: new Date().toISOString(), version_past: true });
+        bulk.add_query(
+            `UPDATE ${this._objects.name} SET data = data || ${escapeLiteral(deleted_json)}::jsonb` +
+            ` WHERE data->>'bucket' = ${escapeLiteral(String(bucket_id))}` +
+            ` AND data->>'key' = ${escapeLiteral(key)}` +
+            ` AND (data->'deleted' IS NULL OR data->'deleted' = 'null'::jsonb)` +
+            ` AND (data->'upload_started' IS NULL OR data->'upload_started' = 'null'::jsonb)` +
+            ` AND (data->'version_enabled' IS NULL OR data->'version_enabled' = 'null'::jsonb)`
+        );
+        bulk.find({ _id: put_obj._id, deleted: null })
+            .updateOne({ $set: set_updates, $unset: unset_updates });
+        const res = await bulk.execute();
+        if (!res.ok || res.nModified < 1) {
+            dbg.error('complete_object_upload_mark_remove_by_key: partial bulk update',
+                _.clone(res), bucket_id, key, put_obj, set_updates, unset_updates);
+            throw res.err || new Error('complete_object_upload_mark_remove_by_key: partial bulk update');
         }
     }
 
@@ -376,7 +734,7 @@ class MDStore {
         if (!res.ok || res.nMatched !== number_of_queries || res.nModified !== number_of_queries) {
             dbg.error('complete_object_upload_latest_mark_remove_current_and_delete: partial bulk update',
                 _.clone(res), unmark_obj, put_obj, set_updates, unset_updates);
-            throw new Error('complete_object_upload_latest_mark_remove_current_and_delete: partial bulk update');
+            throw res.err || new Error('complete_object_upload_latest_mark_remove_current_and_delete: partial bulk update');
         }
     }
 
@@ -419,6 +777,14 @@ class MDStore {
     }
 
     /**
+     * @param {number} n
+     * @returns {Promise<{start: number, end: number}>}
+     */
+    async alloc_next_n_object_version_seq(n) {
+        return this._sequences.nextNsequences(n);
+    }
+
+    /**
      * TODO define indexes used by find_objects()
      *
      * @typedef {Object} FindObjectsParams
@@ -437,12 +803,7 @@ class MDStore {
      * @property {1|-1} [order]
      * @property {boolean} [pagination]
      *
-     * @typedef {Object} FindObjectsReply
-     * @property {nb.ObjectMD[]} objects
-     * @property {{ non_paginated: Object, by_mode: Object }} counters
-     *
-     * @param {FindObjectsParams} params
-     * @returns {Promise<FindObjectsReply>}
+     * @returns {Promise<nb.ObjectMD[]>}
      */
     async find_objects({
         bucket_id,
@@ -476,7 +837,7 @@ class MDStore {
                 $lt: new Date(moment.unix(max_create_time).toISOString()),
                 $exists: true
             } : undefined,
-            tagging: tagging ? {
+            tagging: (tagging?.length > 0) ? {
                 $all: tagging,
             } : undefined,
             size: (max_size || min_size) ?
@@ -497,31 +858,87 @@ class MDStore {
         const uploading_query = _.omit(query, 'upload_started');
         uploading_query.upload_started = { $exists: true };
 
-        const [objects, non_paginated, completed, uploading] = await Promise.all([
-            this._objects.find(query, {
-                limit: Math.min(limit, 1000),
-                skip: skip,
-                sort: sort ? {
-                    [sort]: (order === -1 ? -1 : 1)
-                } : undefined
-            }),
-            pagination ? this._objects.countDocuments(query) : undefined,
-            // completed uploads count
-            this._objects.countDocuments(completed_query),
-            // uploading count
-            this._objects.countDocuments(uploading_query)
-        ]);
+        return this._objects.find(query, {
+            limit: Math.min(limit, 1000),
+            skip: skip,
+            sort: sort ? {
+                [sort]: (order === -1 ? -1 : 1)
+            } : undefined
+        });
+    }
 
-        return {
-            objects,
-            counters: {
-                non_paginated,
-                by_mode: {
-                    completed,
-                    uploading
-                }
-            }
-        };
+    /**
+     * TODO add support for versioning or add another function to support versioning.
+     * @typedef {Object} DeleteObjectsParams
+     * @property {nb.ID} bucket_id
+     * @property {RegExp} key
+     * @property {number} [max_create_time]
+     * @property {number} [max_size]
+     * @property {number} [min_size]
+     * @property {Array<{ key: string; value: string; }>} [tagging]
+     * @property {number} [limit]
+     * @property {boolean} [return_results]
+     *
+     * @param {DeleteObjectsParams} params
+     * @returns {Promise<nb.ObjectMD[]>}
+     */
+    async delete_objects_by_query({
+        bucket_id,
+        key,
+        max_create_time,
+        max_size,
+        min_size,
+        tagging,
+        limit,
+        return_results = false,
+    }) {
+        const params = [new Date().toISOString()];
+        const sql_conditions = [];
+        if (key) {
+            params.push(key.source);
+            sql_conditions.push(`data->>'key' ~ $${params.length}`);
+        }
+        if (max_size !== undefined) {
+            params.push(max_size);
+            sql_conditions.push(`(data->>'size')::BIGINT < $${params.length}`);
+        }
+        if (min_size !== undefined) {
+            params.push(min_size);
+            sql_conditions.push(`(data->>'size')::BIGINT > $${params.length}`);
+        }
+        if (tagging && tagging.length) {
+            params.push(JSON.stringify(tagging));
+            sql_conditions.push(`(data->>'tagging')::jsonb @> $${params.length}::jsonb`);
+        }
+        if (max_create_time) {
+            params.push(new Date(moment.unix(max_create_time).toISOString()).toISOString());
+            sql_conditions.push(`data->>'create_time' < $${params.length}`);
+        }
+
+        const sql_limit = limit === undefined ? "" : `LIMIT ${limit}`;
+
+        let query = `
+        WITH rows AS (
+            SELECT _id
+            FROM ${this._objects.name}
+            WHERE
+                ${sql_and_conditions(
+                    `data->>'bucket' = '${bucket_id}'`,
+                    ...sql_conditions,
+                    `(data->'deleted' IS NULL OR data->'deleted' = 'null'::jsonb)`,
+                    `(data->'upload_started' IS NULL OR data->'upload_started' = 'null'::jsonb)`,
+                    `(data->'version_enabled' IS NULL OR data->'version_enabled' = 'null'::jsonb)`,
+                )}
+             ${sql_limit}
+        )
+        UPDATE ${this._objects.name}
+            SET data = jsonb_set(data, '{deleted}', to_jsonb($1::text), true)
+            WHERE _id IN (
+                SELECT rows._id FROM rows
+            )`;
+        query += return_results ? ' RETURNING *;' : ';';
+        const result = await db_client.instance().executeSQL(query, params, { preferred_pool: this._postgres_pool });
+        return return_results ? result.rows : [];
     }
 
     async find_unreclaimed_objects(limit) {
@@ -530,9 +947,93 @@ class MDStore {
             reclaimed: null
         }, {
             limit: Math.min(limit, 1000),
-            hint: 'deleted_unreclaimed_index',
+            preferred_pool: 'read_only',
         });
         return results;
+    }
+
+    /**
+     * True when the bucket still has soft-deleted objects with one of the given
+     * storage classes that ObjectsReclaimer has not marked reclaimed yet
+     * (e.g. remote archive keys still pending delete).
+     * @param {nb.ID} bucket_id
+     * @param {string[]} storage_classes - storage classes to match (e.g. ['DEEP_ARCHIVE', 'GLACIER'])
+     * @returns {Promise<boolean>}
+     */
+    async has_any_unreclaimed_objects_in_bucket_with_storage_class(bucket_id, storage_classes) {
+        const obj = await this._objects.findOne({
+            bucket: bucket_id,
+            deleted: { $exists: true },
+            reclaimed: null,
+            storage_class: { $in: storage_classes },
+        }, {
+            preferred_pool: 'read_only',
+        });
+        return Boolean(obj);
+    }
+
+    /**
+     * Live objects whose temporary restore has expired (STANDARD restore copy).
+     * @param {number} limit
+     * @param {Date} [now]
+     * @returns {Promise<nb.ObjectMD[]>}
+     */
+    async find_expired_restore_objects(limit, now = new Date()) {
+        const results = await this._objects.find({
+            deleted: null,
+            upload_started: null,
+            restore_status: { $exists: true },
+            'restore_status.ongoing': false,
+            'restore_status.expiry_time': { $lte: now },
+        }, {
+            limit: limit ?? 1000,
+            preferred_pool: 'read_only',
+        });
+        return results;
+    }
+
+    /**
+     * Live objects with transition DONE and unreclaimed source data
+     * (eligible for local-copy purge).
+     * @param {number} limit
+     * @returns {Promise<nb.ObjectMD[]>}
+     */
+    async find_objects_with_transition_done_unreclaimed_source(limit) {
+        const results = await this._objects.find({
+            deleted: null,
+            upload_started: null,
+            restore_status: null,
+            transition_info: { $exists: true },
+            'transition_info.status': 'DONE',
+            'transition_info.source_info': { $exists: true },
+            'transition_info.source_info.reclaimed': null,
+            'transition_info.transition_end_ts': { $exists: true },
+        }, {
+            limit: limit ?? 1000,
+            preferred_pool: 'read_only',
+        });
+        return results;
+    }
+
+    /**
+     * Unsets the transition-in-progress state for objects whose transition
+     * has been marked as in progress beyond the specified cutoff date.
+     *
+     * Only objects that have not been deleted, have not started uploading,
+     * and have an `IN_PROGRESS` transition status with a timestamp older
+     * than the cutoff date are updated.
+     *
+     * @param {Date} cutoff_date - Timestamp before which in-progress transitions should be reset.
+     * @returns {Promise<void>} on successful update.
+     * @throws {Error} if update fails.
+     */
+    async unset_transition_in_progress(cutoff_date) {
+        await this._objects.updateMany({
+            deleted: null,
+            upload_started: null,
+            'transition_info.status': COMMON_CONSTANTS.ARCHIVE.TRANSITION_STATUS.IN_PROGRESS,
+            'transition_info.transition_start_ts': { $lte: cutoff_date, $exists: true },
+        }, compact_updates(undefined, { transition_info: 1 }));
     }
 
     async list_objects({
@@ -542,13 +1043,7 @@ class MDStore {
         key_marker,
         limit
     }) {
-        const hint = 'latest_version_index';
         const sort = { bucket: 1, key: 1 };
-
-        // for mongodb add version_past to the sort
-        if (config.DB_TYPE === 'mongodb') {
-            sort.version_past = 1;
-        }
 
         const { key_query } = this._build_list_key_query_from_markers(prefix, delimiter, key_marker);
 
@@ -566,12 +1061,11 @@ class MDStore {
 
         if (delimiter) {
             const mr_results = await this._objects.mapReduce(
-                mongo_functions.map_common_prefixes,
-                mongo_functions.reduce_common_prefixes, {
+                aggregate_functions.map_common_prefixes,
+                aggregate_functions.reduce_common_prefixes, {
                     query,
                     limit,
                     sort,
-                    hint, // hint is not supported in mapReduce, so assume sort will enforce the correct index
                     scope: { prefix, delimiter },
                     out: { inline: 1 }
                 }
@@ -583,7 +1077,6 @@ class MDStore {
             const results = await this._objects.find(query, {
                 limit,
                 sort,
-                hint,
             });
             return results;
         }
@@ -597,7 +1090,6 @@ class MDStore {
         limit,
         version_seq_marker,
     }) {
-        const hint = 'version_seq_index';
         const sort = { bucket: 1, key: 1, version_seq: -1 };
 
         const { key_query, or_query } = this._build_list_key_query_from_markers(
@@ -616,12 +1108,11 @@ class MDStore {
 
         if (delimiter) {
             const mr_results = await this._objects.mapReduce(
-                mongo_functions.map_common_prefixes,
-                mongo_functions.reduce_common_prefixes, {
+                aggregate_functions.map_common_prefixes,
+                aggregate_functions.reduce_common_prefixes, {
                     query,
                     limit,
                     sort,
-                    hint, // hint is not supported in mapReduce, so assume sort will enforce the correct index
                     scope: { prefix, delimiter },
                     out: { inline: 1 }
                 }
@@ -633,7 +1124,6 @@ class MDStore {
             const results = await this._objects.find(query, {
                 limit,
                 sort,
-                hint,
             });
             return results;
         }
@@ -647,7 +1137,6 @@ class MDStore {
         limit,
         upload_started_marker,
     }) {
-        const hint = 'upload_index';
         const sort = { bucket: 1, key: 1, upload_started: 1 };
 
         const { key_query, or_query } = this._build_list_key_query_from_markers(
@@ -667,12 +1156,11 @@ class MDStore {
 
         if (delimiter) {
             const mr_results = await this._objects.mapReduce(
-                mongo_functions.map_common_prefixes,
-                mongo_functions.reduce_common_prefixes, {
+                aggregate_functions.map_common_prefixes,
+                aggregate_functions.reduce_common_prefixes, {
                     query,
                     limit,
                     sort,
-                    hint, // hint is not supported in mapReduce, so assume sort will enforce the correct index
                     scope: { prefix, delimiter },
                     out: { inline: 1 }
                 }
@@ -684,7 +1172,6 @@ class MDStore {
             const results = await this._objects.find(query, {
                 limit,
                 sort,
-                hint,
             });
             return results;
         }
@@ -769,8 +1256,24 @@ class MDStore {
             deleted: null,
             upload_started: null,
         }, {
-            hint: 'version_seq_index',
             sort: { bucket: 1, key: 1, version_seq: -1 },
+        });
+        return Boolean(obj);
+    }
+
+    /**
+     * Checks whether a bucket contains any completed (non-deleted, non-uploading) objects
+     * whose storage_class matches one of the given values.
+     * @param {nb.ID} bucket_id - the bucket's _id
+     * @param {string[]} storage_classes - array of storage class values to match (e.g. ['DEEP_ARCHIVE', 'GLACIER'])
+     * @returns {Promise<boolean>} true if at least one matching object exists
+     */
+    async has_any_completed_objects_in_bucket_with_storage_class(bucket_id, storage_classes) {
+        const obj = await this._objects.findOne({
+            bucket: bucket_id,
+            storage_class: { $in: storage_classes },
+            deleted: null,
+            upload_started: null,
         });
         return Boolean(obj);
     }
@@ -847,8 +1350,8 @@ class MDStore {
      */
     async _aggregate_objects_internal(query) {
         const res = await this._objects.mapReduce(
-            mongo_functions.map_aggregate_objects,
-            mongo_functions.reduce_sum, {
+            aggregate_functions.map_aggregate_objects,
+            aggregate_functions.reduce_sum, {
                 query,
                 out: { inline: 1 }
             }
@@ -865,20 +1368,23 @@ class MDStore {
         return buckets;
     }
 
+    /**
+     * Find deleted objects that were deleted before max_delete_time and are reclaimed.
+     *
+     * @param {number} max_delete_time - timestamp in milliseconds
+     * @param {number} limit
+     * @returns {Promise<nb.ID[]>}
+     */
     async find_deleted_objects(max_delete_time, limit) {
-        const objects = await this._objects.find({
-            deleted: {
-                $lt: new Date(max_delete_time),
-                $exists: true // This forces the index to be used
-            },
-        }, {
-            limit: Math.min(limit, 1000),
-            projection: {
-                _id: 1,
-                deleted: 1
-            }
+        const query_limit = limit || 1000;
+        const query = `SELECT _id
+        FROM ${this._objects.name}
+        WHERE (to_ts(data->>'deleted')<to_ts($1) and data ? 'deleted' and data ? 'reclaimed')
+        LIMIT ${query_limit};`;
+        const result = await db_client.instance().executeSQL(query, [new Date(max_delete_time).toISOString()], {
+            preferred_pool: 'read_only',
         });
-        return db_client.instance().uniq_ids(objects, '_id');
+        return db_client.instance().uniq_ids(result.rows, '_id');
     }
 
     async db_delete_objects(object_ids) {
@@ -952,8 +1458,13 @@ class MDStore {
             obj: { $eq: obj_id, $exists: true },
             num: { $gt: num_gt },
             size: { $exists: true },
-            md5_b64: { $exists: true },
             create_time: { $exists: true },
+            deleted: null,
+            // STANDARD parts commit with md5_b64; archive parts commit with opaque etag.
+            $or: [
+                { md5_b64: { $exists: true } },
+                { etag: { $exists: true } },
+            ],
         }, {
             sort: {
                 num: 1,
@@ -1026,6 +1537,23 @@ class MDStore {
             .then(obj => Boolean(obj));
     }
 
+    async find_objects_restore_status_ongoing(limit, marker) {
+        const ongoing_objects = await this._objects.find(compact({
+            deleted: null,
+            upload_started: null,
+            restore_status: { $exists: true },
+            'restore_status.ongoing': true,
+            _id: marker ? { $gt: marker } : undefined,
+        }), {
+            sort: { _id: 1 },
+            limit: limit ?? 1000,
+            preferred_pool: 'read_only',
+        });
+        return {
+            ongoing_objects,
+            marker: ongoing_objects.length ? ongoing_objects[ongoing_objects.length - 1]._id : null,
+        };
+    }
 
     ///////////
     // PARTS //
@@ -1099,7 +1627,6 @@ class MDStore {
                     _id: 0,
                     chunk: 1,
                 },
-                hint: 'obj_1_start_1'
             })
 
             .then(parts => db_client.instance().uniq_ids(parts, 'chunk'));
@@ -1114,6 +1641,24 @@ class MDStore {
             chunk: { $in: chunk_ids, $exists: true },
             deleted: null,
         });
+    }
+
+    /**
+     * @param {nb.ID} obj_id
+     * @returns {Promise<number>}
+     */
+    async find_max_part_seq_for_object(obj_id) {
+        const parts = await this._parts.find({
+            obj: { $eq: obj_id, $exists: true },
+            deleted: null,
+            uncommitted: null,
+        }, {
+            sort: { seq: -1 }, // highest seq first
+            limit: 1, // only need the top one
+            projection: { seq: 1 }, // only fetch the seq field
+        });
+        const seq = parts[0]?.seq;
+        return seq === undefined || seq === null ? 0 : seq + 1;
     }
 
     /**
@@ -1201,13 +1746,19 @@ class MDStore {
         return this._parts.find({ obj: { $eq: obj._id, $exists: true }, deleted: null });
     }
 
-    update_parts_in_bulk(parts_updates) {
+    async update_parts_in_bulk(parts_updates) {
         const bulk = this._parts.initializeUnorderedBulkOp();
         for (const update of parts_updates) {
             bulk.find({ _id: update._id })
                 .updateOne(compact_updates(update.set_updates, update.unset_updates));
         }
-        return bulk.length ? bulk.execute() : P.resolve();
+        const res = await bulk.execute();
+        if (res.err) {
+            dbg.error('update_parts_in_bulk: error',
+                _.clone(res), parts_updates);
+            throw res.err;
+        }
+        return res;
     }
 
     delete_parts_of_object(obj) {
@@ -1290,53 +1841,110 @@ class MDStore {
 
     /**
      * @param {nb.Bucket} bucket
-     * @param {nb.DBBuffer[]} dedup_keys
+     * @param {string[]} dedup_keys
      * @returns {Promise<nb.ChunkSchemaDB[]>}
      */
     async find_chunks_by_dedup_key(bucket, dedup_keys) {
-        // TODO: This is temporary patch because of binary representation in MongoDB and PostgreSQL
-        /** @type {nb.ChunkSchemaDB[]} */
-        const chunks = await this._chunks.find({
-            system: bucket.system._id,
-            bucket: bucket._id,
-            dedup_key: {
-                $in: dedup_keys,
-                $exists: true
-            },
-            deleted: null,
-        }, {
-            sort: {
-                _id: -1 // get newer chunks first
+        if (!dedup_keys?.length) return [];
+
+        const query = `
+            SELECT
+                c.data AS chunk_data,
+                b.data AS block_data
+            FROM ${this._chunks.name} c
+            JOIN ${this._blocks.name} b
+              ON b.data ->> 'chunk' = c.data ->> '_id'
+             AND b.data ? 'chunk'
+             AND (b.data->'deleted' IS NULL OR b.data->'deleted' = 'null'::jsonb)
+            WHERE c.data ->> 'system' = $1
+              AND c.data ->> 'bucket' = $2
+              AND c.data ->> 'dedup_key' = ANY($3)
+              AND c.data ? 'dedup_key'
+              AND (c.data->'deleted' IS NULL OR c.data->'deleted' = 'null'::jsonb)
+            ORDER BY c._id DESC
+        `;
+        const values = [`${bucket.system._id}`, `${bucket._id}`, dedup_keys];
+
+        try {
+            const res = await db_client.instance().executeSQL(query, values, { preferred_pool: this._postgres_pool });
+
+            const chunks_map = new Map();
+            const all_blocks = [];
+
+            for (const row of res.rows) {
+                const chunk_id_str = row.chunk_data._id;
+                if (!chunks_map.has(chunk_id_str)) {
+                    chunks_map.set(chunk_id_str, decode_json(this._chunks.schema, row.chunk_data));
+                }
+                if (row.block_data) {
+                    all_blocks.push(decode_json(this._blocks.schema, row.block_data));
+                }
             }
-        });
-        await this.load_blocks_for_chunks(chunks);
-        return chunks;
+
+            const chunks = Array.from(chunks_map.values());
+
+            const blocks_by_chunk = _.groupBy(all_blocks, 'chunk');
+            for (const chunk of chunks) {
+                const blocks_by_frag = _.groupBy(blocks_by_chunk[chunk._id.toHexString()], 'frag');
+                for (const frag of chunk.frags) {
+                    frag.blocks = blocks_by_frag[frag._id.toHexString()] || [];
+                }
+            }
+
+            return chunks;
+        } catch (err) {
+            dbg.error('Error while finding chunks by dedup_key. error is ', err);
+            throw err;
+        }
     }
 
-    iterate_all_chunks_in_buckets(lower_marker, upper_marker, buckets, limit) {
-        return this._chunks.find(compact({
-                _id: lower_marker ? compact({
-                    $gt: lower_marker,
-                    $lte: upper_marker
-                }) : undefined,
-                deleted: null,
-                bucket: {
-                    $in: buckets
-                }
-            }), {
-                projection: {
-                    _id: 1
-                },
-                sort: {
-                    _id: 1
-                },
-                limit: limit,
-            })
-
-            .then(chunks => ({
-                chunk_ids: db_client.instance().uniq_ids(chunks, '_id'),
-                marker: chunks.length ? chunks[chunks.length - 1]._id : null,
-            }));
+    /**
+     * Iterate over chunk _ids in the given buckets, optionally bounded by markers.
+     * When both markers are set (retry range), the range is [lower, upper] inclusive. When the last
+     * chunk in the page equals upper_marker, marker is returned as null so the caller can set done.
+     * When only lower_marker is set (resume), returns chunks with _id > lower_marker.
+     *
+     * @param {nb.ID|null|undefined} lower_marker - Start of range, excluded when upper_marker is not set (resume-after semantics)
+     * @param {nb.ID|null|undefined} upper_marker - End of range, when set with lower_marker range is inclusive
+     * @param {nb.ID[]} buckets - Bucket ids to filter by
+     * @param {number} limit - Max chunks to return
+     * @returns {Promise<{ chunk_ids: nb.ID[], marker: nb.ID|null }>} Chunk ids and last _id for next page (or null if no more / end of range)
+     */
+    async iterate_all_chunks_in_buckets(lower_marker, upper_marker, buckets, limit) {
+        // When both bounds are set (retry range), use $gte so the first failed chunk is included. when only lower is set (resume), use $gt
+        let id_condition;
+        if (lower_marker) {
+            if (upper_marker !== undefined && upper_marker !== null) {
+                id_condition = { $gte: lower_marker, $lte: upper_marker };
+            } else {
+                id_condition = { $gt: lower_marker };
+            }
+        } else {
+            id_condition = undefined;
+        }
+        const chunks = await this._chunks.find(compact({
+            _id: id_condition,
+            deleted: null,
+            bucket: {
+                $in: buckets
+            }
+        }), {
+            projection: {
+                _id: 1
+            },
+            sort: {
+                _id: 1
+            },
+            limit: limit,
+        });
+        const chunk_ids = db_client.instance().uniq_ids(chunks, '_id');
+        let marker = chunks.length ? chunks[chunks.length - 1]._id : null;
+        // When bounded (retry range), signal end of range so builder sets done and does not re-query the same page
+        if (upper_marker !== undefined && upper_marker !== null && marker !== null &&
+            String(marker) === String(upper_marker)) {
+            marker = null;
+        }
+        return { chunk_ids, marker };
     }
 
     iterate_all_chunks(marker, limit) {
@@ -1353,6 +1961,7 @@ class MDStore {
                     _id: -1
                 },
                 limit: limit,
+                preferred_pool: 'read_only',
             })
 
             .then(chunks => ({
@@ -1362,7 +1971,7 @@ class MDStore {
     }
 
     /**
-     * 
+     *
      * @param {{
      *  tier: nb.ID,
      *  limit: number,
@@ -1387,14 +1996,13 @@ class MDStore {
         }
 
         return this._chunks
-          .find(selectors, {
-            projection: { _id: 1 },
-            hint: "tiering_index",
-            sort,
-            limit,
-          })
+            .find(selectors, {
+                projection: { _id: 1 },
+                sort,
+                limit,
+            })
 
-          .then(chunks => db_client.instance().uniq_ids(chunks, "_id"));
+            .then(chunks => db_client.instance().uniq_ids(chunks, "_id"));
     }
 
 
@@ -1418,8 +2026,8 @@ class MDStore {
 
     _aggregate_chunks_internal(query) {
         return this._chunks.mapReduce(
-                mongo_functions.map_aggregate_chunks,
-                mongo_functions.reduce_sum, {
+                aggregate_functions.map_aggregate_chunks,
+                aggregate_functions.reduce_sum, {
                     query: query,
                     out: {
                         inline: 1
@@ -1516,25 +2124,24 @@ class MDStore {
             }));
     }
 
-    find_deleted_chunks(max_delete_time, limit) {
-        const query = {
-            deleted: {
-                $lt: new Date(max_delete_time)
-            },
-        };
-        return this._chunks.find(query, {
-                limit: Math.min(limit, 1000),
-                projection: {
-                    _id: 1,
-                    deleted: 1
-                }
-            })
-            .then(objects => db_client.instance().uniq_ids(objects, '_id'));
+    async find_deleted_chunks(max_delete_time, limit) {
+        const query_limit = limit || 1000;
+        const query = `SELECT _id
+            FROM ${this._chunks.name}
+            WHERE to_ts(data->>'deleted') < to_ts($1)
+              AND data ? 'deleted'
+            LIMIT ${query_limit}`;
+        const result = await db_client.instance().executeSQL(query, [new Date(max_delete_time).toISOString()], {
+            preferred_pool: 'read_only',
+        });
+        return db_client.instance().uniq_ids(result.rows, '_id');
     }
 
     has_any_blocks_for_chunk(chunk_id) {
         return this._blocks.findOne({
                 chunk: { $eq: chunk_id, $exists: true },
+            }, {
+                preferred_pool: 'read_only'
             })
             .then(obj => Boolean(obj));
     }
@@ -1542,8 +2149,24 @@ class MDStore {
     has_any_parts_for_chunk(chunk_id) {
         return this._parts.findOne({
                 chunk: { $eq: chunk_id, $exists: true },
+            }, {
+                preferred_pool: 'read_only'
             })
             .then(obj => Boolean(obj));
+    }
+
+    async has_any_blocks_or_parts_for_chunk(chunk_id) {
+        const query = `
+        SELECT
+            EXISTS (SELECT 1 FROM ${this._parts.name} WHERE data ? 'chunk' AND data->>'chunk' = $1)
+            OR
+            EXISTS (SELECT 1 FROM ${this._blocks.name} WHERE data ? 'chunk' AND data->>'chunk' = $2)
+        AS has_reference;
+        `;
+        const result = await db_client.instance().executeSQL(query, [chunk_id, chunk_id], {
+            preferred_pool: 'read_only',
+        });
+        return Boolean(result.rows[0]?.has_reference);
     }
 
 
@@ -1621,16 +2244,147 @@ class MDStore {
     }
 
     /**
+     * Combined query: fetch parts, chunks, and blocks in one round-trip.
+     * Replaces find_parts_by_start_range + find_chunks_by_ids + load_blocks_for_chunks.
+     *
+     * @param {Object} params
+     * @param {nb.ID} params.obj_id
+     * @param {number} params.start_gte
+     * @param {number} params.start_lt
+     * @param {number} params.end_gt
+     * @param {(a: any, b: any) => number} [params.sorter] block sort function
+     * @returns {Promise<{ parts: nb.PartSchemaDB[], chunks_db: nb.ChunkSchemaDB[] }>}
+     */
+    async find_parts_chunks_blocks_by_range({ obj_id, start_gte, start_lt, end_gt, sorter }) {
+        const query = `
+            SELECT
+                jsonb_agg(
+                    jsonb_build_object(
+                        'part', p.data,
+                        'chunk', c.data,
+                        'blocks', (
+                            SELECT jsonb_agg(b.data)
+                            FROM ${this._blocks.name} b
+                            WHERE b.data->>'chunk' = c.data->>'_id'
+                                AND b.data ? 'chunk'
+                                AND (b.data->'deleted' IS NULL OR b.data->'deleted' = 'null'::jsonb)
+                        )
+                    )
+                    ORDER BY (p.data->>'start')::bigint ASC
+                ) AS mapping
+            FROM ${this._parts.name} p
+            JOIN ${this._chunks.name} c ON c.data->>'_id' = p.data->>'chunk'
+                AND (c.data->'deleted' IS NULL OR c.data->'deleted' = 'null'::jsonb)
+            WHERE p.data->>'obj' = $1
+                AND p.data ? 'obj'
+                AND (p.data->'deleted' IS NULL OR p.data->'deleted' = 'null'::jsonb)
+                AND (p.data->'uncommitted' IS NULL OR p.data->'uncommitted' = 'null'::jsonb)
+                AND (p.data->>'start')::bigint >= $2
+                AND (p.data->>'start')::bigint < $3
+                AND (p.data->>'end')::bigint > $4
+        `;
+        const values = [String(obj_id), start_gte, start_lt, end_gt];
+        const res = await db_client.instance().executeSQL(query, values, {
+            preferred_pool: this._postgres_pool,
+            // fpcbb - find_parts_chunks_blocks_by_range
+            query_name: config.DB_PREPARED_STATEMENTS_ENABLED ? `fpcbb${this._test_suffix}` : undefined,
+        });
+        return _parse_mapping(res.rows[0]?.mapping, sorter);
+    }
+
+    /**
+     * Single-query path: fetch object metadata and the first max_parts parts with
+     * their chunks and blocks in one round-trip. Replaces a read_object_md call
+     * followed by find_parts_chunks_blocks_by_range for the common GET case.
+     * Returns null if the object is not found.
+     *
+     * @param {string} bucket_id
+     * @param {string} key
+     * @param {number} max_parts
+     * @param {(a: any, b: any) => number} [sorter]
+     * @returns {Promise<{ obj: nb.ObjectMD, parts: nb.PartSchemaDB[], chunks_db: nb.ChunkSchemaDB[] }|null>}
+     */
+    async find_object_with_mapping_by_key(bucket_id, key, max_parts, sorter) {
+        const query = `
+            WITH obj AS (
+                SELECT o._id, o.data
+                FROM ${this._objects.name} o
+                WHERE o.data->>'bucket' = $1
+                    AND o.data->>'key' = $2
+                    AND (o.data->'deleted' IS NULL OR o.data->'deleted' = 'null'::jsonb)
+                    AND (o.data->'upload_started' IS NULL OR o.data->'upload_started' = 'null'::jsonb)
+                    AND (o.data->'version_past' IS NULL OR o.data->'version_past' = 'null'::jsonb)
+                LIMIT 1
+            ),
+            parts AS (
+                SELECT p.data
+                FROM obj
+                JOIN ${this._parts.name} p ON p.data->>'obj' = obj._id
+                    AND p.data ? 'obj'
+                    AND (p.data->'deleted' IS NULL OR p.data->'deleted' = 'null'::jsonb)
+                    AND (p.data->'uncommitted' IS NULL OR p.data->'uncommitted' = 'null'::jsonb)
+                ORDER BY (p.data->>'start')::bigint ASC
+                LIMIT $3
+            )
+            SELECT
+                obj.data AS obj_data,
+                jsonb_agg(
+                    jsonb_build_object(
+                        'part', parts.data,
+                        'chunk', c.data,
+                        'blocks', (
+                            SELECT jsonb_agg(b.data)
+                            FROM ${this._blocks.name} b
+                            WHERE b.data->>'chunk' = c.data->>'_id'
+                                AND b.data ? 'chunk'
+                                AND (b.data->'deleted' IS NULL OR b.data->'deleted' = 'null'::jsonb)
+                        )
+                    )
+                    ORDER BY (parts.data->>'start')::bigint ASC
+                ) FILTER (WHERE parts.data IS NOT NULL) AS mapping
+            FROM obj
+            LEFT JOIN parts ON true
+            LEFT JOIN ${this._chunks.name} c ON c.data->>'_id' = parts.data->>'chunk'
+                AND (c.data->'deleted' IS NULL OR c.data->'deleted' = 'null'::jsonb)
+            GROUP BY obj._id, obj.data
+        `;
+        const values = [`${bucket_id}`, key, max_parts];
+        const res = await db_client.instance().executeSQL(query, values, {
+            preferred_pool: this._postgres_pool,
+            // fowmbk - find_object_with_mapping_by_key
+            query_name: config.DB_PREPARED_STATEMENTS_ENABLED ? `fowmbk${this._test_suffix}` : undefined,
+        });
+        if (!res.rows.length) return null;
+        const row = res.rows[0];
+        const obj = decode_json(object_md_schema, row.obj_data);
+        const { parts, chunks_db } = _parse_mapping(row.mapping, sorter);
+        return { obj, parts, chunks_db };
+    }
+
+    /**
      * @param {nb.ChunkSchemaDB[]} chunks
      * @param {?(a: any, b: any) => number} [sorter]
      * @return {Promise<void>}
      */
     async load_blocks_for_chunks(chunks, sorter) {
         if (!chunks || !chunks.length) return;
-        const blocks = await this._blocks.find({
-            chunk: { $in: db_client.instance().uniq_ids(chunks, '_id'), $exists: true },
-            deleted: null,
-        });
+        const chunk_ids = db_client.instance().uniq_ids(chunks, '_id').map(id => id.toString());
+
+        const query = `
+            SELECT d.*
+            FROM unnest($1::text[]) AS chunk_id,
+            LATERAL (
+                SELECT *
+                FROM ${this._blocks.name}
+                WHERE data->>'chunk' = chunk_id
+                  AND data ? 'chunk'
+                  AND (data->'deleted' IS NULL OR data->'deleted' = 'null'::jsonb)
+                OFFSET 0
+            ) d
+        `;
+        const res = await db_client.instance().executeSQL(query, [chunk_ids], { preferred_pool: this._postgres_pool });
+        const blocks = res.rows.map(row => decode_json(this._blocks.schema, row.data));
+
         const blocks_by_chunk = _.groupBy(blocks, 'chunk');
         for (const chunk of chunks) {
             const blocks_by_frag = _.groupBy(blocks_by_chunk[chunk._id.toHexString()], 'frag');
@@ -1733,8 +2487,8 @@ class MDStore {
 
     _aggregate_blocks_internal(query) {
         return this._blocks.mapReduce(
-                mongo_functions.map_aggregate_blocks,
-                mongo_functions.reduce_sum, {
+                aggregate_functions.map_aggregate_blocks,
+                aggregate_functions.reduce_sum, {
                     query: query,
                     out: {
                         inline: 1
@@ -1772,21 +2526,17 @@ class MDStore {
             });
     }
 
-    find_deleted_blocks(max_delete_time, limit) {
-        const query = {
-            deleted: {
-                $lt: new Date(max_delete_time),
-                $exists: true // Force index usage
-            },
-        };
-        return this._blocks.find(query, {
-                limit: Math.min(limit, 1000),
-                projection: {
-                    _id: 1,
-                    deleted: 1
-                }
-            })
-            .then(objects => db_client.instance().uniq_ids(objects, '_id'));
+    async find_deleted_blocks(max_delete_time, limit) {
+        const query_limit = limit || 1000;
+        const query = `SELECT *
+            FROM ${this._blocks.name}
+            WHERE to_ts(data->>'deleted') < to_ts($1)
+              AND data ? 'deleted'
+            LIMIT ${query_limit}`;
+        const result = await db_client.instance().executeSQL(query, [new Date(max_delete_time).toISOString()], {
+            preferred_pool: 'read_only',
+        });
+        return result.rows;
     }
 
     db_delete_blocks(block_ids) {
@@ -1807,9 +2557,316 @@ class MDStore {
     estimated_total_objects() {
         return this._objects.estimatedDocumentCount();
     }
+
+    get_unordered_bulk_op_on_objects() {
+        return this._objects.initializeUnorderedBulkOp();
+    }
+
+    async delete_objects_by_keys({ bucket_id, keys }) {
+        if (!keys || !keys.length) return [];
+        const now = new Date().toISOString();
+        const query = `
+        UPDATE ${this._objects.name}
+        SET data = jsonb_set(data, '{deleted}', to_jsonb($1::text), true)
+        WHERE
+            data->>'bucket' = $2
+            AND data->>'key' = ANY($3)
+            AND (data->'version_past' IS NULL OR data->'version_past' = 'null'::jsonb)
+            AND (data->'deleted' IS NULL OR data->'deleted' = 'null'::jsonb)
+            AND (data->'upload_started' IS NULL OR data->'upload_started' = 'null'::jsonb)
+        RETURNING *;`;
+        const params = [now, bucket_id, keys];
+        const result = await db_client.instance().executeSQL(query, params, { preferred_pool: this._postgres_pool });
+        return result.rows;
+    }
+
+    /*************************/
+    /**** S3 TRANSITION ******/
+    /*************************/
+
+    /**
+    * Find current object versions eligible for lifecycle transition.
+    *
+    * Uses Amazon S3 lifecycle transition timing semantics:
+    * * The object creation time is rounded up to the next midnight UTC
+    * * The resulting time is compared with the transition timestamp
+    *
+    * An object is eligible when:
+    * * Its rounded-up lifecycle transition time is before transition_ts
+    * * It is not deleted or reclaimed
+    * * It is not an incomplete multipart upload
+    * * It is the current version, not a noncurrent version
+    * * It is not a delete marker
+    * * It is not already being transitioned
+    *
+    * Supports keyset pagination via key_marker.
+    *
+    * @param {{
+    * bucket: {_id: nb.ID},
+    * transition_ts: number,
+    * batch_size?: number,
+    * key_marker?: string,
+    * is_date?: Boolean,
+    * }} params
+    * @returns {Promise<nb.ObjectMD[]>}
+    */
+
+    async find_objects_to_transition(params) {
+        const query_limit = params.batch_size || 100;
+        const bucket_id = String(params.bucket._id);
+        const is_date = params.is_date;
+
+        // return early if date not yet elapsed
+        if (is_date && params.transition_ts > (new Date().getTime() / 1000)) {
+            return [];
+        }
+        const values = [bucket_id];
+
+        // TODO: skipping every object with transition_info is enough for a single archive class.
+        // When more Transition targets are available this will not fit — select by current class
+        // and promote already-transitioned objects (e.g. GLACIER → DEEP_ARCHIVE) instead.
+        let query = `
+        SELECT *
+        FROM ${this._objects.name}
+        WHERE 
+            data->>'bucket' = $1
+            AND (data->'deleted' IS NULL OR data->'deleted' = 'null'::jsonb)
+            AND (data->'reclaimed' IS NULL OR data->'reclaimed' = 'null'::jsonb)
+            AND (data->'upload_started' IS NULL OR data->'upload_started' = 'null'::jsonb)
+            AND (data->'version_past' IS NULL OR data->'version_past' = 'null'::jsonb)
+            AND (data->'delete_marker' IS NULL OR data->'delete_marker' = 'null'::jsonb)
+            AND (data->'transition_info' IS NULL OR data->'transition_info' = 'null'::jsonb)`;
+
+        if (!is_date) {
+            /* 
+                Amazon S3 calculates the time by adding the number of days specified in the rule to the 
+                object creation time and rounding up the resulting time to the next day at midnight UTC 
+            */
+           const create_time_cutoff = moment.unix(params.transition_ts).toISOString();
+           values.push(create_time_cutoff);
+
+            query += `
+                AND (
+                    date_trunc('day', (data->>'create_time')::timestamptz AT TIME ZONE 'UTC') + interval '1 day'
+                ) AT TIME ZONE 'UTC' <= $${values.length}::timestamptz`;
+        }
+
+        let key_marker_condition = '';
+        if (params.key_marker) {
+            values.push(params.key_marker);
+            key_marker_condition = `AND data->>'key' > $${values.length}`;
+        }
+
+        // S3 lifecycle filter conditions (prefix, object size, tags) — all ANDed
+        const { conditions: filter_conditions, values: filter_values } =
+            build_lifecycle_filter_conditions(params, values.length + 1);
+        values.push(...filter_values);
+        const filter_sql = filter_conditions.length ?
+            'AND ' + filter_conditions.join(' AND ') : '';
+
+        values.push(query_limit);
+        query += `
+            ${key_marker_condition}
+            ${filter_sql}
+        ORDER BY data->>'key' ASC
+        LIMIT $${values.length};`;
+
+        const result = await db_client.instance().executeSQL(query, values, {
+            preferred_pool: 'read_only',
+        });
+        return result.rows.map(row => decode_json(this._objects.schema, row.data));
+    }
+
+    /**
+     * Find noncurrent object versions eligible for NoncurrentVersionTransition.
+     *
+     * Uses window functions to compute:
+     *  - successor_time: when this version became noncurrent (create_time of the next version)
+     *  - rn: rank among versions of the same key (1 = newest noncurrent, 2 = next, etc.)
+     *
+     * A version is eligible when BOTH conditions are met (AND logic per S3 spec):
+     *  - It has been noncurrent for >= noncurrent_days
+     *  - There are > newer_noncurrent_versions newer noncurrent versions of the same key
+     *    (if newer_noncurrent_versions is specified)
+     *
+     * Excludes deleted, reclaimed, currently-transitioning, and delete-marker objects.
+     * Supports keyset pagination via key_marker + version_seq_marker.
+     *
+     * @param {{
+     *   bucket_id: nb.ID,
+     *   noncurrent_days: number,
+     *   newer_noncurrent_versions?: number,
+     *   prefix?: string,
+     *   size_less?: number,
+     *   size_greater?: number,
+     *   tags?: Array<{key: string, value: string}>,
+     *   batch_size: number,
+     *   key_marker?: string,
+     *   version_seq_marker?: number,
+     * }} params
+     * @returns {Promise<nb.ObjectMD[]>}
+     */
+    async find_versioned_objects_to_transition({
+        bucket_id,
+        noncurrent_days,
+        newer_noncurrent_versions,
+        prefix,
+        size_less,
+        size_greater,
+        tags,
+        batch_size,
+        key_marker,
+        version_seq_marker,
+    }) {
+        const table_name = this._objects.name;
+        const query_limit = batch_size || 100;
+
+        if (noncurrent_days === undefined) throw new Error('noncurrent_days is required');
+
+        const values = [String(bucket_id)];
+
+        // --- CTE base filters (applied before window functions) ---
+        const base_conditions = [
+            `data->>'bucket' = $${values.length}`,
+            `(data->'deleted' IS NULL OR data->'deleted' = 'null'::jsonb)`,
+            `(data->'upload_started' IS NULL OR data->'upload_started' = 'null'::jsonb)`,
+            `(data->'reclaimed' IS NULL OR data->'reclaimed' = 'null'::jsonb)`,
+            `(data->'delete_marker' IS NULL OR data->'delete_marker' = 'null'::jsonb)`,
+        ];
+
+        // Prefix filter goes in base_conditions — all versions of a key share the
+        // same key, so filtering early is efficient.
+        if (prefix) {
+            const escaped = prefix.replace(/%/g, '\\%').replace(/_/g, '\\_');
+            values.push(escaped + '%');
+            base_conditions.push(`data->>'key' LIKE $${values.length}`);
+        }
+
+        // --- Ranked result filters (applied after window functions) ---
+        values.push(noncurrent_days);
+        const noncurrent_days_idx = values.length;
+        const ranked_conditions = [
+            // A noncurrent version becomes eligible after the configured number
+            // of UTC calendar days from the day it became noncurrent.
+            `(
+                successor_time IS NOT NULL
+                AND CURRENT_TIMESTAMP >= (
+                    date_trunc('day', successor_time AT TIME ZONE 'UTC')
+                    + interval '1 day'
+                    + interval '1 day' * $${noncurrent_days_idx}
+                ) AT TIME ZONE 'UTC'
+            )`,
+            // TODO: skipping all transition_info will not fit when more Transition targets exist;
+            // promote already-transitioned noncurrent versions (e.g. GLACIER → DEEP_ARCHIVE) then.
+            `(transition_info IS NULL OR transition_info = 'null'::jsonb)`,
+        ];
+
+        // Size and tag filters go in ranked_conditions — different versions of the
+        // same key can have different sizes/tags. Filtering in base_conditions would
+        // corrupt ROW_NUMBER() and LEAD() calculations.
+        if (size_greater !== undefined && size_greater !== null) {
+            values.push(Number(size_greater));
+            ranked_conditions.push(`size > $${values.length}`);
+        }
+        if (size_less !== undefined && size_less !== null) {
+            values.push(Number(size_less));
+            ranked_conditions.push(`size < $${values.length}`);
+        }
+        if (tags && tags.length) {
+            values.push(JSON.stringify(tags));
+            ranked_conditions.push(`tags @> $${values.length}::jsonb`);
+        }
+
+        // NewerNoncurrentVersions: rn=1 is the newest noncurrent version, rn=2 is next, etc.
+        // Only transition versions ranked beyond the retention count.
+        if (newer_noncurrent_versions) {
+            values.push(newer_noncurrent_versions + 1);
+            ranked_conditions.push(`(rn > $${values.length})`);
+        }
+
+        // Composite keyset pagination on (key, version_seq).
+        // Results are ordered by key ASC, version_seq DESC, so for the same key
+        // we resume from versions with a lower version_seq than the marker.
+        if (key_marker && version_seq_marker) {
+            values.push(key_marker);
+            const key_idx = values.length;
+            values.push(version_seq_marker);
+            const seq_idx = values.length;
+            ranked_conditions.push(
+                `((key = $${key_idx} AND version_seq < $${seq_idx}) OR key > $${key_idx})`
+            );
+        } else if (key_marker) {
+            values.push(key_marker);
+            ranked_conditions.push(`key > $${values.length}`);
+        }
+
+        values.push(query_limit);
+        const query = `
+            WITH ranked AS (
+                SELECT
+                    _id,
+                    data->>'key' AS key,
+                    (data->>'version_seq')::BIGINT AS version_seq,
+                    (data->>'size')::BIGINT AS size,
+                    data->'tagging' AS tags,
+                    data->'transition_info' AS transition_info,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY data->>'key'
+                        ORDER BY (data->>'version_seq')::BIGINT DESC
+                    ) AS rn,
+                    LEAD((data->>'create_time')::timestamptz) OVER (
+                        PARTITION BY data->>'key'
+                        ORDER BY (data->>'version_seq')::BIGINT
+                    ) AS successor_time
+                FROM ${table_name}
+                WHERE
+                    ${sql_and_conditions(...base_conditions)}
+            )
+            SELECT t.*
+            FROM ${table_name} t
+            INNER JOIN ranked ON ranked._id = t._id
+            WHERE
+                ${sql_and_conditions(...ranked_conditions)}
+            ORDER BY ranked.key ASC, ranked.version_seq DESC
+            LIMIT $${values.length};`;
+
+        dbg.log1('[find_versioned_objects_to_transition] generated query:', query, 'values:', values);
+        const result = await db_client.instance().executeSQL(query, values, {
+            preferred_pool: 'read_only',
+        });
+        return result.rows.map(row => decode_json(this._objects.schema, row.data));
+    }
 }
 
 MDStore._instance = undefined;
+
+/**
+ * Parse the mapping array returned by the jsonb_agg queries.
+ * Each entry contains one part with its chunk and a pre-aggregated blocks array.
+ * Attaches decoded blocks to their respective frags, applying the optional sorter.
+ *
+ * @param {Object[]|null} mapping
+ * @param {(a: any, b: any) => number} [sorter]
+ * @returns {{ parts: nb.PartSchemaDB[], chunks_db: nb.ChunkSchemaDB[] }}
+ */
+function _parse_mapping(mapping, sorter) {
+    const parts = [];
+    const chunks_db = [];
+    for (const entry of mapping || []) {
+        const part = decode_json(object_part_schema, entry.part);
+        const chunk = decode_json(data_chunk_schema, entry.chunk);
+        const blocks = (entry.blocks || []).map(b => decode_json(data_block_schema, b));
+        const blocks_by_frag = _.groupBy(blocks, b => b.frag.toHexString());
+        for (const frag of chunk.frags) {
+            let frag_blocks = blocks_by_frag[frag._id.toHexString()] || [];
+            if (sorter) frag_blocks = frag_blocks.sort(sorter);
+            frag.blocks = frag_blocks;
+        }
+        parts.push(part);
+        chunks_db.push(chunk);
+    }
+    return { parts, chunks_db };
+}
 
 function compact(obj) {
     return _.omitBy(obj, _.isUndefined);

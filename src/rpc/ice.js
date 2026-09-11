@@ -1,11 +1,12 @@
 /* Copyright (C) 2016 NooBaa */
-/* eslint max-lines: ['error', 1550] */
+/* eslint max-lines: ['error', 1650] */
 'use strict';
 
 module.exports = Ice;
 
 const _ = require('lodash');
 const P = require('../util/promise');
+const Defer = require('../util/defer');
 const os = require('os');
 const net = require('net');
 const tls = require('tls');
@@ -13,12 +14,12 @@ const util = require('util');
 const crypto = require('crypto');
 const chance = require('chance')();
 const events = require('events');
-const ip_module = require('ip');
 
 const dbg = require('../util/debug_module')(__filename);
 const stun = require('./stun');
 const config = require('../../config');
 const js_utils = require('../util/js_utils');
+const net_utils = require('../util/net_utils');
 const url_utils = require('../util/url_utils');
 const FrameStream = require('../util/frame_stream');
 const buffer_utils = require('../util/buffer_utils');
@@ -144,7 +145,7 @@ function Ice(connid, n2n_config, signal_target) {
             n.ifcname = name;
             self.networks.push(n);
             // for the nodes internal ip - add public_ips as another network interface. take same parameters as internal ip
-            if (n.address === ip_module.address() &&
+            if (n.address === net_utils.get_local_address() &&
                 self.config.public_ips.length) {
                 self.config.public_ips.forEach(ip => {
                     if (ip === n.address) return;
@@ -450,7 +451,7 @@ Ice.prototype._add_tcp_transient_passive_candidates = function() {
                     conn.destroy();
                     return;
                 }
-                dbg.log3('ICE TCP ACCEPTED CONNECTION', conn.remoteAddress + ':' + conn.remotePort);
+                dbg.log3('ICE TCP ACCEPTED CONNECTION', get_connection_remote_address(conn) + ':' + conn.remotePort);
                 self._init_tcp_connection(conn);
             });
 
@@ -764,9 +765,9 @@ Ice.prototype._init_tcp_connection = function(conn, session) {
 function init_tcp_connection(conn, session, ice, ice_lookup) {
     const info = {
         family: conn.remoteFamily,
-        address: conn.remoteAddress,
+        address: get_connection_remote_address(conn),
         port: conn.remotePort,
-        key: make_candidate_key('tcp', conn.remoteFamily, conn.remoteAddress, conn.remotePort),
+        key: make_candidate_key('tcp', conn.remoteFamily, get_connection_remote_address(conn), conn.remotePort),
         tcp: conn,
         transport: 'tcp',
         session: session,
@@ -1308,12 +1309,19 @@ Ice.prototype.close = function() {
 
 
 function IceCandidate(cand) {
+    const is_private_no_throw = address => {
+        try {
+            return net_utils.is_private(address);
+        } catch (err) {
+            return false;
+        }
+    };
     // the key is used finding duplicates or locating the candidate
     // on successful connect check, so is crucial to identify exactly
     // the needed properties, not less, and no more.
     cand.key = make_candidate_key(cand.transport, cand.family, cand.address, cand.port);
     cand.priority =
-        (ip_module.isPrivate(cand.address) ? 1000 : 0) +
+        (is_private_no_throw(cand.address) ? 1000 : 0) +
         (cand.transport === 'tcp' ? 100 : 0) +
         // (cand.family === 'IPv4' ? 10 : 0) +
         (cand.tcp_type === CAND_TCP_TYPE_SO ? 0 : 1);
@@ -1334,7 +1342,7 @@ function IceSession(local, remote, packet, udp) {
     self.state = 'init';
     js_utils.self_bind(self, 'run_udp_request_loop');
     js_utils.self_bind(self, 'run_udp_indication_loop');
-    self.defer = new P.Defer();
+    self.defer = new Defer();
     self.defer.promise.catch(_.noop); // to ignore 'Unhandled rejection' printouts
     // set session timeout
     self.ready_timeout = setTimeout(function() {
@@ -1536,4 +1544,11 @@ function allocate_port_in_range(port_range) {
             server.close();
             return port;
         });
+}
+
+
+// get remote address from the connection and remove the link-local suffix (e.g.: %eth0)
+function get_connection_remote_address(conn) {
+    const ip = conn.remoteAddress;
+    return ip.split('%')[0];
 }

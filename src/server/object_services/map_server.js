@@ -85,13 +85,15 @@ class GetMapping {
         if (!config.DEDUP_ENABLED) return;
         await Promise.all(Object.values(this.chunks_per_bucket).map(async chunks => {
             const bucket = chunks[0].bucket;
-            const dedup_keys = _.compact(_.map(chunks,
-                chunk => chunk.digest_b64 && Buffer.from(chunk.digest_b64, 'base64')));
+            const dedup_keys = chunks.map(chunk => chunk.digest_b64).filter(Boolean);
+
             if (!dedup_keys.length) return;
             dbg.log0('GetMapping.find_dups: found keys', dedup_keys.length);
             const dup_chunks_db = await MDStore.instance().find_chunks_by_dedup_key(bucket, dedup_keys);
+            if (dup_chunks_db.length === 0) return;
             const dup_chunks = dup_chunks_db.map(chunk_db => new ChunkDB(chunk_db));
-            dbg.log0('GetMapping.find_dups: dup_chunks', dup_chunks);
+            dbg.log0('GetMapping.find_dups: dup_chunk ids', dup_chunks.slice(0, 10).map(chunk => chunk._id.toString()),
+                dup_chunks.length > 10 ? `... truncated list. total dup_chunks.length=${dup_chunks.length}` : '');
             await _prepare_chunks_group({ chunks: dup_chunks, location_info: this.location_info });
             for (const dup_chunk of dup_chunks) {
                 if (mapper.is_chunk_good_for_dedup(dup_chunk)) {
@@ -236,11 +238,13 @@ class PutMapping {
     /**
      * @param {Object} props
      * @param {nb.Chunk[]} props.chunks
-     * @param {nb.Tier} props.move_to_tier
+     * @param {nb.Tier} [props.move_to_tier]
+     * @param {Object} [props.deferred_object_md]
      */
     constructor(props) {
         this.chunks = props.chunks;
         this.move_to_tier = props.move_to_tier;
+        this.deferred_object_md = props.deferred_object_md;
 
         /** @type {nb.BlockSchemaDB[]} */
         this.new_blocks = [];
@@ -359,16 +363,16 @@ class PutMapping {
     }
 
     async update_db() {
-        await Promise.all([
-            MDStore.instance().insert_blocks(this.new_blocks),
-            MDStore.instance().insert_chunks(this.new_chunks),
-            MDStore.instance().insert_parts(this.new_parts),
-            map_deleter.delete_blocks(this.delete_blocks),
-
-            // TODO
-            // (upload_size > obj.upload_size) && MDStore.instance().update_object_by_id(obj._id, { upload_size: upload_size })
-
-        ]);
+        // Single CTE transaction for chunks/parts/blocks (+ optional deferred object insert on first large batch).
+        await MDStore.instance().insert_mappings_in_transaction({
+            object_md: this.deferred_object_md,
+            chunks: this.new_chunks,
+            parts: this.new_parts,
+            blocks: this.new_blocks,
+        });
+        if (this.delete_blocks.length) {
+            await map_deleter.delete_blocks(this.delete_blocks);
+        }
     }
 
 }
@@ -611,8 +615,7 @@ async function prepare_blocks(blocks) {
     const system_id = blocks[0].system._id;
     const { nodes } = await nodes_client.instance().list_nodes_by_identity(
         system_id,
-        node_ids.map(id => ({ id: id.toHexString() })),
-        nodes_client.NODE_FIELDS_FOR_MAP
+        node_ids.map(id => ({ id: id.toHexString() }))
     );
     const nodes_by_id = _.keyBy(nodes, '_id');
     for (const block of blocks) {
@@ -626,19 +629,34 @@ async function prepare_blocks(blocks) {
 /**
  *
  * @param {nb.BlockSchemaDB[]} blocks
+ * @param {boolean} include_empty_blocks - include blocks with no valid chunks in return
  * @return {Promise<nb.Block[]>}
  */
-async function prepare_blocks_from_db(blocks) {
-    const chunk_ids = blocks.map(block => block.chunk);
+async function prepare_blocks_from_db(blocks, include_empty_blocks) {
+    const chunk_ids = blocks.map(block => block.chunk).filter(Boolean);
     const chunks = await MDStore.instance().find_chunks_by_ids(chunk_ids);
     const chunks_by_id = _.keyBy(chunks, '_id');
-    const db_blocks = blocks.map(block => {
-        const chunk_db = new ChunkDB(chunks_by_id[block.chunk.toHexString()]);
-        const frag_db = _.find(chunk_db.frags, frag =>
-            frag._id.toHexString() === block.frag.toHexString());
+    const db_blocks = _.compact(blocks.map(block => {
+        let valid_block = true;
+        if (!block.chunk || !chunks_by_id[block.chunk.toHexString()]) {
+            valid_block = false;
+        }
+
+        if (!include_empty_blocks && !valid_block) {
+            dbg.error('skipping invalid block with no matching chunk', block);
+            return null;
+        }
+
+        let chunk_db;
+        let frag_db;
+        if (valid_block) {
+            chunk_db = new ChunkDB(chunks_by_id[block.chunk.toHexString()]);
+            frag_db = _.find(chunk_db.frags, frag =>
+                frag._id.toHexString() === block.frag.toHexString());
+        }
         const block_db = new BlockDB(block, frag_db, chunk_db);
         return block_db;
-    });
+    }));
     await prepare_blocks(db_blocks);
     return db_blocks;
 }

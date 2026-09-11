@@ -7,33 +7,38 @@ const crypto = require('crypto');
 const P = require('../util/promise');
 const api = require('../api');
 const dbg = require('../util/debug_module')(__filename);
-const system_store = require('../server/system_services/system_store').get_instance();
+const system_store = require('../server/system_services/system_store').get_instance({ standalone: true });
 const node_allocator = require('../server/node_services/node_allocator');
 const db_client = require('../util/db_client');
+const { make_auth_token } = require('../server/common_services/auth_server');
 
 const rpc = api.new_rpc();
 const client = rpc.new_client();
 
-argv.email = argv.email || 'demo@noobaa.com';
+argv.email = argv.email || 'admin@noobaa.io';
 argv.password = argv.password || 'DeMo1';
-argv.system = argv.system || 'demo';
+argv.system = argv.system || 'noobaa';
 argv.bucket = argv.bucket || 'first.bucket';
 argv.count = argv.count || 100;
 argv.chunks = argv.chunks || 128;
 argv.chunk_size = argv.chunk_size || 1024 * 1024;
 argv.concur = argv.concur || 20;
 argv.key = argv.key || ('md_blow-' + Date.now().toString(36));
+argv.pool = argv.pool || 'noobaa-default-backing-store';
 
 main();
 
 async function main() {
     try {
+        const mkm = system_store.master_key_manager;
+        await mkm.load_root_keys_from_mount();
         await system_store.load();
-        await client.create_auth_token({
+        const auth_params = {
             email: argv.email,
-            password: argv.password,
+            role: 'admin',
             system: argv.system,
-        });
+        };
+        client.options.auth_token = make_auth_token(auth_params);
         await blow_objects();
         process.exit(0);
     } catch (err) {
@@ -79,7 +84,7 @@ async function blow_parts(params) {
         const [record] = bucket.tiering.tiers;
         const tier = await client.tier.read_tier({ name: record.tier });
         const tier_db = _.find(system_store.data.tiers, t => (t.name.unwrap() === tier.name.unwrap()));
-        const pool_db = system_store.data.pools[0];
+        const pool_db = _.find(system_store.data.pools, p => (p.name === argv.pool));
         await node_allocator.refresh_pool_alloc(pool_db);
         const node = node_allocator.allocate_node({
             pools: [pool_db]

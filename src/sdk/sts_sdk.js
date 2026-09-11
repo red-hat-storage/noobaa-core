@@ -5,29 +5,38 @@ const cloud_utils = require('../util/cloud_utils');
 const dbg = require('../util/debug_module')(__filename);
 const { RpcError } = require('../rpc');
 const signature_utils = require('../util/signature_utils');
-const { account_cache } = require('./object_sdk');
+const { account_cache, dn_cache } = require('./object_sdk');
 const BucketSpaceNB = require('./bucketspace_nb');
+const jwt = require('jsonwebtoken');
+const { resolve_iam_role_by_arn } = require('../endpoint/iam/iam_utils');
+const ldap_client = require('../util/ldap_client');
+const keycloak_client = require('../util/keycloak_client');
+const { get_tags_claim } = require('../util/access_policy_utils');
 
 class StsSDK {
 
-    constructor(rpc_client, internal_rpc_client, bucketspace) {
+    /**
+     * @param {nb.AccountSpace} [accountspace] - NC only (AccountSpaceFS). Unused in containerized.
+     */
+    constructor(rpc_client, internal_rpc_client, bucketspace, accountspace) {
         this.rpc_client = rpc_client;
         this.internal_rpc_client = internal_rpc_client;
         this.requesting_account = undefined;
         this.auth_token = undefined;
         this.bucketspace = bucketspace || new BucketSpaceNB({ rpc_client, internal_rpc_client });
+        this.accountspace = accountspace;
     }
 
     set_auth_token(auth_token) {
         this.auth_token = auth_token;
-        this.rpc_client.options.auth_token = auth_token;
+        if (this.rpc_client) this.rpc_client.options.auth_token = auth_token;
     }
 
     get_auth_token() {
         return this.auth_token;
     }
 
-     /**
+    /**
      * @returns {nb.BucketSpace}
      */
     _get_bucketspace() {
@@ -42,45 +51,214 @@ class StsSDK {
                 bucketspace: this._get_bucketspace(),
                 access_key: token.access_key,
             });
+            if (this.requesting_account?.nsfs_account_config?.distinguished_name) {
+                const distinguished_name = this.requesting_account.nsfs_account_config.distinguished_name.unwrap();
+                const user = await dn_cache.get_with_cache({
+                    bucketspace: this._get_bucketspace(),
+                    distinguished_name,
+                });
+                this.requesting_account.nsfs_account_config.uid = user.uid;
+                this.requesting_account.nsfs_account_config.gid = user.gid;
+            }
         } catch (error) {
-            dbg.error('authorize_request_account error:', error);
+            dbg.error('load_requesting_account error:', error);
             if (error.rpc_code === 'NO_SUCH_ACCOUNT') {
                 throw new RpcError('INVALID_ACCESS_KEY_ID', `Account with access_key not found`);
+            }
+            if (error.rpc_code === 'NO_SUCH_USER') {
+                throw new RpcError('UNAUTHORIZED', `Distinguished name associated with access_key not found`);
             }
             throw error;
         }
     }
 
-    async get_assumed_role(req) {
-        dbg.log1('sts_sdk.get_assumed_role body', req.body);
-        // arn:aws:sts::access_key:role/role_name
-        const role_name_idx = req.body.role_arn.lastIndexOf('/') + 1;
-        const role_name = req.body.role_arn.slice(role_name_idx);
-        const access_key = req.body.role_arn.split(':')[4];
-
-        const account = await account_cache.get_with_cache({
-            bucketspace: this._get_bucketspace(),
-            access_key: access_key,
-        });
-        if (!account) {
-            throw new RpcError('NO_SUCH_ACCOUNT', 'No such account with access_key: ' + access_key);
+    /**
+     * _assume_role resolves a role from the correct backend based on deployment mode.
+     * @param {string} role_arn  arn:aws:iam::<account_id>:role/<role_name>
+     * @returns {Promise<Object>}
+     */
+    async _assume_role(role_arn) {
+        const resolved_role = await resolve_iam_role_by_arn(role_arn, this._get_bucketspace());
+        const iam_role = resolved_role.iam_role;
+        if (!iam_role || resolved_role.error) {
+            throw new RpcError('NO_SUCH_ROLE',
+                `No such Role found with name: ${resolved_role.role_name || 'unknown'} and account id : ${resolved_role.account_id || 'unknown'}`);
         }
-        if (!account.role_config || account.role_config.role_name !== role_name) {
-            throw new RpcError('NO_SUCH_ROLE', `Role not found`);
-        }
-        dbg.log0('sts_sdk.get_assumed_role res', account,
-            'account.role_config: ', account.role_config);
-
+        dbg.log1('sts_sdk._assume_role:', 'iam_role:', iam_role.role_name);
         return {
-            access_key,
-            role_config: account.role_config
+            ...iam_role,
+            role_name: iam_role.role_name,
+            account_id: String(resolved_role.account_id),
+            access_key: iam_role.owner_access_key.unwrap(),
+            assume_role_policy: iam_role.assume_role_policy_document
         };
     }
 
+    async get_assumed_role(req) {
+        dbg.log1('sts_sdk.get_assumed_role body', req.body);
+        const role_config = await this._assume_role(req.body.role_arn);
+
+        return {
+            account_id: role_config.account_id,
+            access_key: role_config.access_key,
+            role_config,
+        };
+    }
+
+    async authenticate_web_identity(req) {
+        dbg.log1('sts_sdk.get_assumed_ldap_user body', req.body);
+        let web_token;
+        const jwt_secret = ldap_client.instance().ldap_params?.jwt_secret;
+        if (jwt_secret) {
+            try {
+                web_token = jwt.verify(req.body.web_identity_token, jwt_secret);
+            } catch (err) {
+                dbg.error('get_assumed_ldap_user error: JWT token verification failed', err);
+                if (err.message.includes('TokenExpiredError')) {
+                    throw new RpcError('EXPIRED_WEB_IDENTITY_TOKEN', err.message);
+                } else {
+                    throw new RpcError('INVALID_WEB_IDENTITY_TOKEN', err.message);
+                }
+            }
+        } else {
+            dbg.warn('get_assumed_ldap_user: No LDAP JWT secret found, failing back to decoding');
+            web_token = jwt.decode(req.body.web_identity_token);
+            if (!web_token) throw new RpcError('INVALID_WEB_IDENTITY_TOKEN', 'jwt malformed');
+        }
+        if (!web_token.user) {
+            throw new RpcError('INVALID_WEB_IDENTITY_TOKEN', 'Missing a required claim: user');
+        }
+        if (!web_token.password) {
+            throw new RpcError('INVALID_WEB_IDENTITY_TOKEN', 'Missing a required claim: password');
+        }
+
+        // TODO: we should see if we can move to the authentication phase
+        const ldap_user = web_token.user;
+        const ldap_password = web_token.password;
+        if (!(await ldap_client.is_ldap_configured()) || !ldap_client.instance().is_connected()) {
+            throw new RpcError('ACCESS_DENIED', 'LDAP is not configured or not connected');
+        }
+        let ldap_auth_result = {};
+        try {
+            ldap_auth_result = await ldap_client.instance().authenticate(ldap_user, ldap_password);
+        } catch (err) {
+            dbg.error('get_assumed_ldap_user error:', err);
+            throw new RpcError('ACCESS_DENIED', 'issue with LDAP authentication');
+        }
+
+        return ldap_auth_result;
+    }
+
+    /**
+     * Get assumed LDAP user
+     * @param {Object} req - Request object
+     */
+    async get_assumed_ldap_user(req) {
+        const ldap_auth_result = this.identity_info || await this.authenticate_web_identity(req);
+        const role_config = await this._assume_role(req.body.role_arn);
+        dbg.log0('sts_sdk.get_assumed_role_with_web_identity res', 'account.role_config: ', role_config);
+        return {
+            access_key: role_config.access_key,
+            account_id: role_config.account_id,
+            role_config,
+            dn: ldap_auth_result.dn,
+        };
+    }
+
+    /**
+     * Get assumed role for OIDC/Keycloak user
+     * Validates JWT token using introspection with client_id, client_secret, and access_token
+     * @param {Object} req - Request object
+     * @returns {Promise<Object>} - Assumed role info with session tags
+     */
+    async get_assumed_oidc_user(req) {
+        dbg.log1('sts_sdk.get_assumed_oidc_user body', req.body.role_arn);
+
+        try {
+            // Initialize OIDC client if not already done
+            const keycloak_instance = keycloak_client.get_instance();
+            if (!keycloak_instance.initialized) {
+                await keycloak_instance.initialize();
+            }
+            // JWT token decoded and check token issuer is in provider list
+            const decoded_token = await keycloak_instance.verify_token(req.body.web_identity_token);
+
+            // Introspect token with Keycloak using client_id, client_secret, and access_token
+            // This is the key implementation for Keycloak - validates token is active and not revoked
+            const introspection_resp = await keycloak_instance.introspect_token(
+                req.body.web_identity_token
+            );
+
+            // Extract session tags from decoded token.
+            const session_tags = get_tags_claim(decoded_token);
+
+            // Assume role
+            const role_config = await this._assume_role(req.body.role_arn);
+            dbg.log1('sts_sdk.get_assumed_oidc_user _assume_role res',
+                'account.role_config:', role_config);
+
+            return {
+                access_key: role_config.access_key,
+                account_id: role_config.account_id,
+                role_config,
+                sub: introspection_resp.sub,
+                aud: introspection_resp.client_id || introspection_resp.aud,
+                iss: introspection_resp.iss,
+                session_tags,
+                // Store additional claims for audit
+                email: introspection_resp.email,
+                name: introspection_resp.name,
+            };
+        } catch (err) {
+            dbg.error('get_assumed_oidc_user error :', err, err.rpc_code);
+            if (err.rpc_code === 'EXPIRED_WEB_IDENTITY_TOKEN' || err.rpc_code === 'INVALID_WEB_IDENTITY_TOKEN') {
+                throw err;
+            }
+            throw new RpcError('ACCESS_DENIED', 'Not authorized to perform sts:AssumeRoleWithWebIdentity');
+        }
+    }
+
+    /**
+     * Unified method to get assumed user (LDAP or OIDC/Keycloak)
+     * Detects token type and routes to appropriate handler
+     * @param {Object} req - Request object
+     * @returns {Promise<Object>} - Assumed role info
+     */
+    async get_assumed_web_identity_role(req) {
+        const decoded = jwt.decode(req.body.web_identity_token, { json: true });
+        if (!decoded) {
+            throw new RpcError('INVALID_WEB_IDENTITY_TOKEN', 'jwt malformed');
+        }
+        // Check if OIDC is configured and token is from OIDC provider
+        if (await keycloak_client.is_keycloak_configured()) {
+            const keycloak_instance = keycloak_client.get_instance();
+            const provider = keycloak_instance.get_provider(decoded.iss);
+            if (provider) {
+                dbg.log1('Routing to KeyCloak handler for issuer:', decoded.iss);
+                return await this.get_assumed_oidc_user(req);
+            } else {
+                dbg.log0('Routing to Web Identity handler missing', decoded.iss);
+            }
+        }
+
+        // Fall back to LDAP Web Identity handler
+        dbg.log0('Routing to LDAP handler');
+        return await this.get_assumed_ldap_user(req);
+    }
+
+    /**
+     * Generates a temporary access key for the requesting account
+     * @returns {Object} - Access token and secret object
+     */
     generate_temp_access_keys() {
         return cloud_utils.generate_access_keys();
     }
 
+    /**
+     * Authorizes request account
+     * @param {Object} req - Request object
+     * @throws {RpcError} - If the request is not signed or the requesting account is not authorized
+     */
     authorize_request_account(req) {
         const token = this.get_auth_token();
         // If the request is signed (authenticated)
@@ -88,7 +266,11 @@ class StsSDK {
             signature_utils.authorize_request_account_by_token(token, this.requesting_account);
             return;
         }
-        throw new RpcError('UNAUTHORIZED', `No permission to access bucket`);
+        // assume role with web identity is Anonymous
+        if (req.op_name === 'post_assume_role_with_web_identity') {
+            return;
+        }
+        throw new RpcError('UNAUTHORIZED', `No permission to sts ops`);
     }
 }
 

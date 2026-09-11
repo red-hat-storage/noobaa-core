@@ -7,7 +7,6 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const assert = require('assert');
-const ip_module = require('ip');
 const os = require('os');
 const util = require('util');
 
@@ -17,7 +16,6 @@ const pkg = require('../../package.json');
 const DebugLogger = require('../util/debug_module');
 const diag = require('./agent_diagnostics');
 const config = require('../../config');
-const FuncNode = require('./func_services/func_node');
 const os_utils = require('../util/os_utils');
 const js_utils = require('../util/js_utils');
 const net_utils = require('../util/net_utils');
@@ -26,10 +24,10 @@ const ssl_utils = require('../util/ssl_utils');
 const time_utils = require('../util/time_utils');
 const json_utils = require('../util/json_utils');
 const cloud_utils = require('../util/cloud_utils');
+const COMMON_CONSTANTS = require('../common/constants');
 const BlockStoreFs = require('./block_store_services/block_store_fs').BlockStoreFs;
 const BlockStoreS3 = require('./block_store_services/block_store_s3').BlockStoreS3;
 const BlockStoreGoogle = require('./block_store_services/block_store_google').BlockStoreGoogle;
-const BlockStoreMongo = require('./block_store_services/block_store_mongo').BlockStoreMongo;
 const BlockStoreMem = require('./block_store_services/block_store_mem').BlockStoreMem;
 const BlockStoreAzure = require('./block_store_services/block_store_azure').BlockStoreAzure;
 
@@ -113,9 +111,10 @@ class Agent {
                     params.cloud_info.endpoint_type === 'S3_COMPATIBLE' ||
                     params.cloud_info.endpoint_type === 'FLASHBLADE' ||
                     params.cloud_info.endpoint_type === 'IBM_COS') {
-                    this.node_type = 'BLOCK_STORE_S3';
+                    this.node_type = COMMON_CONSTANTS.STORE_TYPE.S3;
                     this.block_store = new BlockStoreS3(block_store_options);
-                } else if (params.cloud_info.endpoint_type === 'AZURE') {
+                } else if (params.cloud_info.endpoint_type === 'AZURE' ||
+                    params.cloud_info.endpoint_type === 'AZURESTS') {
                     const connection_string = cloud_utils.get_azure_new_connection_string({
                         endpoint: params.cloud_info.endpoint,
                         access_key: params.cloud_info.access_keys.access_key,
@@ -127,17 +126,17 @@ class Agent {
                     };
                     this.node_type = 'BLOCK_STORE_AZURE';
                     this.block_store = new BlockStoreAzure(block_store_options);
-                } else if (params.cloud_info.endpoint_type === 'GOOGLE') {
+                } else if (params.cloud_info.endpoint_type === 'GOOGLE' ||
+                    params.cloud_info.endpoint_type === 'GOOGLE_STS') {
                     this.node_type = 'BLOCK_STORE_GOOGLE';
-                    const { project_id, private_key, client_email } = JSON.parse(params.cloud_info.access_keys.secret_key.unwrap());
-                    block_store_options.cloud_info.google = { project_id, private_key, client_email };
+                    block_store_options.cloud_info.google = cloud_utils.build_google_cloud_info(
+                        params.cloud_info.endpoint_type,
+                        params.cloud_info.access_keys.secret_key.unwrap()
+                    );
                     this.block_store = new BlockStoreGoogle(block_store_options);
                 }
             } else if (params.mongo_info) {
-                this.mongo_info = params.mongo_info;
-                block_store_options.mongo_path = params.mongo_path;
-                this.node_type = 'BLOCK_STORE_MONGO';
-                this.block_store = new BlockStoreMongo(block_store_options);
+                throw new Error('MongoDB block store is no longer supported');
             } else {
                 block_store_options.root_path = this.storage_path;
                 this.node_type = 'BLOCK_STORE_FS';
@@ -150,11 +149,6 @@ class Agent {
             this.block_store = new BlockStoreMem(block_store_options);
         }
 
-        this.func_node = new FuncNode({
-            rpc_client: this.client,
-            storage_path: this.storage_path,
-        });
-
         // AGENT API methods - bind to self
         // (rpc registration requires bound functions)
         js_utils.self_bind(this, [
@@ -164,15 +158,11 @@ class Agent {
             'update_create_node_token',
             'update_rpc_config',
             'n2n_signal',
-            'test_store_perf',
             'test_store_validity',
             'test_network_perf',
             'test_network_perf_to_peer',
             'collect_diagnostics',
             'set_debug_node',
-            'decommission',
-            'recommission',
-            'uninstall',
             'update_node_service'
         ]);
 
@@ -191,12 +181,6 @@ class Agent {
                 }
             );
         }
-        this.rpc.register_service(
-            this.rpc.schema.func_node_api,
-            this.func_node, {
-                middleware: [req => this._authenticate_agent_api(req)]
-            }
-        );
 
         // register rpc n2n
         this.n2n_agent = this.rpc.register_n2n_agent((...args) => this.client.node.n2n_signal(...args));
@@ -260,9 +244,18 @@ class Agent {
         this.block_store.cleanup_target_path();
     }
 
-    async update_credentials(access_keys) {
+    async update_hosted_agents(agent_params) {
         if (!this.cloud_info) return;
-        this.cloud_info.access_keys = access_keys;
+
+        if (agent_params.access_keys) {
+            this.cloud_info.access_keys = agent_params.access_keys;
+        }
+
+        if (this.node_type === COMMON_CONSTANTS.STORE_TYPE.S3 && agent_params.endpoint) {
+            this.cloud_info.endpoint = agent_params.endpoint;
+            this.cloud_info.endpoint_type = agent_params.endpoint_type;
+        }
+
         const block_store_options = {
             node_name: this.node_name,
             rpc_client: this.client,
@@ -272,7 +265,7 @@ class Agent {
             cloud_path: this.cloud_path,
         };
 
-        if (this.node_type === 'BLOCK_STORE_S3') {
+        if (this.node_type === COMMON_CONSTANTS.STORE_TYPE.S3) {
             this.block_store = new BlockStoreS3(block_store_options);
         } else if (this.node_type === 'BLOCK_STORE_AZURE') {
             const connection_string = cloud_utils.get_azure_new_connection_string({
@@ -286,8 +279,10 @@ class Agent {
             };
             this.block_store = new BlockStoreAzure(block_store_options);
         } else if (this.node_type === 'BLOCK_STORE_GOOGLE') {
-            const { project_id, private_key, client_email } = JSON.parse(this.cloud_info.access_keys.secret_key.unwrap());
-            block_store_options.cloud_info.google = { project_id, private_key, client_email };
+            block_store_options.cloud_info.google = cloud_utils.build_google_cloud_info(
+                this.cloud_info.endpoint_type,
+                this.cloud_info.access_keys.secret_key.unwrap()
+            );
             this.block_store = new BlockStoreGoogle(block_store_options);
         }
 
@@ -418,8 +413,6 @@ class Agent {
                     };
                     if (this.cloud_info) {
                         hb_info.pool_name = this.cloud_info.pool_name;
-                    } else if (this.mongo_info) {
-                        hb_info.pool_name = this.mongo_info.pool_name;
                     }
 
                     dbg.log0(`_do_heartbeat called. sending HB to ${this.master_address}`);
@@ -481,9 +474,9 @@ class Agent {
                     if (err.rpc_code === 'DUPLICATE') {
                         dbg.error('This agent appears to be duplicated.',
                             'exiting and starting new agent', err);
-                        if (this.cloud_info || this.mongo_info) {
-                            dbg.error(`shouldn't be here. found duplicated node for cloud pool or mongo pool!!`);
-                            throw new Error('found duplicated cloud or mongo node');
+                        if (this.cloud_info) {
+                            dbg.error(`shouldn't be here. found duplicated node for cloud pool!!`);
+                            throw new Error('found duplicated cloud node');
                         } else {
                             this.send_message_and_exit('DUPLICATE', 68); // 68 is 'D' in ascii
                         }
@@ -492,9 +485,9 @@ class Agent {
                     if (err.rpc_code === 'NODE_NOT_FOUND') {
                         dbg.error('This agent appears to be using an old token.',
                             'cleaning this agent noobaa_storage directory', this.storage_path);
-                        if (this.cloud_info || this.mongo_info) {
-                            dbg.error(`shouldn't be here. node not found for cloud pool or mongo pool!!`);
-                            throw new Error('node not found cloud or mongo node');
+                        if (this.cloud_info) {
+                            dbg.error(`shouldn't be here. node not found for cloud pool!!`);
+                            throw new Error('node not found cloud node');
                         } else {
                             // We don't exit the process in order to keep the underlaying pod alive until
                             // the pool statefulset will scale this pod out of existence.
@@ -603,8 +596,7 @@ class Agent {
 
         // agent_api requests allowed only on server connection
         if (!req.method_api.auth?.n2n &&
-            req.api !== this.rpc.schema.block_store_api &&
-            req.api !== this.rpc.schema.func_node_api
+            req.api !== this.rpc.schema.block_store_api
         ) {
             // delayed close the connection to give a chance to send the thrown error response
             setTimeout(() => req.connection.close(), 1000);
@@ -735,11 +727,6 @@ class Agent {
 
     update_node_service(req) {
         this.location_info = req.rpc_params.location_info;
-        if (req.rpc_params.enabled) {
-            return this._enable_service();
-        } else {
-            return this._disable_service();
-        }
     }
 
     _disable_service() {
@@ -774,7 +761,7 @@ class Agent {
             return res.info.address;
         }
 
-        const ip = ip_module.address();
+        const ip = net_utils.get_local_address();
         dbg.log0(`get_node_ip: using fallback node ip`, ip);
         return ip;
     }
@@ -812,9 +799,6 @@ class Agent {
         };
         if (this.cloud_info && this.cloud_info.pool_name) {
             reply.pool_name = this.cloud_info.pool_name;
-        }
-        if (this.mongo_info && this.mongo_info.pool_name) {
-            reply.pool_name = this.mongo_info.pool_name;
         }
 
         this._test_server_connection();
@@ -957,11 +941,6 @@ class Agent {
         return this.rpc.accept_n2n_signal(req.rpc_params);
     }
 
-    async test_store_perf(req) {
-        if (!this.block_store) return {};
-        return this.block_store.test_store_perf(req.rpc_params);
-    }
-
     async test_store_validity(req) {
         if (!this.block_store) return;
         await this.block_store.test_store_validity();
@@ -1080,19 +1059,6 @@ class Agent {
             await P.delay_unblocking(config.DEBUG_MODE_PERIOD);
             dbg.set_module_level(0, 'core');
         }
-    }
-
-    uninstall() {
-        return P.resolve()
-            .then(() => {
-                const dbg = this.dbg;
-                dbg.log1('Received uninstall req');
-                if (os_utils.IS_MAC) return;
-                P.delay(30 * 1000) // this._disable_service()
-                    .then(() => {
-                        this.send_message_and_exit('UNINSTALL', 85); // 85 is 'U' in ascii
-                    });
-            });
     }
 
     async send_message_and_exit(message_code, exit_code) {

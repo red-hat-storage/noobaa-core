@@ -15,9 +15,10 @@ const rpc = api.new_rpc();
 const test_utils = require('./test_utils');
 
 const fs = require('fs');
-const AWS = require('aws-sdk');
-const { v4: uuid } = require('uuid');
+const { S3 } = require('@aws-sdk/client-s3');
+const crypto = require('crypto');
 const assert = require('assert');
+const { make_auth_token } = require('../../server/common_services/auth_server');
 
 
 dotenv.load();
@@ -75,10 +76,10 @@ module.exports = {
 function authenticate() {
     const auth_params = {
         email: 'demo@noobaa.com',
-        password: 'DeMo1',
-        system: 'demo'
+        role: 'admin',
+        system: 'demo',
     };
-    return client.create_auth_token(auth_params);
+    client.options.auth_token = make_auth_token(auth_params);
 }
 
 async function main() {
@@ -110,57 +111,60 @@ async function setup() {
     let account = account_by_name(system_info.accounts, full_access_user.email);
     full_access_user.access_keys = account.access_keys[0];
 
-    // replicate permission_list - loops over the permission_list and generates 
+    // replicate permission_list - loops over the permission_list and generates
     // S3 policies which gives the user equivalent permissions over the buckets that permission_list was giving.
     await Promise.all(
         full_access_user
-            .allowed_buckets
-            .permission_list
-            .map(bucket => test_utils.generate_s3_policy(full_access_user.email, bucket, ['s3:*']))
-            .map(generated => client.bucket.put_bucket_policy({ name: generated.params.bucket, policy: generated.policy }))
+        .allowed_buckets
+        .permission_list
+        .map(bucket => test_utils.generate_s3_policy(full_access_user.email, bucket, ['s3:*']))
+        .map(generated => client.bucket.put_bucket_policy({ name: generated.params.bucket, policy: generated.policy }))
     );
 
     account = account_by_name(system_info.accounts, bucket1_user.email);
     bucket1_user.access_keys = account.access_keys[0];
 
-    // replicate permission_list - loops over the permission_list and generates 
+    // replicate permission_list - loops over the permission_list and generates
     // S3 policies which gives the user equivalent permissions over the buckets that permission_list was giving.
     await Promise.all(
         full_access_user
-            .allowed_buckets
-            .permission_list
-            .map(bucket => test_utils.generate_s3_policy(full_access_user.email, bucket, ['s3:*']))
-            .map(generated => client.bucket.put_bucket_policy({ name: generated.params.bucket, policy: generated.policy }))
+        .allowed_buckets
+        .permission_list
+        .map(bucket => test_utils.generate_s3_policy(full_access_user.email, bucket, ['s3:*']))
+        .map(generated => client.bucket.put_bucket_policy({ name: generated.params.bucket, policy: generated.policy }))
     );
 
     account = account_by_name(system_info.accounts, no_access_user.email);
     no_access_user.access_keys = account.access_keys[0];
 
-    // replicate permission_list - loops over the permission_list and generates 
+    // replicate permission_list - loops over the permission_list and generates
     // S3 policies which gives the user equivalent permissions over the buckets that permission_list was giving.
     await Promise.all(
         full_access_user
-            .allowed_buckets
-            .permission_list
-            .map(bucket => test_utils.generate_s3_policy(full_access_user.email, bucket, ['s3:*']))
-            .map(generated => client.bucket.put_bucket_policy({ name: generated.params.bucket, policy: generated.policy }))
+        .allowed_buckets
+        .permission_list
+        .map(bucket => test_utils.generate_s3_policy(full_access_user.email, bucket, ['s3:*']))
+        .map(generated => client.bucket.put_bucket_policy({ name: generated.params.bucket, policy: generated.policy }))
     );
 }
 
 function get_new_server(user) {
     const access_key = user.access_keys.access_key;
     const secret_key = user.access_keys.secret_key;
-    return new AWS.S3({
+    return new S3({
         endpoint: target_s3_endpoint,
-        s3ForcePathStyle: true,
-        accessKeyId: access_key.unwrap(),
-        secretAccessKey: secret_key.unwrap(),
-        maxRedirects: 10,
+        forcePathStyle: true,
+        credentials: {
+            accessKeyId: access_key.unwrap(),
+            secretAccessKey: secret_key.unwrap(),
+        },
+        // v3: Deprecated. SDK does not follow redirects to avoid unintentional cross-region requests.
+        //maxRedirects: 10,
     });
 }
 
 async function run_test() {
-    await authenticate();
+    authenticate();
     await setup();
     await test_bucket_write_allowed();
     await test_bucket_read_allowed();
@@ -194,8 +198,8 @@ async function test_bucket_write_allowed() {
         Key: file_name,
         Body: fs.createReadStream(file_name)
     };
-    await server.upload(params1).promise();
-    await server.upload(params2).promise();
+    await server.putObject({Bucket: params1.Bucket, Key: params1.Key, Body: params1.Body });
+    await server.putObject({Bucket: params2.Bucket, Key: params2.Key, Body: params2.Body });
 
     file_name = await ops.generate_random_file(1);
     // upload with full_access_user to both buckets:
@@ -205,7 +209,7 @@ async function test_bucket_write_allowed() {
         Key: file_name,
         Body: fs.createReadStream(file_name)
     };
-    await server.upload(params).promise();
+    await server.putObject({Bucket: params.Bucket, Key: params.Key, Body: params.Body});
     console.log('test_bucket_write_allowed PASSED');
 }
 
@@ -218,13 +222,13 @@ async function test_bucket_read_allowed() {
         Key: file_name,
         Body: fs.createReadStream(file_name)
     };
-    await server.upload(params1).promise();
+    await server.putObject({Bucket: params1.Bucket, Key: params1.Key, Body: params1.Body });
     const server2 = get_new_server(bucket1_user);
     const params2 = {
         Bucket: 'bucket1',
         Key: file_name
     };
-    await server2.getObject(params2).promise();
+    await server2.getObject(params2);
     console.log('test_bucket_read_allowed PASSED');
 }
 
@@ -238,13 +242,13 @@ async function test_bucket_list_allowed() {
         Key: file_name,
         Body: fs.createReadStream(file_name)
     };
-    await server.upload(params1).promise();
+    await server.putObject(params1);
 
     const server2 = get_new_server(bucket1_user);
     const params2 = {
         Bucket: 'bucket1'
     };
-    await server2.listObjects(params2).promise();
+    await server2.listObjects(params2);
 
 }
 
@@ -260,7 +264,7 @@ async function test_bucket_write_denied() {
         Body: fs.createReadStream(file_name)
     };
     try {
-        await server.upload(params1).promise();
+        await server.putObject(params1);
 
         throw new Error('expecting upload to fail with statusCode 403- AccessDenied');
 
@@ -279,14 +283,14 @@ async function test_bucket_read_denied() {
         Key: file_name,
         Body: fs.createReadStream(file_name)
     };
-    await server.upload(params1).promise();
+    await server.putObject(params1);
     const server2 = get_new_server(bucket1_user);
     const params2 = {
         Bucket: 'bucket2',
         Key: file_name
     };
     try {
-        await server2.getObject(params2).promise();
+        await server2.getObject(params2);
         throw new Error('expecting read to fail with statusCode 403- AccessDenied');
     } catch (err) {
         assert(err.statusCode === 403, 'expecting read to fail with statusCode 403- AccessDenied');
@@ -304,14 +308,14 @@ async function test_bucket_list_denied() {
         Key: file_name,
         Body: fs.createReadStream(file_name)
     };
-    await server.upload(params1).promise();
+    await server.putObject(params1);
 
     const server2 = get_new_server(bucket1_user);
     const params2 = {
         Bucket: 'bucket2'
     };
     try {
-        await server2.listObjects(params2).promise();
+        await server2.listObjects(params2);
         throw new Error('expecting read to fail with statusCode 403- AccessDenied');
     } catch (err) {
         assert(err.statusCode === 403, 'expecting read to fail with statusCode 403- AccessDenied');
@@ -322,11 +326,11 @@ async function test_bucket_list_denied() {
 async function test_create_bucket_add_creator_permissions() {
     console.log(`Starting test_create_bucket_add_creator_permissions`);
     const server = get_new_server(full_access_user);
-    const unique_bucket_name = 'bucket' + uuid();
+    const unique_bucket_name = 'bucket' + crypto.randomUUID();
     const params = {
         Bucket: unique_bucket_name
     };
-    await server.createBucket(params).promise();
+    await server.createBucket(params);
 
     // Owners have full access to the bucket
     const bucket = await client.bucket.read_bucket({ rpc_params: { name: unique_bucket_name } });
@@ -336,14 +340,14 @@ async function test_create_bucket_add_creator_permissions() {
 async function test_delete_bucket_deletes_permissions() {
     console.log(`Starting test_delete_bucket_deletes_permissions`);
     const server = get_new_server(full_access_user);
-    const unique_bucket_name = 'bucket' + uuid();
+    const unique_bucket_name = 'bucket' + crypto.randomUUID();
 
-    await server.createBucket({ Bucket: unique_bucket_name }).promise();
+    await server.createBucket({ Bucket: unique_bucket_name });
 
     const bucket = await client.bucket.read_bucket({ rpc_params: { name: unique_bucket_name } });
     assert(bucket.owner_account.email.unwrap() === full_access_user.email, 'expecting full_access_user to have permissions to access ' + unique_bucket_name);
 
-    await server.deleteBucket({ Bucket: unique_bucket_name }).promise();
+    await server.deleteBucket({ Bucket: unique_bucket_name });
 
     try {
         await client.bucket.read_bucket({ rpc_params: { name: unique_bucket_name } });
@@ -356,7 +360,7 @@ async function test_delete_bucket_deletes_permissions() {
 async function test_no_s3_access() {
     console.log(`Starting test_no_s3_access`);
     const server = get_new_server(no_access_user);
-    const data = await server.listBuckets().promise();
+    const data = await server.listBuckets();
     assert(data.Buckets.length === 0, 'expecting an empty bucket list for no_access_user');
 }
 
@@ -378,21 +382,21 @@ async function test_ip_restrictions() {
 
     await client.account.update_account(single_ip_restriction);
     try {
-        await server.listBuckets().promise();
+        await server.listBuckets();
     } catch (err) {
         assert(err.statusCode === 403, 'expecting read to fail with statusCode 403- AccessDenied');
     }
     await client.account.update_account(no_ip_restriction);
-    let data = await server.listBuckets().promise();
+    let data = await server.listBuckets();
     assert(data.Buckets.length !== 0, 'expecting none empty bucket list for none-restricted IP');
     await client.account.update_account(range_ip_restriction);
     try {
-        await server.listBuckets().promise();
+        await server.listBuckets();
     } catch (err) {
         assert(err.statusCode === 403, 'expecting read to fail with statusCode 403- AccessDenied');
     }
     await client.account.update_account(no_ip_restriction);
-    data = await server.listBuckets().promise();
+    data = await server.listBuckets();
     assert(data.Buckets.length !== 0, 'expecting none empty bucket list for none-restricted IP');
 }
 

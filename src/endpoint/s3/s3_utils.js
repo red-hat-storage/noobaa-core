@@ -2,6 +2,7 @@
 'use strict';
 
 const _ = require('lodash');
+const querystring = require('querystring');
 
 const dbg = require('../../util/debug_module')(__filename);
 const S3Error = require('./s3_errors').S3Error;
@@ -12,6 +13,7 @@ const crypto = require('crypto');
 const config = require('../../.././config');
 const ChunkedContentDecoder = require('../../util/chunked_content_decoder');
 const stream_utils = require('../../util/stream_utils');
+const { AWS_RESTORE_FIELD_REGEXP, AWS_RESTORE_EXPIRY_DATE_REGEXP } = require('../../util/string_utils');
 
 /** @type {nb.StorageClass} */
 const STORAGE_CLASS_STANDARD = 'STANDARD';
@@ -19,6 +21,8 @@ const STORAGE_CLASS_STANDARD = 'STANDARD';
 const STORAGE_CLASS_GLACIER = 'GLACIER'; // "S3 Glacier Flexible Retrieval"
 /** @type {nb.StorageClass} */
 const STORAGE_CLASS_GLACIER_IR = 'GLACIER_IR'; // "S3 Glacier Instant Retrieval"
+/** @type {nb.StorageClass} */
+const STORAGE_CLASS_DEEP_ARCHIVE = 'DEEP_ARCHIVE'; // "S3 Deep Archive Storage Class"
 
 const DEFAULT_S3_USER = Object.freeze({
     ID: '123',
@@ -35,8 +39,23 @@ const DEFAULT_OBJECT_ACL = Object.freeze({
 
 const XATTR_SORT_SYMBOL = Symbol('XATTR_SORT_SYMBOL');
 const base64_regex = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const object_id_regex = /^[0-9a-fA-F]{24}$/;
 
 const X_NOOBAA_AVAILABLE_STORAGE_CLASSES = 'x-noobaa-available-storage-classes';
+
+const OBJECT_ATTRIBUTES = Object.freeze(['ETag', 'Checksum', 'ObjectParts', 'StorageClass', 'ObjectSize']);
+const OBJECT_ATTRIBUTES_UNSUPPORTED = Object.freeze(['Checksum', 'ObjectParts']);
+
+/** 
+ * Set of storage classes which support RestoreObject S3 API
+ * 
+ * GLACIER_IR is omitted as it doesn't require a restore.
+ * @type {nb.StorageClass[]}
+ */
+const GLACIER_STORAGE_CLASSES = [
+    STORAGE_CLASS_GLACIER,
+    STORAGE_CLASS_DEEP_ARCHIVE,
+];
 
  /**
  * get_default_object_owner returns bucket_owner info if exists
@@ -293,13 +312,13 @@ function set_response_object_md(res, object_md) {
     if (object_md.content_encoding) res.setHeader('Content-Encoding', object_md.content_encoding);
     res.setHeader('Content-Length', object_md.content_length === undefined ? object_md.size : object_md.content_length);
     res.setHeader('Accept-Ranges', 'bytes');
-    if (config.WORM_ENABLED && object_md.lock_settings) {
+    if (object_md.lock_settings) {
         if (object_md.lock_settings.legal_hold) {
             res.setHeader('x-amz-object-lock-legal-hold', object_md.lock_settings.legal_hold.status);
         }
         if (object_md.lock_settings.retention) {
             res.setHeader('x-amz-object-lock-mode', object_md.lock_settings.retention.mode);
-            res.setHeader('x-amz-object-lock-retain-until-date', object_md.lock_settings.retention.retain_until_date);
+            res.setHeader('x-amz-object-lock-retain-until-date', new Date(object_md.lock_settings.retention.retain_until_date).toISOString());
         }
     }
     if (object_md.version_id) res.setHeader('x-amz-version-id', object_md.version_id);
@@ -311,17 +330,46 @@ function set_response_object_md(res, object_md) {
     if (storage_class !== STORAGE_CLASS_STANDARD) {
         res.setHeader('x-amz-storage-class', storage_class);
     }
-    if (object_md.restore_status) {
-        const restore = [`ongoing-request="${object_md.restore_status.ongoing}"`];
+    if (object_md.restore_status?.ongoing || object_md.restore_status?.expiry_time) {
+        let restore = `ongoing-request="${object_md.restore_status.ongoing}"`;
         if (!object_md.restore_status.ongoing && object_md.restore_status.expiry_time) {
             // Expiry time is in UTC format
             const expiry_date = new Date(object_md.restore_status.expiry_time).toUTCString();
 
-            restore.push(`expiry-date="${expiry_date}"`);
+            restore += `, expiry-date="${expiry_date}"`;
         }
 
         res.setHeader('x-amz-restore', restore);
     }
+    if (config.NSFS_GLACIER_DMAPI_TPS_HTTP_HEADER_ENABLE) {
+        object_md.restore_status?.tape_info?.forEach?.((meta, idx) => {
+            // @ts-ignore - For some TS check doesn't like "meta" being passed to querystring
+            const header = querystring.stringify(meta);
+            res.setHeader(`${config.NSFS_GLACIER_DMAPI_TPS_HTTP_HEADER}-${idx}`, header);
+        });
+    }
+}
+
+/** set_response_headers_get_object_attributes is based on set_response_object_md
+ * and serves get_object_attributes
+ * @param {nb.S3Request} req
+ * @param {nb.S3Response} res
+ * @param {object} reply
+ * @param {string} version_id 
+ */
+function set_response_headers_get_object_attributes(req, res, reply, version_id) {
+    if (version_id) {
+        res.setHeader('x-amz-version-id', version_id);
+        if (reply.delete_marker) {
+            res.setHeader('x-amz-delete-marker', 'true');
+        }
+    }
+    if (reply.last_modified_time) {
+        res.setHeader('Last-Modified', time_utils.format_http_header_date(new Date(reply.last_modified_time)));
+    } else {
+        res.setHeader('Last-Modified', time_utils.format_http_header_date(new Date(reply.create_time)));
+    }
+    set_encryption_response_headers(req, res, reply.encryption);
 }
 
 /**
@@ -346,9 +394,12 @@ function parse_storage_class_header(req) {
  * @returns {nb.StorageClass}
  */
 function parse_storage_class(storage_class) {
-    if (!storage_class) return STORAGE_CLASS_STANDARD;
-    if (storage_class === STORAGE_CLASS_STANDARD) return STORAGE_CLASS_STANDARD;
+    if (!storage_class || storage_class === STORAGE_CLASS_STANDARD) {
+        return config.NSFS_GLACIER_FORCE_STORAGE_CLASS ?
+        config.NSFS_GLACIER_FORCE_STORAGE_CLASS : STORAGE_CLASS_STANDARD;
+    }
     if (storage_class === STORAGE_CLASS_GLACIER) return STORAGE_CLASS_GLACIER;
+    if (storage_class === STORAGE_CLASS_DEEP_ARCHIVE) return STORAGE_CLASS_DEEP_ARCHIVE;
     if (storage_class === STORAGE_CLASS_GLACIER_IR) return STORAGE_CLASS_GLACIER_IR;
     throw new Error(`No such s3 storage class ${storage_class}`);
 }
@@ -489,35 +540,50 @@ function parse_body_encryption_xml(req) {
 
 function parse_body_object_lock_conf_xml(req) {
     const configuration = req.body.ObjectLockConfiguration;
-    const retention = configuration.Rule[0].DefaultRetention[0];
+    try {
+        const retention = configuration?.Rule?.[0]?.DefaultRetention?.[0];
+        const object_lock_enabled = configuration?.ObjectLockEnabled?.[0];
+        if (object_lock_enabled !== 'Enabled') {
+            dbg.error('invalid object_lock_enabled, can only be Enabled', object_lock_enabled);
+            throw new S3Error(S3Error.MalformedXML);
+        }
+        const conf = {
+            object_lock_enabled,
+        };
 
-    if ((retention.Days && retention.Years) || (!retention.Days && !retention.Years) ||
-        (retention.Mode[0] !== 'GOVERNANCE' && retention.Mode[0] !== 'COMPLIANCE')) throw new S3Error(S3Error.MalformedXML);
-
-    const conf = {
-        object_lock_enabled: configuration.ObjectLockEnabled[0],
-        rule: { default_retention: { mode: retention.Mode[0], } }
-    };
-
-    if (retention.Days) {
-        const days = parseInt(retention.Days[0], 10);
-        if (days <= 0) {
-            const err = new S3Error(S3Error.InvalidArgument);
-            err.message = 'Default retention period must be a positive integer value';
+        if (retention) {
+            conf.rule = { default_retention: { mode: retention.Mode[0] } };
+            if ((!retention.Days && !retention.Years) || (retention.Mode[0] !== 'GOVERNANCE' && retention.Mode[0] !== 'COMPLIANCE')) {
+                dbg.error('invalid object lock confugration retention', retention);
+                throw new S3Error(S3Error.MalformedXML);
+            }
+            if (retention.Days) {
+                const days = parseInt(retention.Days[0], 10);
+                if (!Number.isInteger(days) || days <= 0) {
+                    const err = new S3Error(S3Error.InvalidArgument);
+                    err.message = 'Default retention period must be a positive integer value';
+                    throw err;
+                }
+                conf.rule.default_retention.days = days;
+            }
+            if (retention.Years) {
+                const years = parseInt(retention.Years[0], 10);
+                if (!Number.isInteger(years) || years <= 0) {
+                    const err = new S3Error(S3Error.InvalidArgument);
+                    err.message = 'Default retention period must be a positive integer value';
+                    throw err;
+                }
+                conf.rule.default_retention.years = years;
+            }
+        }
+        return conf;
+    } catch (err) {
+        dbg.error('parse_body_object_lock_conf_xml failed', err);
+        if (err instanceof S3Error) {
             throw err;
         }
-        conf.rule.default_retention.days = days;
+        throw new S3Error(S3Error.MalformedXML);
     }
-    if (retention.Years) {
-        const years = parseInt(retention.Years[0], 10);
-        if (years <= 0) {
-            const err = new S3Error(S3Error.InvalidArgument);
-            err.message = 'Default retention period must be a positive integer value';
-            throw err;
-        }
-        conf.rule.default_retention.years = years;
-    }
-    return conf;
 }
 
 function parse_body_website_xml(req) {
@@ -590,7 +656,7 @@ function parse_to_camel_case(obj_lock, root_key) {
         }
         return variable;
     };
-    const reply = root_key ? { root_key: rename_keys(obj_lock) } : rename_keys(obj_lock);
+    const reply = root_key ? { [root_key]: rename_keys(obj_lock) } : rename_keys(obj_lock);
     return reply;
 }
 
@@ -633,18 +699,6 @@ function parse_body_logging_xml(req) {
     return logging;
 }
 
-function get_http_response_date(res) {
-    const r = get_http_response_from_resp(res);
-    if (!r.httpResponse.headers.date) throw new Error("date not found in response header");
-    return r.httpResponse.headers.date;
-}
-
-function get_http_response_from_resp(res) {
-    const r = res.$response;
-    if (!r) throw new Error("no $response in s3 returned object");
-    return r;
-}
-
 function get_response_field_encoder(req) {
     const encoding_type = req.query['encoding-type'];
     if ((typeof encoding_type === 'undefined') || (encoding_type === null)) return response_field_encoder_none;
@@ -662,6 +716,7 @@ function response_field_encoder_none(value) {
 * with plus (+) instead of spaces (and not %20 as encodeURIComponent() does)
 */
 function response_field_encoder_url(value) {
+    if (value === undefined) return undefined; // else the undefined value will be a string of 'undefined'
     return new URLSearchParams({ 'a': value }).toString().slice(2); // slice the leading 'a='
 }
 
@@ -693,6 +748,15 @@ function parse_version_id(version_id, empty_err = S3Error.InvalidArgumentEmptyVe
 }
 
 /**
+ * Throw S3 NoSuchUpload when upload id is missing or not a valid ObjectId.
+ * Avoids RPC schema INVALID_SCHEMA_PARAMS for malformed UploadId values.
+ * @param {string} [upload_id]
+ */
+function throw_if_invalid_upload_id(upload_id) {
+    if (!upload_id || !object_id_regex.test(upload_id)) throw new S3Error(S3Error.NoSuchUpload);
+}
+
+/**
  * 
  * @param {*} req 
  * @returns {number}
@@ -706,7 +770,7 @@ function parse_restore_request_days(req) {
     const days = parse_decimal_int(req.body.RestoreRequest.Days[0]);
     if (days < 1) {
         dbg.warn('parse_restore_request_days: days cannot be less than 1');
-        throw new S3Error(S3Error.InvalidArgument);
+        throw new S3Error({ ...S3Error.InvalidArgument, message: 'restoration days should be at least 1'});
     }
 
     if (days > config.S3_RESTORE_REQUEST_MAX_DAYS) {
@@ -724,9 +788,146 @@ function parse_restore_request_days(req) {
     return days;
 }
 
+/**
+ * cont_tok_to_key_marker takes an encoded string and decodes it.
+ * cont_tok is the token which represents the next item in
+ * the list which some API returns to user in parts.
+ * @param {string} cont_tok
+ * @returns {string}
+ */
+function cont_tok_to_key_marker(cont_tok) {
+    if (!cont_tok) return;
+    try {
+        const b = Buffer.from(cont_tok, 'base64');
+        const j = JSON.parse(b.toString());
+        return j.key;
+    } catch (err) {
+        throw new S3Error(S3Error.InvalidArgument);
+    }
+}
+
+/**
+ * key_marker_to_cont_tok takes a string and returns an encoded
+ * string. key_marker is the token which represents the next item in
+ * the list which some API returns to user in parts.
+ * @param {string} key_marker
+ * @param {array} objects_arr
+ * @param {boolean} is_truncated
+ * @returns {string}
+ */
+
+function key_marker_to_cont_tok(key_marker, objects_arr, is_truncated) {
+    if (!key_marker && !is_truncated) return;
+    // next marker is the key marker we got or the key of the last item in the objects list.
+    const next_marker = key_marker || (objects_arr && objects_arr.length > 0 ? objects_arr[objects_arr.length - 1].key : undefined);
+    const j = JSON.stringify({ key: next_marker });
+    return Buffer.from(j).toString('base64');
+}
+
+/**
+ * Returns true if the byte length of the key
+ * is within the range [0, max_length]
+ * @param {string} key 
+ * @param {number} max_length 
+ * @returns 
+ */
+function verify_string_byte_length(key, max_length) {
+    // Fast path
+    const MAX_UTF8_WIDTH = 4;
+    if (key.length * MAX_UTF8_WIDTH <= max_length) {
+        return true;
+    }
+
+    // Slow path
+    return Buffer.byteLength(key, 'utf8') <= max_length;
+}
+
+function parse_body_public_access_block(req) {
+    const parsed = {};
+
+    const access_cfg = req.body?.PublicAccessBlockConfiguration;
+    if (!access_cfg) throw new S3Error(S3Error.MalformedXML);
+
+    if (access_cfg.BlockPublicAcls || access_cfg.IgnorePublicAcls) {
+        throw new S3Error(S3Error.AccessControlListNotSupported);
+    }
+    if (access_cfg.BlockPublicPolicy) {
+        parsed.block_public_policy = access_cfg.BlockPublicPolicy?.[0].toLowerCase?.() === 'true';
+    }
+    if (access_cfg.RestrictPublicBuckets) {
+        parsed.restrict_public_buckets = access_cfg.RestrictPublicBuckets?.[0].toLowerCase?.() === 'true';
+    }
+
+    return parsed;
+}
+
+/**
+ * Parses the S3 HeadObject/GetObject `Restore` response field.
+ * Omits expiry_time when expiry-date is missing or not a valid date.
+ * @param {string|undefined|null} restore_field
+ * @returns {{ ongoing: boolean, expiry_time?: Date } | undefined}
+ */
+function parse_s3_restore_field(restore_field) {
+    if (!restore_field || typeof restore_field !== 'string') return;
+    const ongoing_match = AWS_RESTORE_FIELD_REGEXP.exec(restore_field);
+    if (!ongoing_match) return;
+    const ongoing = ongoing_match[1].toLowerCase() === 'true';
+    const expiry_match = AWS_RESTORE_EXPIRY_DATE_REGEXP.exec(restore_field);
+    const result = { ongoing };
+    if (expiry_match) {
+        const expiry_time = new Date(expiry_match[1]);
+        if (!Number.isNaN(expiry_time.getTime())) {
+            result.expiry_time = expiry_time;
+        }
+    }
+    return result;
+}
+
+
+/**
+ * Parses x-amz-optional-object-attributes and returns whether RestoreStatus was requested
+ * @param {import('http').IncomingHttpHeaders} headers
+ * @returns {boolean}
+ */
+function parse_optional_object_attributes_header(headers) {
+    const optional_object_attributes_header = headers['x-amz-optional-object-attributes'];
+    const optional_object_attributes = Array.isArray(optional_object_attributes_header) ?
+        optional_object_attributes_header[0] : optional_object_attributes_header;
+    const restore_status_requested = optional_object_attributes === 'RestoreStatus';
+
+    // Only RestoreStatus is a valid attribute for now
+    if (optional_object_attributes && !restore_status_requested) {
+        throw new S3Error({ ...S3Error.InvalidArgument, message: 'Invalid attribute name specified' });
+    }
+    return restore_status_requested;
+}
+
+/**
+ * Returns RestoreStatus XML fields when requested and object has restore_status
+ * @param {nb.ObjectInfo} obj
+ * @param {boolean} restore_status_requested
+ * @returns {{ IsRestoreInProgress: boolean | undefined, RestoreExpiryDate?: string } | undefined}
+ */
+function get_object_restore_status(obj, restore_status_requested) {
+    if (!restore_status_requested || !obj.restore_status) {
+        return;
+    }
+
+    /** @type {{ IsRestoreInProgress: boolean | undefined, RestoreExpiryDate?: string }} */
+    const restore_status = {
+        IsRestoreInProgress: obj.restore_status.ongoing,
+    };
+    if (!obj.restore_status.ongoing && obj.restore_status.expiry_time) {
+        restore_status.RestoreExpiryDate = new Date(obj.restore_status.expiry_time).toUTCString();
+    }
+
+    return restore_status;
+}
+
 exports.STORAGE_CLASS_STANDARD = STORAGE_CLASS_STANDARD;
 exports.STORAGE_CLASS_GLACIER = STORAGE_CLASS_GLACIER;
 exports.STORAGE_CLASS_GLACIER_IR = STORAGE_CLASS_GLACIER_IR;
+exports.STORAGE_CLASS_DEEP_ARCHIVE = STORAGE_CLASS_DEEP_ARCHIVE;
 exports.DEFAULT_S3_USER = DEFAULT_S3_USER;
 exports.DEFAULT_OBJECT_ACL = DEFAULT_OBJECT_ACL;
 exports.decode_chunked_upload = decode_chunked_upload;
@@ -738,6 +939,7 @@ exports.parse_part_number = parse_part_number;
 exports.parse_copy_source = parse_copy_source;
 exports.format_copy_source = format_copy_source;
 exports.set_response_object_md = set_response_object_md;
+exports.set_response_headers_get_object_attributes = set_response_headers_get_object_attributes;
 exports.parse_storage_class = parse_storage_class;
 exports.parse_storage_class_header = parse_storage_class_header;
 exports.parse_encryption = parse_encryption;
@@ -753,13 +955,24 @@ exports.parse_lock_header = parse_lock_header;
 exports.parse_body_object_lock_conf_xml = parse_body_object_lock_conf_xml;
 exports.parse_to_camel_case = parse_to_camel_case;
 exports._is_valid_retention = _is_valid_retention;
-exports.get_http_response_from_resp = get_http_response_from_resp;
-exports.get_http_response_date = get_http_response_date;
 exports.XATTR_SORT_SYMBOL = XATTR_SORT_SYMBOL;
 exports.get_response_field_encoder = get_response_field_encoder;
+exports.response_field_encoder_url = response_field_encoder_url;
 exports.parse_decimal_int = parse_decimal_int;
 exports.parse_restore_request_days = parse_restore_request_days;
 exports.parse_version_id = parse_version_id;
+exports.throw_if_invalid_upload_id = throw_if_invalid_upload_id;
 exports.get_object_owner = get_object_owner;
 exports.get_default_object_owner = get_default_object_owner;
 exports.set_response_supported_storage_classes = set_response_supported_storage_classes;
+exports.cont_tok_to_key_marker = cont_tok_to_key_marker;
+exports.key_marker_to_cont_tok = key_marker_to_cont_tok;
+exports.parse_sse_c = parse_sse_c;
+exports.verify_string_byte_length = verify_string_byte_length;
+exports.parse_body_public_access_block = parse_body_public_access_block;
+exports.parse_s3_restore_field = parse_s3_restore_field;
+exports.parse_optional_object_attributes_header = parse_optional_object_attributes_header;
+exports.get_object_restore_status = get_object_restore_status;
+exports.OBJECT_ATTRIBUTES = OBJECT_ATTRIBUTES;
+exports.OBJECT_ATTRIBUTES_UNSUPPORTED = OBJECT_ATTRIBUTES_UNSUPPORTED;
+exports.GLACIER_STORAGE_CLASSES = GLACIER_STORAGE_CLASSES;

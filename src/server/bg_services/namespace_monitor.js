@@ -2,9 +2,6 @@
 'use strict';
 
 const system_store = require('../system_services/system_store').get_instance();
-//TODO: why do we what to use the wrap and not directly @google-cloud/storage ? 
-const GoogleCloudStorage = require('../../util/google_storage_wrap');
-const azure_storage = require('../../util/azure_storage_wrap');
 const auth_server = require('../common_services/auth_server');
 const dbg = require('../../util/debug_module')(__filename);
 const system_utils = require('../utils/system_utils');
@@ -66,9 +63,9 @@ class NamespaceMonitor {
                     await this.test_nsfs_resource(nsr);
                 } else if (['AWS', 'AWSSTS', 'S3_COMPATIBLE', 'IBM_COS'].includes(endpoint_type)) {
                     await this.test_s3_resource(nsr);
-                } else if (endpoint_type === 'AZURE') {
+                } else if (['AZURE', 'AZURESTS' ].includes(endpoint_type)) {
                     await this.test_blob_resource(nsr);
-                } else if (endpoint_type === 'GOOGLE') {
+                } else if (endpoint_type === 'GOOGLE' || endpoint_type === 'GOOGLE_STS') {
                     await this.test_gcs_resource(nsr);
                 } else {
                     dbg.error('namespace_monitor: invalid endpoint type', endpoint_type);
@@ -76,7 +73,7 @@ class NamespaceMonitor {
                 this.update_last_monitoring(nsr._id, nsr.name, endpoint_type);
             } catch (err) {
                 this.run_update_issues_report(err, nsr);
-                dbg.log1(`test_namespace_resource_validity: namespace resource ${nsr.name} has error as expected`);
+                dbg.log1(`test_namespace_resource_validity: namespace resource ${nsr.name} has an unexpected error`, err);
             }
         });
         dbg.log1(`test_namespace_resource_validity finished successfully..`);
@@ -143,10 +140,10 @@ class NamespaceMonitor {
             });
         } catch (err) {
             noobaa_s3_client.fix_error_object(err);
-            if (err.code === 'AccessDenied' && nsr.is_readonly_namespace()) {
+            if (err.code === 'AccessDenied' && this._is_readonly_namespace(nsr)) {
                 return;
             }
-            dbg.log1('test_s3_resource: got error:', err);
+            dbg.log1(`test_s3_resource: on bucket ${target_bucket} got error:`, err);
             if (err.code !== 'NoSuchKey') throw err;
         }
 
@@ -157,11 +154,17 @@ class NamespaceMonitor {
         if (!conn) {
             const { endpoint, access_key, secret_key } = nsr.connection;
             const conn_string = cloud_utils.get_azure_new_connection_string({
-                endpoint,
-                access_key: access_key,
-                secret_key: secret_key
+                        endpoint,
+                        access_key: access_key,
+                        secret_key: secret_key
+                    });
+            conn = cloud_utils.create_azure_blob_client({
+                endpoint: nsr.connection.endpoint,
+                connection_string: conn_string,
+                access_key: nsr.connection.access_key,
+                azure_client_id: nsr.connection.azure_sts_credentials?.azure_client_id.unwrap(),
+                azure_tenant_id: nsr.connection.azure_sts_credentials?.azure_tenant_id.unwrap(),
             });
-            conn = azure_storage.BlobServiceClient.fromConnectionString(conn_string);
             if (conn) this.nsr_connections_obj[nsr._id] = conn;
         }
         const { target_bucket } = nsr.connection;
@@ -171,10 +174,10 @@ class NamespaceMonitor {
             const container_client = conn.getContainerClient(target_bucket);
             await container_client.deleteBlob(block_key);
         } catch (err) {
-            if (err.code === 'InsufficientAccountPermissions' && nsr.is_readonly_namespace()) {
+            if (err.code === 'InsufficientAccountPermissions' && this._is_readonly_namespace(nsr)) {
                 return;
             }
-            dbg.log1('test_blob_resource: got error:', err);
+            dbg.log1(`test_blob_resource: on bucket ${target_bucket} got error:`, err);
             if (err.code !== 'BlobNotFound') throw err;
         }
     }
@@ -182,27 +185,39 @@ class NamespaceMonitor {
     async test_gcs_resource(nsr) {
         let conn = this.nsr_connections_obj[nsr._id];
         if (!conn) {
-            const { project_id, private_key, client_email } = JSON.parse(nsr.connection.secret_key.unwrap());
-            conn = new GoogleCloudStorage({
-                projectId: project_id,
-                credentials: {
-                    client_email,
-                    private_key,
-                }
-            });
+            try {
+                conn = cloud_utils.create_google_storage_from_connection(nsr.connection.secret_key.unwrap());
+            } catch (err) {
+                throw Object.assign(err, { code: err.code || 'AuthenticationFailed' });
+            }
             this.nsr_connections_obj[nsr._id] = conn;
         }
         const { target_bucket } = nsr.connection;
         const block_key = `test-delete-non-existing-gcs-key-${Date.now()}`;
         try {
-            await conn.bucket(target_bucket).file(block_key).delete();
+            // GCP does not distinguish bucket-not-found from object-not-found on delete (both return 404),
+            // so we first call bucket.exists(), then delete a non-existing test key.
+            const bucket = conn.bucket(target_bucket);
+            const [bucket_exists] = await bucket.exists();
+            if (!bucket_exists) {
+                throw Object.assign(new Error(`Google cloud bucket ${target_bucket} not found`), { code: S3Error.NoSuchBucket.code });
+            }
+            await bucket.file(block_key).delete();
         } catch (err) {
-            if (err.errors[0].reason === 'UserProjectAccessDenied' && nsr.is_readonly_namespace()) {
+            dbg.log1(`test_gcs_resource: on bucket ${target_bucket} got error (code=${err.code}, message: ${err.message})`);
+            const reason = err.errors?.[0]?.reason;
+            if (err.code === S3Error.NoSuchBucket.code) {
+                throw err;
+            }
+            if (reason === 'UserProjectAccessDenied' && this._is_readonly_namespace(nsr)) {
                 return;
             }
-            dbg.log1('test_gcs_resource: got error:', err);
             // https://cloud.google.com/storage/docs/json_api/v1/status-codes
-            if (err.errors[0].reason !== 'notFound') throw err;
+            // Delete of the non-existing test key is expected (bucket was verified above).
+            if (err.code === 404 || reason === 'notFound') {
+                return;
+            }
+            throw err;
         }
     }
 
@@ -237,6 +252,10 @@ class NamespaceMonitor {
             }
             throw err;
         }
+    }
+
+    _is_readonly_namespace(nsr) {
+        return nsr.access_mode === 'READ_ONLY';
     }
 }
 

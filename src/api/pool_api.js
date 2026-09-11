@@ -121,23 +121,9 @@ module.exports = {
                             },
                         }
                     },
-                }
-            },
-            auth: {
-                system: 'admin'
-            }
-        },
-
-        create_mongo_pool: {
-            doc: 'Create Mongo Pool',
-            method: 'POST',
-            params: {
-                type: 'object',
-                required: ['name'],
-                properties: {
-                    name: {
-                        type: 'string',
-                    }
+                    archive: {
+                        type: 'boolean',
+                    },
                 }
             },
             auth: {
@@ -260,7 +246,7 @@ module.exports = {
                     properties: {
                         service: {
                             type: 'string',
-                            enum: ['AWSSTS', 'AWS', 'AZURE', 'S3_COMPATIBLE', 'GOOGLE', 'FLASHBLADE', 'NET_STORAGE', 'IBM_COS']
+                            enum: ['AWSSTS', 'AWS', 'AZURE', 'AZURESTS', 'S3_COMPATIBLE', 'GOOGLE', 'GOOGLE_STS', 'FLASHBLADE', 'NET_STORAGE', 'IBM_COS']
                         },
                         read_count: {
                             type: 'integer'
@@ -596,6 +582,9 @@ module.exports = {
                     type: 'string',
                     enum: ['READ_ONLY', 'READ_WRITE']
                 },
+                archive: {
+                    type: 'boolean'
+                },
             }
         },
 
@@ -643,6 +632,9 @@ module.exports = {
                 },
                 region: {
                     type: 'string'
+                },
+                azure_sts_credentials: {
+                    $ref: 'common_api#/definitions/azure_sts_credentials'
                 },
             }
         },

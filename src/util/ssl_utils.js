@@ -6,7 +6,7 @@ const fs = require('fs');
 const tls = require('tls');
 const path = require('path');
 const https = require('https');
-const Semaphore = require('../util/semaphore');
+const semaphore = require('../util/semaphore');
 const dbg = require('./debug_module')(__filename);
 const nb_native = require('./nb_native');
 const { EventEmitter } = require('events');
@@ -19,7 +19,7 @@ class CertInfo extends EventEmitter {
         this.cert = null;
         this.is_loaded = false;
         this.is_generated = false;
-        this.sem = new Semaphore(1);
+        this.sem = new semaphore.Semaphore(1);
     }
 
     async file_notification(event, filename) {
@@ -46,6 +46,10 @@ const certs = {
     S3: new CertInfo(config.S3_SERVICE_CERT_PATH),
     EXTERNAL_DB: new CertInfo(config.EXTERNAL_DB_SERVICE_CERT_PATH),
     STS: new CertInfo(config.STS_SERVICE_CERT_PATH),
+    IAM: new CertInfo(config.IAM_SERVICE_CERT_PATH),
+    VECTOR: new CertInfo(config.VECTOR_SERVICE_CERT_PATH),
+    METRICS: new CertInfo(config.S3_SERVICE_CERT_PATH), // metric server will use the S3 cert.
+    FORK_HEALTH: new CertInfo(config.S3_SERVICE_CERT_PATH) // fork health server will use the S3 cert.
 };
 
 function generate_ssl_certificate() {
@@ -64,7 +68,7 @@ function verify_ssl_certificate(certificate) {
 // Get SSL certificate (load once then serve from cache)
 async function get_ssl_cert_info(service, nsfs_config_root) {
     let cert_info;
-    if (service === 'S3' && nsfs_config_root) {
+    if ((service === 'S3' || service === 'METRICS' || service === 'FORK_HEALTH') && nsfs_config_root) {
         const nsfs_ssl_cert_dir = path.join(nsfs_config_root, 'certificates/');
         cert_info = new CertInfo(nsfs_ssl_cert_dir);
     } else {
@@ -90,7 +94,7 @@ async function get_ssl_cert_info(service, nsfs_config_root) {
 
         } catch (err) {
             if (err.code === 'ENOENT') {
-                dbg.log0(`SSL certificate not found in dir ${cert_info.dir}`);
+                dbg.log0(`SSL certificate not found in dir ${cert_info.dir} for service ${service}`);
             } else {
                 dbg.error(`SSL certificate failed to load from dir ${cert_info.dir}:`, err.message);
             }
@@ -164,10 +168,37 @@ function run_https_test_server() {
     server.listen();
 }
 
+// An internal function to prevent code duplication
+async function create_https_server(ssl_cert_info, honorCipherOrder, endpoint_handler, service) {
+    const ssl_options = { ...ssl_cert_info.cert, honorCipherOrder: honorCipherOrder };
+    apply_tls_config(ssl_options, service);
+    dbg.log0(`Creating HTTPS server for service ${service} with TLS options: minVersion=${ssl_options.minVersion} ciphers=${ssl_options.ciphers} ecdhCurve=${ssl_options.ecdhCurve}`);
+    return https.createServer(ssl_options, endpoint_handler);
+}
+
+function apply_tls_config(ssl_options, service) {
+    if (!service || !config.TLS_CONFIGURABLE_SERVERS.includes(service)) {
+        dbg.log0(`TLS config skipped for service ${service} (not in TLS_CONFIGURABLE_SERVERS)`);
+        return;
+    }
+    dbg.log0(`Updating TLS config for service ${service} config.TLS_MIN_VERSION=${config.TLS_MIN_VERSION}, config.TLS_CIPHERS=${config.TLS_CIPHERS} config.TLS_GROUPS=${config.TLS_GROUPS}`);
+    if (config.TLS_MIN_VERSION) {
+        ssl_options.minVersion = config.TLS_MIN_VERSION;
+    }
+    if (config.TLS_CIPHERS) {
+        ssl_options.ciphers = config.TLS_CIPHERS;
+    }
+    if (config.TLS_GROUPS) {
+        ssl_options.ecdhCurve = config.TLS_GROUPS;
+    }
+}
+
 exports.generate_ssl_certificate = generate_ssl_certificate;
 exports.verify_ssl_certificate = verify_ssl_certificate;
 exports.get_ssl_cert_info = get_ssl_cert_info;
 exports.is_using_generated_certs = is_using_generated_certs;
 exports.get_cert_dir = get_cert_dir;
+exports.create_https_server = create_https_server;
+exports.apply_tls_config = apply_tls_config;
 
 if (require.main === module) run_https_test_server();
