@@ -1,17 +1,16 @@
 /* Copyright (C) 2016 NooBaa */
 'use strict';
 
-const AWS = require('aws-sdk');
 const system_store = require('../system_services/system_store').get_instance();
 const replication_store = require('../system_services/replication_store').instance();
 const cloud_utils = require('../../util/cloud_utils');
-const http_utils = require('../../util/http_utils');
 const pool_server = require('../system_services/pool_server');
 const dbg = require('../../util/debug_module')(__filename);
 const config = require('../../../config');
 const moment = require('moment');
-const { LogsQueryClient, LogsQueryResultStatus } = require("@azure/monitor-query");
+const { LogsQueryClient, LogsQueryResultStatus } = require("@azure/monitor-query-logs");
 const { ClientSecretCredential } = require("@azure/identity");
+const noobaa_s3_client = require('../../sdk/noobaa_s3_client/noobaa_s3_client');
 
 /**
  * get_log_candidates will return an object which contains the log candidates
@@ -61,7 +60,8 @@ async function get_aws_log_candidates(source_bucket_id, rule_id, replication_con
         }
 
         const next_log_data = await _aws_get_next_log(s3, logs_bucket, next_log_entry.Contents[0].Key);
-        aws_parse_log_object(logs, next_log_data, sync_deletions, obj_prefix_filter);
+        const log_string = await next_log_data.Body.transformToString();
+        await aws_parse_log_object(logs, log_string, sync_deletions, obj_prefix_filter);
 
         dbg.log1("get_aws_log_candidates: parsed logs ", logs);
 
@@ -141,7 +141,7 @@ async function get_azure_log_candidates(source_bucket_id, rule_id, replication_c
 
     if (query_result.status === LogsQueryResultStatus.Success) {
         const tables_from_result = query_result.tables;
-        if (tables_from_result && tables_from_result[0].rows.length > 0) {
+        if (tables_from_result && tables_from_result.length > 0 && tables_from_result[0].rows.length > 0) {
             const result_rows = query_result.tables[0].rows;
             // @ts-ignore - Needed since the format of `rows` is changed in the Kusto query - project Time, Action, Key
             // So there's a mismatch between what the code expects and what it actually receives
@@ -158,10 +158,14 @@ async function get_azure_log_candidates(source_bucket_id, rule_id, replication_c
             dbg.log1("get_azure_log_candidates: candsidates", candidates);
         } else {
             dbg.log1("get_azure_log_candidates: No new Azure logs found to process");
-        }
-        if (tables_from_result.length === 0) {
-            dbg.log1(`get_azure_log_candidates: No results for Azure replication query '${kusto_query}'`);
-            return;
+            if (!tables_from_result || tables_from_result.length === 0) {
+                dbg.log1(`get_azure_log_candidates: No results for Azure replication query '${kusto_query}'`);
+                return { items: {}, done: async () => { /* no-op */ } };
+            }
+            // Rows are empty but a table was returned — advance the token to now so
+            // next cycle does not re-query the same time window.
+            continuation_token = Date.now().toString();
+            candidates = create_candidates([]);
         }
     } else {
         dbg.error(`get_azure_log_candidates: Error processing the Azure replication query '${kusto_query}' - ${query_result.partialError}`);
@@ -227,6 +231,13 @@ function create_candidates(logs) {
     return candidates;
 }
 
+/**
+ *  _aws_get_next_log will get the log object
+ * @param {S3} s3
+ * @param {string} logs_bucket
+ * @param {string} logs_prefix
+ * @param {*} continuation_token
+ */
 async function aws_get_next_log_entry(s3, logs_bucket, logs_prefix, continuation_token) {
     let start_after = logs_prefix;
     if (start_after && !start_after.endsWith('/')) {
@@ -243,7 +254,7 @@ async function aws_get_next_log_entry(s3, logs_bucket, logs_prefix, continuation
 
     try {
         dbg.log2('log_parser aws_get_next_log_entry: params:', params);
-        const res = await s3.listObjectsV2(params).promise();
+        const res = await s3.listObjectsV2(params);
         dbg.log1('log_parser aws_get_next_log_entry: finished successfully ', res);
         return res;
 
@@ -255,7 +266,7 @@ async function aws_get_next_log_entry(s3, logs_bucket, logs_prefix, continuation
 
 /**
  *  _aws_get_next_log will get the log object
- * @param {AWS.S3} s3
+ * @param {S3} s3
  * @param {string} bucket
  * @param {string} key
  */
@@ -266,7 +277,7 @@ async function _aws_get_next_log(s3, bucket, key) {
             Bucket: bucket,
             Key: key,
             ResponseContentType: 'json'
-        }).promise();
+        });
 
         dbg.log1('log_parser _aws_get_next_log: finished successfully ', res);
         return res;
@@ -280,12 +291,11 @@ async function _aws_get_next_log(s3, bucket, key) {
 /**
  * aws_parse_log_object will parse the log object and will return an array of candidates
  * @param {nb.ReplicationLogs} logs - Log array
- * @param {*} log_object  - AWS log object
+ * @param {String} log_string  - AWS log object
  * @param {boolean} sync_deletions  - Whether deletions should be synced or not
  * @param {string} obj_prefix_filter - Object prefix filter
  */
-function aws_parse_log_object(logs, log_object, sync_deletions, obj_prefix_filter) {
-    const log_string = log_object.Body.toString();
+async function aws_parse_log_object(logs, log_string, sync_deletions, obj_prefix_filter) {
     const log_array = log_string.split("\n");
 
     for (const line of log_array) {
@@ -362,25 +372,20 @@ function _get_source_bucket_azure_connection(source_bucket_id) {
 
 function _get_source_bucket_aws_connection(source_bucket_id, aws_log_replication_info) {
     const source_bucket = system_store.data.get_by_id(source_bucket_id);
-    const logs_location = aws_log_replication_info.logs_location;
-    const { logs_bucket } = logs_location;
 
     const s3_resource_connection_info =
         pool_server.get_namespace_resource_extended_info(source_bucket.namespace.write_resource.resource);
-
-    const agent = s3_resource_connection_info.endpoint_type === 'AWS' ?
-        http_utils.get_default_agent(s3_resource_connection_info.endpoint) :
-        http_utils.get_unsecured_agent(s3_resource_connection_info.endpoint);
-
-    const s3 = new AWS.S3({
-        params: { Bucket: logs_bucket },
+    const s3 = noobaa_s3_client.get_s3_client_v3_params({
         endpoint: s3_resource_connection_info.endpoint,
-        accessKeyId: s3_resource_connection_info.access_key.unwrap(),
-        secretAccessKey: s3_resource_connection_info.secret_key.unwrap(),
+        credentials: {
+            accessKeyId: s3_resource_connection_info.access_key.unwrap(),
+            secretAccessKey: s3_resource_connection_info.secret_key.unwrap(),
+        },
+        forcePathStyle: true,
+        region: config.DEFAULT_REGION,
         signatureVersion: cloud_utils.get_s3_endpoint_signature_ver(s3_resource_connection_info.endpoint,
             s3_resource_connection_info.auth_method),
-        s3ForcePathStyle: true,
-        httpOptions: { agent }
+        requestHandler: noobaa_s3_client.get_requestHandler_with_suitable_agent(s3_resource_connection_info.endpoint),
     });
 
     return s3;

@@ -120,6 +120,21 @@ module.exports = {
             }
         },
 
+        archive_policy: {
+            type: 'object',
+            required: ['deep_archive_resource'],
+            properties: {
+                deep_archive_resource: {
+                    type: 'object',
+                    required: ['resource'],
+                    properties: {
+                        resource: { objectid: true }, // namespace resource id
+                        path: { type: 'string' },
+                    }
+                },
+            }
+        },
+
         force_md5_etag: {
             type: 'boolean' // enable md5 calculation per bucket
         },
@@ -203,22 +218,14 @@ module.exports = {
         lifecycle_configuration_rules: {
             $ref: 'common_api#/definitions/bucket_lifecycle_configuration'
         },
+        //cors rules if exist
+        cors_configuration_rules: {
+            $ref: 'common_api#/definitions/bucket_cors_configuration'
+        },
         tagging: {
             $ref: 'common_api#/definitions/tagging',
         },
-        bucket_claim: {
-            type: 'object',
-            required: ['bucket_class', 'namespace'],
-            properties: {
-                // TODO: Fill this with relevant info
-                bucket_class: {
-                    type: 'string',
-                },
-                namespace: {
-                    type: 'string',
-                },
-            }
-        },
+        bucket_claim: { $ref: 'common_api#/definitions/bucket_claim' },
         encryption: {
             $ref: 'common_api#/definitions/bucket_encryption',
         },
@@ -227,43 +234,6 @@ module.exports = {
         },
         s3_policy: {
             $ref: 'common_api#/definitions/bucket_policy',
-        },
-        lambda_triggers: {
-            type: 'array',
-            items: {
-                type: 'object',
-                required: ['_id', 'event_name', 'func_name', 'func_version', 'enabled'],
-                properties: {
-                    _id: {
-                        objectid: true
-                    },
-                    event_name: {
-                        enum: ['ObjectCreated', 'ObjectRemoved', 'ObjectRead' /* 'ObjectCreated:Put', 'ObjectCreated:CompleteMultipartUpload', ... */ ],
-                        type: 'string'
-                    },
-                    func_name: {
-                        type: 'string'
-                    },
-                    func_version: {
-                        type: 'string'
-                    },
-                    enabled: {
-                        type: 'boolean',
-                    },
-                    last_run: {
-                        idate: true
-                    },
-                    object_prefix: {
-                        type: 'string'
-                    },
-                    object_suffix: {
-                        type: 'string'
-                    },
-                    attempts: {
-                        type: 'integer'
-                    },
-                }
-            }
         },
         stats: {
             type: 'object',
@@ -275,5 +245,14 @@ module.exports = {
         logging: {
             $ref: 'common_api#/definitions/bucket_logging',
         },
+        notifications: {
+            type: 'array',
+            items: {
+                $ref: 'common_api#/definitions/bucket_notification'
+            }
+        },
+        public_access_block: {
+            $ref: 'common_api#/definitions/public_access_block',
+        }
     }
 };

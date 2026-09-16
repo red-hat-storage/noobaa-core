@@ -69,28 +69,28 @@ const NOOBAA_CORE_METRICS = js_utils.deep_freeze([{
         }
     }, {
         type: 'Gauge',
-        name: 'providers_bandwidth_write_size',
+        name: 'providers_bandwidth_write_size_total',
         configuration: {
             help: 'Providers bandwidth write size',
             labelNames: ['type'],
         }
     }, {
         type: 'Gauge',
-        name: 'providers_bandwidth_read_size',
+        name: 'providers_bandwidth_read_size_total',
         configuration: {
             help: 'Providers bandwidth read size',
             labelNames: ['type']
         }
     }, {
         type: 'Gauge',
-        name: 'providers_ops_read_num',
+        name: 'providers_ops_read_count',
         configuration: {
             help: 'Providers number of read operations',
             labelNames: ['type']
         }
     }, {
         type: 'Gauge',
-        name: 'providers_ops_write_num',
+        name: 'providers_ops_write_count',
         configuration: {
             help: 'Providers number of write operations',
             labelNames: ['type']
@@ -262,7 +262,7 @@ const NOOBAA_CORE_METRICS = js_utils.deep_freeze([{
         name: 'bucket_status',
         configuration: {
             help: 'Bucket Health',
-            labelNames: ['bucket_name']
+            labelNames: ['bucket_name', 'bucket_mode']
         }
     },
     {
@@ -270,7 +270,7 @@ const NOOBAA_CORE_METRICS = js_utils.deep_freeze([{
         name: 'namespace_bucket_status',
         configuration: {
             help: 'Namespace Bucket Health',
-            labelNames: ['bucket_name'],
+            labelNames: ['bucket_name', 'bucket_mode'],
         },
     }, {
         type: 'Gauge',
@@ -291,21 +291,49 @@ const NOOBAA_CORE_METRICS = js_utils.deep_freeze([{
         type: 'Gauge',
         name: 'bucket_capacity',
         configuration: {
-            help: 'Bucket Capacity Precent',
+            help: 'Bucket Capacity Percent',
             labelNames: ['bucket_name']
+        }
+    }, {
+        type: 'Gauge',
+        name: 'backing_store_low_capacity',
+        configuration: {
+            help: 'Backing Store Low Capacity Status (0=normal, 1=low capacity)',
+            labelNames: ['backing_store_name']
         }
     }, {
         type: 'Gauge',
         name: 'bucket_size_quota',
         configuration: {
-            help: 'Bucket Size Quota Precent',
+            help: 'Bucket Size Quota Percent',
             labelNames: ['bucket_name']
         }
     }, {
         type: 'Gauge',
         name: 'bucket_quantity_quota',
         configuration: {
-            help: 'Bucket Quantity Quota Precent',
+            help: 'Bucket Quantity Quota Percent',
+            labelNames: ['bucket_name']
+        }
+    }, {
+        type: 'Gauge',
+        name: 'bucket_object_count',
+        configuration: {
+            help: 'Current Number of Objects per Bucket',
+            labelNames: ['bucket_name']
+        }
+    }, {
+        type: 'Gauge',
+        name: 'bucket_max_objects_quota',
+        configuration: {
+            help: 'Bucket Maximum Objects Quota',
+            labelNames: ['bucket_name']
+        }
+    }, {
+        type: 'Gauge',
+        name: 'bucket_max_bytes_quota',
+        configuration: {
+            help: 'Bucket Maximum Bytes Quota',
             labelNames: ['bucket_name']
         }
     }, {
@@ -384,10 +412,39 @@ const NOOBAA_CORE_METRICS = js_utils.deep_freeze([{
         }
     }, {
         type: 'Gauge',
+        name: 'bucket_last_cycle_total_objects_num',
+        configuration: {
+            help: 'Total number of objects scanned per bucket in last replication cycle',
+            labelNames: ['bucket_name']
+        }
+    }, {
+        type: 'Gauge',
+        name: 'bucket_last_cycle_replicated_objects_num',
+        configuration: {
+            help: 'Number of objects replicated per bucket in last replication cycle',
+            labelNames: ['bucket_name']
+        }
+    }, {
+        type: 'Gauge',
+        name: 'bucket_last_cycle_error_objects_num',
+        configuration: {
+            help: 'Number of objects failed to replicate per bucket in last replication cycle',
+            labelNames: ['bucket_name']
+        }
+    }, {
+        type: 'Gauge',
         name: 'bucket_used_bytes',
         configuration: {
             help: 'Object Bucket Used Bytes',
             labelNames: ['bucket_name']
+        }
+    },
+    {
+        type: 'Gauge',
+        name: 'replication_target_status',
+        configuration: {
+            help: 'Replication target bucket reachability status (1=reachable, 0=unreachable)',
+            labelNames: ['replication_id', 'source_bucket', 'target_bucket']
         }
     }
 ]);
@@ -498,15 +555,15 @@ class NooBaaCoreReport extends BasePrometheusReport {
     set_providers_bandwidth(type, write_size, read_size) {
         if (!this._metrics) return;
 
-        this._metrics.providers_bandwidth_read_size.set({ type }, read_size);
-        this._metrics.providers_bandwidth_write_size.set({ type }, write_size);
+        this._metrics.providers_bandwidth_read_size_total.set({ type }, read_size);
+        this._metrics.providers_bandwidth_write_size_total.set({ type }, write_size);
     }
 
     set_providers_ops(type, write_num, read_num) {
         if (!this._metrics) return;
 
-        this._metrics.providers_ops_read_num.set({ type }, read_num);
-        this._metrics.providers_ops_write_num.set({ type }, write_num);
+        this._metrics.providers_ops_read_count.set({ type }, read_num);
+        this._metrics.providers_ops_write_count.set({ type }, write_num);
     }
 
     set_providers_physical_logical(providers_stats) {
@@ -542,17 +599,24 @@ class NooBaaCoreReport extends BasePrometheusReport {
         this._metrics.bucket_capacity.reset();
         this._metrics.bucket_tagging.reset();
         this._metrics.bucket_used_bytes.reset();
+        this._metrics.bucket_object_count.reset();
+        this._metrics.bucket_max_objects_quota.reset();
+        this._metrics.bucket_max_bytes_quota.reset();
         buckets_info.forEach(bucket_info => {
-            const bucket_labels = { bucket_name: bucket_info.bucket_name };
+            const bucket_labels = { bucket_name: bucket_info.bucket_name, bucket_mode: bucket_info.mode };
+            const bucket_tagging_labels = { bucket_name: bucket_info.bucket_name };
             if (bucket_info.tagging && bucket_info.tagging.length) {
                 const tagging = bucket_info.tagging.map(tag => `{ ${tag.key} : ${tag.value} }`);
-                this._metrics.bucket_tagging.set({ ...bucket_labels, tagging }, Date.now());
+                this._metrics.bucket_tagging.set({ ...bucket_tagging_labels, tagging }, Date.now());
             }
             this._metrics.bucket_status.set(bucket_labels, Number(bucket_info.is_healthy));
-            this._metrics.bucket_size_quota.set({ bucket_name: bucket_info.bucket_name }, bucket_info.quota_size_precent);
+            this._metrics.bucket_size_quota.set({ bucket_name: bucket_info.bucket_name }, Math.min(100, bucket_info.quota_size_percent));
             this._metrics.bucket_quantity_quota.set({ bucket_name: bucket_info.bucket_name }, bucket_info.quota_quantity_percent);
-            this._metrics.bucket_capacity.set({ bucket_name: bucket_info.bucket_name }, bucket_info.capacity_precent);
+            this._metrics.bucket_capacity.set({ bucket_name: bucket_info.bucket_name }, bucket_info.capacity_percent);
             this._metrics.bucket_used_bytes.set({ bucket_name: bucket_info.bucket_name }, bucket_info.bucket_used_bytes);
+            this._metrics.bucket_object_count.set({ bucket_name: bucket_info.bucket_name }, bucket_info.object_count || 0);
+            this._metrics.bucket_max_objects_quota.set({ bucket_name: bucket_info.bucket_name }, bucket_info.quota_max_objects || 0);
+            this._metrics.bucket_max_bytes_quota.set({ bucket_name: bucket_info.bucket_name }, bucket_info.quota_max_bytes || 0);
         });
     }
 
@@ -561,10 +625,11 @@ class NooBaaCoreReport extends BasePrometheusReport {
         this._metrics.namespace_bucket_status.reset();
         this._metrics.namespace_bucket_tagging.reset();
         buckets_info.forEach(bucket_info => {
-            const bucket_labels = { bucket_name: bucket_info.bucket_name };
+            const bucket_labels = { bucket_name: bucket_info.bucket_name, bucket_mode: bucket_info.mode };
+            const bucket_tagging_labels = { bucket_name: bucket_info.bucket_name };
             if (bucket_info.tagging && bucket_info.tagging.length) {
                 const tagging = bucket_info.tagging.map(tag => `{ ${tag.key} : ${tag.value} }`);
-                this._metrics.namespace_bucket_tagging.set({ ...bucket_labels, tagging }, Date.now());
+                this._metrics.namespace_bucket_tagging.set({ ...bucket_tagging_labels, tagging }, Date.now());
             }
             this._metrics.namespace_bucket_status.set(bucket_labels, Number(bucket_info.is_healthy));
         });
@@ -574,8 +639,12 @@ class NooBaaCoreReport extends BasePrometheusReport {
         if (!this._metrics) return;
 
         this._metrics.resource_status.reset();
+        this._metrics.backing_store_low_capacity.reset();
         resources_info.forEach(resource_info => {
             this._metrics.resource_status.set({ resource_name: resource_info.resource_name }, Number(resource_info.is_healthy));
+            this._metrics.backing_store_low_capacity.set(
+                { backing_store_name: resource_info.resource_name },
+                Number(resource_info.is_low_capacity));
         });
     }
 
@@ -592,23 +661,26 @@ class NooBaaCoreReport extends BasePrometheusReport {
     update_providers_bandwidth(type, write_size, read_size) {
         if (!this._metrics) return;
 
-        this._metrics.providers_bandwidth_read_size.inc({ type }, read_size);
-        this._metrics.providers_bandwidth_write_size.inc({ type }, write_size);
+        this._metrics.providers_bandwidth_read_size_total.inc({ type }, read_size);
+        this._metrics.providers_bandwidth_write_size_total.inc({ type }, write_size);
     }
 
     update_providers_ops(type, write_num, read_num) {
         if (!this._metrics) return;
 
-        this._metrics.providers_ops_read_num.inc({ type }, read_num);
-        this._metrics.providers_ops_write_num.inc({ type }, write_num);
+        this._metrics.providers_ops_read_count.inc({ type }, read_num);
+        this._metrics.providers_ops_write_count.inc({ type }, write_num);
     }
 
     set_replication_status(repl_info) {
         if (!this._metrics) return;
         const replication_id = repl_info.replication_id;
+        const bucket_name = repl_info.bucket_name;
         delete this._metrics.replication_status.hashMap[String(repl_info.replication_id)];
         this._metrics.replication_status.set(_.omit(repl_info, ['last_cycle_writes_size',
-            'last_cycle_writes_num', 'last_cycle_error_writes_size', 'last_cycle_error_writes_num'
+            'last_cycle_writes_num', 'last_cycle_error_writes_size', 'last_cycle_error_writes_num',
+            'bucket_last_cycle_total_objects_num', 'bucket_last_cycle_replicated_objects_num',
+            'bucket_last_cycle_error_objects_num'
         ]), Date.now());
 
         delete this._metrics.replication_last_cycle_writes_size.hashMap[String(repl_info.replication_id)];
@@ -622,7 +694,33 @@ class NooBaaCoreReport extends BasePrometheusReport {
 
         delete this._metrics.replication_last_cycle_error_writes_num.hashMap[String(repl_info.replication_id)];
         this._metrics.replication_last_cycle_error_writes_num.set({ replication_id }, repl_info.last_cycle_error_writes_num);
+
+        delete this._metrics.bucket_last_cycle_total_objects_num.hashMap[String(bucket_name)];
+        this._metrics.bucket_last_cycle_total_objects_num.set({ bucket_name }, repl_info.bucket_last_cycle_total_objects_num);
+
+        delete this._metrics.bucket_last_cycle_replicated_objects_num.hashMap[String(bucket_name)];
+        this._metrics.bucket_last_cycle_replicated_objects_num.set({ bucket_name }, repl_info.bucket_last_cycle_replicated_objects_num);
+
+        delete this._metrics.bucket_last_cycle_error_objects_num.hashMap[String(bucket_name)];
+        this._metrics.bucket_last_cycle_error_objects_num.set({ bucket_name }, repl_info.bucket_last_cycle_error_objects_num);
     }
+
+    set_replication_target_status(replication_id, source_bucket, target_bucket, is_reachable) {
+        if (!this._metrics) return;
+        this._metrics.replication_target_status.set({ replication_id, source_bucket, target_bucket }, Number(is_reachable));
+    }
+
+    clear_replication_target_status_by_replication_id(replication_id) {
+        const gauge_hash_map = this._metrics?.replication_target_status?.hashMap;
+        if (!gauge_hash_map) return;
+
+        const id = String(replication_id);
+        for (const key of Object.keys(gauge_hash_map)) {
+            const entry = gauge_hash_map[key];
+            if (entry?.labels?.replication_id === id) delete gauge_hash_map[key];
+        }
+    }
+
 }
 
 exports.NooBaaCoreReport = NooBaaCoreReport;

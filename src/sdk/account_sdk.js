@@ -16,9 +16,10 @@ class AccountSDK {
      *      internal_rpc_client: nb.APIClient;
      *      bucketspace?: nb.BucketSpace;
      *      accountspace?: nb.AccountSpace;
+     *      stats?: import('./endpoint_stats_collector').EndpointStatsCollector;
      * }} args
      */
-    constructor({ rpc_client, internal_rpc_client, bucketspace, accountspace }) {
+    constructor({ rpc_client, internal_rpc_client, bucketspace, accountspace, stats }) {
         this.rpc_client = rpc_client;
         this.internal_rpc_client = internal_rpc_client;
         this.requesting_account = undefined;
@@ -27,6 +28,7 @@ class AccountSDK {
         this.bucketspace = bucketspace || new BucketSpaceNB({ rpc_client, internal_rpc_client });
         const config_root = config.NSFS_NC_DEFAULT_CONF_DIR;
         this.accountspace = accountspace || new AccountSpaceFS({ config_root });
+        this.stats = stats;
     }
 
     set_auth_token(auth_token) {
@@ -93,28 +95,87 @@ class AccountSDK {
     ////////////
 
     async create_user(params) {
-        const accountspace = this._get_accountspace();
-        return accountspace.create_user(params, this);
+        const op_func = () => {
+            const accountspace = this._get_accountspace();
+            return accountspace.create_user(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            service: 'iam',
+            op_name: 'create_user',
+            op_func,
+        });
     }
 
     async get_user(params) {
-        const accountspace = this._get_accountspace();
-        return accountspace.get_user(params, this);
+        const op_func = () => {
+            const accountspace = this._get_accountspace();
+            return accountspace.get_user(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            service: 'iam',
+            op_name: 'get_user',
+            op_func,
+        });
     }
 
     async update_user(params) {
-        const accountspace = this._get_accountspace();
-        return accountspace.update_user(params, this);
+        const op_func = () => {
+            const accountspace = this._get_accountspace();
+            return accountspace.update_user(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            service: 'iam',
+            op_name: 'update_user',
+            op_func,
+        });
     }
 
     async delete_user(params) {
-        const accountspace = this._get_accountspace();
-        return accountspace.delete_user(params, this);
+        const op_func = () => {
+            const accountspace = this._get_accountspace();
+            return accountspace.delete_user(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            service: 'iam',
+            op_name: 'delete_user',
+            op_func,
+        });
     }
 
     async list_users(params) {
+        const op_func = () => {
+            const accountspace = this._get_accountspace();
+            return accountspace.list_users(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            service: 'iam',
+            op_name: 'list_users',
+            op_func,
+        });
+    }
+
+    ////////////
+    // TAGS   //
+    ////////////
+
+    async tag_user(params) {
         const accountspace = this._get_accountspace();
-        return accountspace.list_users(params, this);
+        return accountspace.tag_user(params, this);
+    }
+
+    async untag_user(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.untag_user(params, this);
+    }
+
+    async list_user_tags(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.list_user_tags(params, this);
     }
 
     ////////////////
@@ -122,28 +183,150 @@ class AccountSDK {
     ////////////////
 
     async create_access_key(params) {
-        const accountspace = this._get_accountspace();
-        return accountspace.create_access_key(params, this);
+        const op_func = () => {
+            const accountspace = this._get_accountspace();
+            return accountspace.create_access_key(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            service: 'iam',
+            op_name: 'create_access_key',
+            op_func,
+        });
     }
 
     async get_access_key_last_used(params) {
-        const accountspace = this._get_accountspace();
-        return accountspace.get_access_key_last_used(params, this);
+        const op_func = () => {
+            const accountspace = this._get_accountspace();
+            return accountspace.get_access_key_last_used(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            service: 'iam',
+            op_name: 'get_access_key_last_used',
+            op_func,
+        });
     }
 
     async update_access_key(params) {
-        const accountspace = this._get_accountspace();
-        return accountspace.update_access_key(params, this);
+        const op_func = () => {
+            const accountspace = this._get_accountspace();
+            return accountspace.update_access_key(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            service: 'iam',
+            op_name: 'update_access_key',
+            op_func,
+        });
     }
 
     async delete_access_key(params) {
-        const accountspace = this._get_accountspace();
-        return accountspace.delete_access_key(params, this);
+        const op_func = () => {
+            const accountspace = this._get_accountspace();
+            return accountspace.delete_access_key(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            service: 'iam',
+            op_name: 'delete_access_key',
+            op_func,
+        });
     }
 
     async list_access_keys(params) {
+        const op_func = () => {
+            const accountspace = this._get_accountspace();
+            return accountspace.list_access_keys(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            service: 'iam',
+            op_name: 'list_access_keys',
+            op_func,
+        });
+    }
+
+    /////////////////
+    // USER POLICY //
+    /////////////////
+
+    async put_user_policy(params) {
         const accountspace = this._get_accountspace();
-        return accountspace.list_access_keys(params, this);
+        return accountspace.put_user_policy(params, this);
+    }
+
+    async get_user_policy(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.get_user_policy(params, this);
+    }
+
+    async delete_user_policy(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.delete_user_policy(params, this);
+    }
+
+    async list_user_policies(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.list_user_policies(params, this);
+    }
+
+    ////////////
+    // ROLE   //
+    ////////////
+
+    async create_role(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.create_role(params, this);
+    }
+
+    async get_role(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.get_role(params, this);
+    }
+
+    async update_role(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.update_role(params, this);
+    }
+
+    async delete_role(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.delete_role(params, this);
+    }
+
+    async list_roles(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.list_roles(params, this);
+    }
+
+    ////////////////////
+    // ROLE POLICY  //
+    ////////////////////
+
+    async put_role_policy(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.put_role_policy(params, this);
+    }
+
+    async get_role_policy(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.get_role_policy(params, this);
+    }
+
+    async delete_role_policy(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.delete_role_policy(params, this);
+    }
+
+    async list_role_policies(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.list_role_policies(params, this);
+    }
+
+    async update_assume_role_policy(params) {
+        const accountspace = this._get_accountspace();
+        return accountspace.update_assume_role_policy(params, this);
     }
 }
 

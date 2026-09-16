@@ -23,10 +23,14 @@ const NamespaceMerge = require('./namespace_merge');
 const NamespaceCache = require('./namespace_cache');
 const NamespaceMultipart = require('./namespace_multipart');
 const NamespaceNetStorage = require('./namespace_net_storage');
+const NamespaceMultiStorageClass = require('./namespace_multi_storage_class');
 const BucketSpaceNB = require('./bucketspace_nb');
+const s3_utils = require('../endpoint/s3/s3_utils');
 const { RpcError } = require('../rpc');
+const noobaa_s3_client = require('../sdk/noobaa_s3_client/noobaa_s3_client');
 
 const anonymous_access_key = Symbol('anonymous_access_key');
+
 const bucket_namespace_cache = new LRUCache({
     name: 'ObjectSDK-Bucket-Namespace-Cache',
     // This is intentional. Cache entry expiration is handled by _validate_bucket_namespace().
@@ -45,10 +49,10 @@ const bucket_namespace_cache = new LRUCache({
     validate: (data, params) => params.sdk._validate_bucket_namespace(data, params),
 });
 
+// TODO: account_cache should be in account_sdk
 const account_cache = new LRUCache({
     name: 'AccountCache',
-    // TODO: Decide on a time that we want to invalidate
-    expiry_ms: Number(process.env.ACCOUNTS_CACHE_EXPIRY) || 10 * 60 * 1000,
+    expiry_ms: config.OBJECT_SDK_ACCOUNT_CACHE_EXPIRY_MS,
     /**
      * Set type for the generic template
      * @param {{
@@ -58,6 +62,24 @@ const account_cache = new LRUCache({
      */
     make_key: ({ access_key }) => access_key,
     load: async ({ bucketspace, access_key }) => bucketspace.read_account_by_access_key({ access_key }),
+    validate: (data, params) => _validate_account(data, params),
+});
+
+// IAM role cache — keyed by owner + role_name (role names are unique per account, not globally)
+const iam_roles_cache = new LRUCache({
+    name: 'IamRolesCache',
+    expiry_ms: config.IAM_ROLES_CACHE_EXPIRY_MS,
+    /**
+     * Set type for the generic template
+     * @param {{
+     *      role_name: string;
+     *      owner_account_id: string;
+     *      bucketspace: nb.BucketSpace;
+     * }} params
+     */
+    make_key: ({ role_name, owner_account_id }) => `${owner_account_id}:${role_name.toLowerCase()}`,
+    load: async ({ bucketspace, role_name, owner_account_id }) =>
+        bucketspace.read_role_by_name({ role_name, owner_account_id }),
 });
 
 const dn_cache = new LRUCache({
@@ -67,17 +89,55 @@ const dn_cache = new LRUCache({
     /**
      * Set type for the generic template
      * @param {{
-    *      distinguished_name: string;
-    * }} params
-    */
+     *      distinguished_name: string;
+     * }} params
+     */
     make_key: ({ distinguished_name }) => distinguished_name,
     load: async ({ distinguished_name }) => native_fs_utils.get_user_by_distinguished_name({ distinguished_name }),
- });
+});
+
+const supplemental_groups_cache = new LRUCache({
+    name: 'SupplementalGroupsCache',
+    expiry_ms: config.NSFS_SUPPLEMENTAL_GROUPS_CACHE_EXPIRY_MS,
+    /**
+     * @param {{ uid: number; name?: string; gid?: number }} params
+     */
+    make_key: ({ uid }) => uid,
+    /**
+     * When user_from_dn provides name/gid, use get_supplemental_groups_by_user to avoid redundant getpwuid_r.
+     * @param {{ uid: number; name?: string; gid?: number }} params
+     */
+    load: async ({ uid, name, gid }) => {
+        if (name !== undefined && gid !== undefined) {
+            return native_fs_utils.get_supplemental_groups_by_user({ name, gid });
+        }
+        return native_fs_utils.get_supplemental_groups_by_uid({ uid });
+    },
+});
 
 const MULTIPART_NAMESPACES = [
     'NET_STORAGE'
 ];
-const required_obj_properties = ['obj_id', 'bucket', 'key', 'size', 'content_type', 'etag'];
+
+/** _validate_account is an additional layer (to expiry_ms)
+ * and in NC deployment it checks the stat of the config file
+ * @param {object} data
+ * @param {object} params
+ * @returns Promise<{boolean>}
+ */
+// TODO: account function should be handled in account_sdk 
+async function _validate_account(data, params) {
+    // stat check (only in bucketspace FS)
+    const bs = params.bucketspace;
+    const bs_allow_stat_account = Boolean(bs.check_same_stat_account);
+    if (bs_allow_stat_account && config.NC_ENABLE_ACCOUNT_CACHE_STAT_VALIDATION) {
+        const same_stat = await bs.check_same_stat_account(params.access_key, data.stat);
+        if (!same_stat) { // config file of account was changed
+            return false;
+        }
+    }
+    return true;
+}
 
 class ObjectSDK {
 
@@ -106,22 +166,37 @@ class ObjectSDK {
      * in order to handle aborting requests gracefully. The `abort_controller` member will
      * be used to signal async flows that abort was detected.
      * @see {@link https://nodejs.org/docs/latest/api/globals.html#class-abortcontroller}
-     * @param {import('http').IncomingMessage} req
+     * @param {nb.S3Request} req
      * @param {import('http').ServerResponse} res
      */
     setup_abort_controller(req, res) {
         res.once('error', err => {
-            dbg.log0('response error:', err, req.url);
+            const sys_err = /** @type {NodeJS.ErrnoException} */ (err);
+            dbg.log0('S3 RESPONSE ERROR', {
+                request_id: req.request_id,
+                code: sys_err.code,
+                op: req.op_name,
+                bucket: req.params?.bucket,
+                duration_ms: req.start_time ? Date.now() - req.start_time : undefined,
+            }, err.message);
             this.abort_controller.abort(err);
         });
 
         req.once('error', err => {
-            dbg.log0('request error:', err, req.url);
+            const sys_err = /** @type {NodeJS.ErrnoException} */ (err);
+            dbg.log0('S3 REQUEST ERROR', {
+                request_id: req.request_id,
+                code: sys_err.code,
+                op: req.op_name,
+                bucket: req.params?.bucket,
+                key: req.params?.key,
+                duration_ms: req.start_time ? Date.now() - req.start_time : undefined,
+            }, err.message);
             this.abort_controller.abort(err);
         });
 
-        // TODO: aborted event is being deprecated since nodejs 16
-        // https://nodejs.org/dist/latest-v16.x/docs/api/http.html#event-aborted recommends on listening to close event
+        // TODO: aborted event is deprecated; use close and check !req.readableEnded instead
+        // https://nodejs.org/api/http.html#event-close
         // req.once('close', () => {
         //     dbg.log0('request aborted1', req.url);
 
@@ -132,7 +207,13 @@ class ObjectSDK {
         // });
 
         req.once('aborted', () => {
-            dbg.log0('request aborted', req.url);
+            dbg.log0('S3 REQUEST ABORTED', {
+                request_id: req.request_id,
+                op: req.op_name,
+                bucket: req.params?.bucket,
+                key: req.params?.key,
+                duration_ms: req.start_time ? Date.now() - req.start_time : undefined,
+            });
             this.abort_controller.abort(new Error('request aborted ' + req.url));
         });
     }
@@ -196,7 +277,9 @@ class ObjectSDK {
             s3_policy: bucket.s3_policy,
             system_owner: bucket.system_owner, // note that bucketspace_fs currently doesn't return system_owner
             bucket_owner: bucket.bucket_owner,
-            owner_account: bucket.owner_account, // in NC NSFS this is the account id that owns the bucket
+            bucket_owner_id: bucket.bucket_owner_id, // in containerized this is the account id that owns the bucket
+            owner_account: bucket.owner_account, // in NC NSFS this is an object of account id and name that owns the bucket
+            public_access_block: bucket.public_access_block,
         };
         return policy_info;
     }
@@ -210,6 +293,21 @@ class ObjectSDK {
         return bucket_namespace_cache.get_with_cache({ sdk: this, name });
     }
 
+    async read_bucket_sdk_cors_info(name) {
+        try {
+            const { bucket } = await bucket_namespace_cache.get_with_cache({ sdk: this, name });
+            return bucket.cors_configuration_rules;
+        } catch (error) {
+            if (error.rpc_code === 'NO_SUCH_BUCKET') return undefined;
+            throw error;
+        }
+    }
+
+    async read_bucket_sdk_lifecycle_rules(name) {
+        const { bucket } = await bucket_namespace_cache.get_with_cache({ sdk: this, name });
+        return bucket?.lifecycle_configuration_rules;
+    }
+
     async load_requesting_account(req) {
         try {
             const token = this.get_auth_token();
@@ -218,14 +316,40 @@ class ObjectSDK {
                 bucketspace: this._get_bucketspace(),
                 access_key: token ? token.access_key : anonymous_access_key,
             });
+            let distinguished_name;
             if (this.requesting_account?.nsfs_account_config?.distinguished_name) {
-                const distinguished_name = this.requesting_account.nsfs_account_config.distinguished_name.unwrap();
+                distinguished_name = this.requesting_account.nsfs_account_config.distinguished_name.unwrap();
                 const user = await dn_cache.get_with_cache({
                     bucketspace: this._get_bucketspace(),
                     distinguished_name,
                 });
                 this.requesting_account.nsfs_account_config.uid = user.uid;
                 this.requesting_account.nsfs_account_config.gid = user.gid;
+            }
+            const cfg = this.requesting_account?.nsfs_account_config;
+            const enable_dynamic = cfg && config.NSFS_ENABLE_DYNAMIC_SUPPLEMENTAL_GROUPS;
+            if (enable_dynamic && !cfg.supplemental_groups) {
+                let groups = [];
+                try {
+                    groups = await supplemental_groups_cache.get_with_cache({
+                        uid: this.requesting_account.nsfs_account_config.uid,
+                        name: distinguished_name,
+                        gid: this.requesting_account.nsfs_account_config.gid
+                    });
+                } catch (err) {
+                    dbg.error('load_requesting_account: supplemental groups lookup failed, proceeding without', err, err.code);
+                }
+                // Copy instead of mutating: this.requesting_account points at the shared account_cache
+                // entry (from get_with_cache above). Mutating it would persist supplemental_groups
+                // onto the cache, causing future requests to skip supplemental_groups_cache and
+                // serve stale groups until account_cache expires.
+                this.requesting_account = {
+                    ...this.requesting_account,
+                    nsfs_account_config: {
+                        ...this.requesting_account.nsfs_account_config,
+                        supplemental_groups: groups
+                    }
+                };
             }
         } catch (error) {
             dbg.error('load_requesting_account error:', error);
@@ -235,15 +359,36 @@ class ObjectSDK {
         }
     }
 
+    /**
+     * Load a single IAM role through the endpoint cache (not the public IAM GetRole API).
+     *
+     * Callers must pass owner_account_id (typically from the role ARN).
+     * (AssumeRoleWithWebIdentity) or be the caller rather than the role owner (AssumeRole).
+     *
+     * @param {string} role_name
+     * @param {string} owner_account_id
+     * @returns {Promise<object>}
+     */
+    async get_iam_role_by_name(role_name, owner_account_id) {
+        if (!owner_account_id) {
+            throw new RpcError('UNAUTHORIZED', 'owner_account_id is required');
+        }
+        return iam_roles_cache.get_with_cache({
+            bucketspace: this._get_bucketspace(),
+            role_name,
+            owner_account_id: String(owner_account_id),
+        });
+    }
+
     async authorize_request_account(req) {
-        const { bucket } = req.params;
+        const bucket = req.params?.bucket;
         const token = this.get_auth_token();
         // If the request is signed (authenticated)
         if (token) {
             signature_utils.authorize_request_account_by_token(token, this.requesting_account);
         }
         // check for a specific bucket
-        if (bucket && req.op_name !== 'put_bucket') {
+        if (bucket && req.op_name !== 'put_bucket' && req.op_name !== 'post_vector_bucket') {
             // ANONYMOUS: cannot work without bucket.
             // Return if the acount is anonymous
             if (this._get_bucketspace().is_nsfs_non_containerized_user_anonymous(token)) return;
@@ -286,6 +431,15 @@ class ObjectSDK {
 
     async _validate_bucket_namespace(data, params) {
         const time = Date.now();
+        // stat check (only in bucketspace FS)
+        const bs = this._get_bucketspace();
+        const bs_allow_stat_bucket = Boolean(bs.check_same_stat_bucket);
+        if (bs_allow_stat_bucket && config.NC_ENABLE_BUCKET_NS_CACHE_STAT_VALIDATION) {
+            const same_stat = await bs.check_same_stat_bucket(params.name, data.bucket.stat);
+            if (!same_stat) { // config file of bucket was changed
+                return false;
+            }
+        }
         if (time <= data.valid_until) return true;
         const bucket = await this._get_bucketspace().read_bucket_sdk_info({ name: params.name });
         if (_.isEqual(bucket, data.bucket)) {
@@ -311,6 +465,14 @@ class ObjectSDK {
         const time = Date.now();
         dbg.log1('_load_bucket_namespace', bucket);
         try {
+            if (bucket.archive_policy) {
+                return {
+                    ns: this._setup_multi_storage_class_namespace(bucket),
+                    bucket,
+                    valid_until: time + config.OBJECT_SDK_BUCKET_CACHE_EXPIRY_MS,
+                };
+            }
+
             if (bucket.namespace) {
 
                 if (bucket.namespace.caching) {
@@ -333,8 +495,7 @@ class ObjectSDK {
                     return {
                         ns: this._setup_single_namespace(
                             bucket.namespace.read_resources[0],
-                            bucket._id,
-                            {
+                            bucket._id, {
                                 versioning: bucket.bucket_info && bucket.bucket_info.versioning,
                                 force_md5_etag: bucket.force_md5_etag
                             },
@@ -391,12 +552,33 @@ class ObjectSDK {
                 write_resource: wr,
                 read_resources: _.map(rr, it => (
                     it.resource.endpoint_type === 'MULTIPART' ?
-                        it.ns :
-                        this._setup_single_namespace(it)
+                    it.ns :
+                    this._setup_single_namespace(it)
                 ))
             },
             active_triggers: bucket.active_triggers
         });
+    }
+
+    /**
+     * Builds a NamespaceMultiStorageClass for buckets with an archive_policy.
+     * STANDARD maps to NamespaceNB (metadata + data).
+     * DEEP_ARCHIVE / GLACIER map to NamespaceS3 (data only); metadata is owned by NamespaceMultiStorageClass
+     * @returns {nb.Namespace}
+     */
+    _setup_multi_storage_class_namespace(bucket) {
+        const namespace_nb = new NamespaceNB();
+        namespace_nb.set_triggers_for_bucket(bucket.name.unwrap(), bucket.active_triggers);
+
+        const namespace_by_storage_class = { [s3_utils.STORAGE_CLASS_STANDARD]: namespace_nb };
+
+        if (bucket.archive_policy?.deep_archive_resource) {
+            const deep_archive_ns = this._setup_single_namespace(bucket.archive_policy.deep_archive_resource);
+            namespace_by_storage_class[s3_utils.STORAGE_CLASS_DEEP_ARCHIVE] = deep_archive_ns;
+            namespace_by_storage_class[s3_utils.STORAGE_CLASS_GLACIER] = deep_archive_ns;
+        }
+
+        return new NamespaceMultiStorageClass({ namespace_by_storage_class });
     }
 
     /**
@@ -417,29 +599,26 @@ class ObjectSDK {
             r.endpoint_type === 'FLASHBLADE' ||
             r.endpoint_type === 'IBM_COS') {
 
-            const agent = r.endpoint_type === 'AWS' ?
-                http_utils.get_default_agent(r.endpoint) :
-                http_utils.get_unsecured_agent(r.endpoint);
-
             return new NamespaceS3({
                 namespace_resource_id: r.id,
                 s3_params: {
-                    params: { Bucket: r.target_bucket },
                     endpoint: r.endpoint,
                     aws_sts_arn: r.aws_sts_arn,
-                    accessKeyId: r.access_key.unwrap(),
-                    secretAccessKey: r.secret_key.unwrap(),
-                    // region: 'us-east-1', // TODO needed?
-                    signatureVersion: cloud_utils.get_s3_endpoint_signature_ver(r.endpoint, r.auth_method),
-                    s3ForcePathStyle: true,
-                    // computeChecksums: false, // disabled by default for performance
-                    httpOptions: { agent },
-                    access_mode: r.access_mode
+                    credentials: {
+                        accessKeyId: r.access_key.unwrap(),
+                        secretAccessKey: r.secret_key.unwrap(),
+                    },
+                    region: r.region || config.DEFAULT_REGION, // SDKv3 needs region
+                    forcePathStyle: true,
+                    requestHandler: noobaa_s3_client.get_requestHandler_with_suitable_agent(r.endpoint),
+                    requestChecksumCalculation: 'WHEN_REQUIRED',
+                    access_mode: r.access_mode,
                 },
+                bucket: r.target_bucket,
                 stats: this.stats,
             });
         }
-        if (r.endpoint_type === 'AZURE') {
+        if (r.endpoint_type === 'AZURE' || r.endpoint_type === 'AZURESTS') {
             return new NamespaceBlob({
                 namespace_resource_id: r.id,
                 container: r.target_bucket,
@@ -448,17 +627,18 @@ class ObjectSDK {
                 account_name: r.access_key.unwrap(),
                 account_key: r.secret_key.unwrap(),
                 access_mode: r.access_mode,
+                endpoint: r.endpoint,
+                endpoint_type: r.endpoint_type,
+                azure_client_id: r.azure_sts_credentials?.azure_client_id?.unwrap(),
+                azure_tenant_id: r.azure_sts_credentials?.azure_tenant_id?.unwrap(),
                 stats: this.stats,
             });
         }
-        if (r.endpoint_type === 'GOOGLE') {
-            const { project_id, private_key, client_email } = JSON.parse(r.secret_key.unwrap());
+        if (r.endpoint_type === 'GOOGLE' || r.endpoint_type === 'GOOGLE_STS') {
             return new NamespaceGCP({
                 namespace_resource_id: r.id,
                 target_bucket: r.target_bucket,
-                project_id,
-                client_email,
-                private_key,
+                credentials_json: r.secret_key.unwrap(),
                 access_mode: r.access_mode,
                 stats: this.stats,
             });
@@ -521,51 +701,20 @@ class ObjectSDK {
         return false;
     }
 
-    /**
-     * Calls the op and report time and error to stats collector.
-     * on_success can be added to update read/write stats (but on_success shouln't throw)
-     *
-     * @template T
-     * @param {{
-     *      op_name: string;
-     *      op_func: () => Promise<T>;
-     *      on_success?: () => void;
-     * }} params
-     * @returns {Promise<T>}
-     */
-    async _call_op_and_update_stats({ op_name, op_func, on_success = undefined }) {
-        const start_time = Date.now();
-        let error = 0;
-        try {
-            // cannot just return the promise from inside this try scope
-            // because rejections will not be caught unless we await.
-            // we could use `return await ...` too but wanted to make it more explicit.
-            const reply = await op_func();
-            if (on_success) on_success();
-            return reply;
-        } catch (e) {
-            error = 1;
-            throw e;
-        } finally {
-            this.stats?.update_ops_counters({
-                time: Date.now() - start_time,
-                op_name,
-                error,
-            });
-        }
-    }
 
     /////////////////
     // OBJECT LIST //
     /////////////////
 
     async list_objects(params) {
-        return this._call_op_and_update_stats({
+        const op_func = async () => {
+            const ns = await this._get_bucket_namespace(params.bucket);
+            return ns.list_objects(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
             op_name: 'list_objects',
-            op_func: async () => {
-                const ns = await this._get_bucket_namespace(params.bucket);
-                return ns.list_objects(params, this);
-            },
+            op_func,
         });
     }
 
@@ -584,24 +733,28 @@ class ObjectSDK {
     /////////////////
 
     async read_object_md(params) {
-        return this._call_op_and_update_stats({
-            op_name: 'head_object',
-            op_func: async () => {
-                const ns = await this._get_bucket_namespace(params.bucket);
-                return ns.read_object_md(params, this);
-            },
+        const op_func = async () => {
+            const ns = await this._get_bucket_namespace(params.bucket);
+            return ns.read_object_md(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
+            op_name: 'read_object',
+            op_func,
         });
     }
 
     async read_object_stream(params, res) {
-        return this._call_op_and_update_stats({
+        const op_func = async () => {
+            const ns = await this._get_bucket_namespace(params.bucket);
+            return ns.read_object_stream(params, this, res);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
             op_name: 'read_object',
-            op_func: async () => {
-                const ns = await this._get_bucket_namespace(params.bucket);
-                return ns.read_object_stream(params, this, res);
-            },
+            op_func,
             on_success: () => {
-                this.stats?.update_bucket_read_counters({
+                this.stats.update_bucket_read_counters({
                     bucket_name: params.bucket,
                     key: params.key,
                     content_type: params.content_type
@@ -640,6 +793,7 @@ class ObjectSDK {
         if (params.xattr_copy) {
             params.xattr = source_md.xattr;
             params.content_type = source_md.content_type;
+            params.content_encoding = source_md.content_encoding;
         }
         try {
             //omitBy iterates all xattr calling startsWith on them. this can include symbols such as XATTR_SORT_SYMBOL.
@@ -725,14 +879,16 @@ class ObjectSDK {
     }
 
     async upload_object(params) {
-        return this._call_op_and_update_stats({
+        const op_func = async () => {
+            const ns = await this._get_bucket_namespace(params.bucket);
+            this._check_is_readonly_namespace(ns);
+            if (params.copy_source) await this.fix_copy_source_params(params, ns);
+            return ns.upload_object(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
             op_name: 'upload_object',
-            op_func: async () => {
-                const ns = await this._get_bucket_namespace(params.bucket);
-                this._check_is_readonly_namespace(ns);
-                if (params.copy_source) await this.fix_copy_source_params(params, ns);
-                return ns.upload_object(params, this);
-            },
+            op_func,
             on_success: () => {
                 this.stats?.update_bucket_write_counters({
                     bucket_name: params.bucket,
@@ -748,13 +904,14 @@ class ObjectSDK {
     /////////////////////////////
 
     async create_object_upload(params) {
-        return this._call_op_and_update_stats({
+        const op_func = async () => {
+            const ns = await this._get_bucket_namespace(params.bucket);
+            return ns.create_object_upload(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
             op_name: 'initiate_multipart',
-            op_func: async () => {
-                const ns = await this._get_bucket_namespace(params.bucket);
-                this._check_is_readonly_namespace(ns);
-                return ns.create_object_upload(params, this);
-            },
+            op_func,
             on_success: () => {
                 this.stats?.update_bucket_write_counters({
                     bucket_name: params.bucket,
@@ -766,14 +923,16 @@ class ObjectSDK {
     }
 
     async upload_multipart(params) {
-        return this._call_op_and_update_stats({
+        const op_func = async () => {
+            const ns = await this._get_bucket_namespace(params.bucket);
+            this._check_is_readonly_namespace(ns);
+            if (params.copy_source) await this.fix_copy_source_params(params, ns);
+            return ns.upload_multipart(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
             op_name: 'upload_part',
-            op_func: async () => {
-                const ns = await this._get_bucket_namespace(params.bucket);
-                this._check_is_readonly_namespace(ns);
-                if (params.copy_source) await this.fix_copy_source_params(params, ns);
-                return ns.upload_multipart(params, this);
-            },
+            op_func,
         });
     }
 
@@ -783,13 +942,15 @@ class ObjectSDK {
     }
 
     async complete_object_upload(params) {
-        return this._call_op_and_update_stats({
+        const op_func = async () => {
+            const ns = await this._get_bucket_namespace(params.bucket);
+            this._check_is_readonly_namespace(ns);
+            return ns.complete_object_upload(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
             op_name: 'complete_object_upload',
-            op_func: async () => {
-                const ns = await this._get_bucket_namespace(params.bucket);
-                this._check_is_readonly_namespace(ns);
-                return ns.complete_object_upload(params, this);
-            },
+            op_func,
         });
     }
 
@@ -827,13 +988,15 @@ class ObjectSDK {
     ///////////////////
 
     async delete_object(params) {
-        return this._call_op_and_update_stats({
+        const op_func = async () => {
+            const ns = await this._get_bucket_namespace(params.bucket);
+            this._check_is_readonly_namespace(ns);
+            return ns.delete_object(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
             op_name: 'delete_object',
-            op_func: async () => {
-                const ns = await this._get_bucket_namespace(params.bucket);
-                this._check_is_readonly_namespace(ns);
-                return ns.delete_object(params, this);
-            },
+            op_func,
         });
     }
 
@@ -877,13 +1040,15 @@ class ObjectSDK {
     // BUCKET //
     ////////////
 
-    async list_buckets() {
-        return this._call_op_and_update_stats({
+    async list_buckets(params = {}) {
+        const op_func = async () => {
+            const bs = this._get_bucketspace();
+            return bs.list_buckets(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
             op_name: 'list_buckets',
-            op_func: async () => {
-                const bs = this._get_bucketspace();
-                return bs.list_buckets(this);
-            },
+            op_func,
         });
     }
 
@@ -893,22 +1058,26 @@ class ObjectSDK {
     }
 
     async create_bucket(params) {
-        return this._call_op_and_update_stats({
+        const op_func = async () => {
+            const bs = this._get_bucketspace();
+            return bs.create_bucket(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
             op_name: 'create_bucket',
-            op_func: async () => {
-                const bs = this._get_bucketspace();
-                return bs.create_bucket(params, this);
-            },
+            op_func,
         });
     }
 
     async delete_bucket(params) {
-        return this._call_op_and_update_stats({
+        const op_func = async () => {
+            const bs = this._get_bucketspace();
+            return bs.delete_bucket(params, this);
+        };
+        if (!this.stats) return op_func();
+        return this.stats.call_op_and_update_stats({
             op_name: 'delete_bucket',
-            op_func: async () => {
-                const bs = this._get_bucketspace();
-                return bs.delete_bucket(params, this);
-            },
+            op_func,
         });
     }
 
@@ -946,7 +1115,7 @@ class ObjectSDK {
 
     async put_bucket_tagging(params) {
         const bs = this._get_bucketspace();
-        return bs.put_bucket_tagging(params);
+        return bs.put_bucket_tagging(params, this);
     }
 
     async delete_bucket_tagging(params) {
@@ -1051,19 +1220,41 @@ class ObjectSDK {
         });
     }
 
-    async dispatch_triggers({ active_triggers, obj, operation, bucket }) {
-        const dispatch = this.should_run_triggers({ active_triggers, obj, operation });
-        if (dispatch) {
-            const dispatch_obj = _.pick(obj, required_obj_properties);
-            // Dummy obj_id (not all flows return with obj_id and we need it for the API schema)
-            dispatch_obj.obj_id = '10101010aaaabbbbccccdddd';
-            await this.internal_rpc_client.object.dispatch_triggers({
-                bucket,
-                event_name: operation,
-                obj: dispatch_obj
-            });
-        }
+    /////////////////////////
+    // BUCKET NOTIFICATION //
+    /////////////////////////
+
+    async put_bucket_notification(params) {
+        const bs = this._get_bucketspace();
+        const res = bs.put_bucket_notification(params);
+        bucket_namespace_cache.invalidate_key(params.bucket_name);
+        return res;
     }
+
+    async get_bucket_notification(params) {
+        const { bucket } = await bucket_namespace_cache.get_with_cache({ sdk: this, name: params.bucket_name });
+        return bucket.notifications;
+    }
+
+    ////////////////////
+    // BUCKET CORS //
+    ////////////////////
+
+    async put_bucket_cors(params) {
+        const bs = this._get_bucketspace();
+        return bs.put_bucket_cors(params);
+    }
+
+    async delete_bucket_cors(params) {
+        const bs = this._get_bucketspace();
+        return bs.delete_bucket_cors(params);
+    }
+
+    async get_bucket_cors(params) {
+        const bs = this._get_bucketspace();
+        return bs.get_bucket_cors(params);
+    }
+
     ////////////////////
     //  OBJECT LOCK   //
     ////////////////////
@@ -1110,6 +1301,42 @@ class ObjectSDK {
         this._check_is_readonly_namespace(ns);
         return ns.put_object_acl(params, this);
     }
+
+    //////////////////////////
+    //  OBJECT ATTRIBUTES   //
+    //////////////////////////
+
+    async get_object_attributes(params) {
+        const ns = await this._get_bucket_namespace(params.bucket);
+        if (ns.get_object_attributes) {
+            return ns.get_object_attributes(params, this);
+        } else {
+            // fallback to calling get_object_md without attributes params
+            dbg.warn('namespace does not implement get_object_attributes action, fallback to read_object_md');
+            const md_params = { ...params };
+            delete md_params.attributes; // not part of the schema of read_object_md
+            return ns.read_object_md(md_params, this);
+        }
+    }
+
+    //////////////////////////
+    // PUBLIC ACCESS BLOCK  //
+    //////////////////////////
+
+    async get_public_access_block(params) {
+        const bs = this._get_bucketspace();
+        return bs.get_public_access_block?.({ bucket_name: params.name });
+    }
+
+    async put_public_access_block(params) {
+        const bs = this._get_bucketspace();
+        return bs.put_public_access_block?.({ bucket_name: params.name, public_access_block: params.public_access_block });
+    }
+
+    async delete_public_access_block(params) {
+        const bs = this._get_bucketspace();
+        return bs.delete_public_access_block?.({ bucket_name: params.name });
+    }
 }
 
 // EXPORT
@@ -1117,10 +1344,13 @@ module.exports = {
     ObjectSDK,
     anonymous_access_key: anonymous_access_key,
     account_cache: account_cache,
+    iam_roles_cache: iam_roles_cache,
     dn_cache: dn_cache,
 };
 
 module.exports = ObjectSDK;
 module.exports.anonymous_access_key = anonymous_access_key;
 module.exports.account_cache = account_cache;
+module.exports.iam_roles_cache = iam_roles_cache;
 module.exports.dn_cache = dn_cache;
+module.exports.supplemental_groups_cache = supplemental_groups_cache;

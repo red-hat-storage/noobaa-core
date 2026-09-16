@@ -3,7 +3,7 @@
 
 const _ = require('lodash');
 const util = require('util');
-const Semaphore = require('./semaphore');
+const semaphore = require('./semaphore');
 
 require('setimmediate'); // shim for the browser
 
@@ -28,7 +28,7 @@ function delay_unblocking(delay_ms) {
 
 /**
  * Simple array items mapping to async calls per item.
- * 
+ *
  * @template K
  * @template V
  * @param {Array<K>} arr
@@ -41,22 +41,48 @@ async function map(arr, func) {
 
 /**
  * Map with limited concurrency.
- * 
+ *
  * @template K
  * @template V
- * @param {number} concurrency 
+ * @param {number} concurrency
  * @param {Array<K>} arr
  * @param {(key:K, index?:number) => Promise<V>} func
  * @returns {Promise<Array<V>>}
  */
 async function map_with_concurrency(concurrency, arr, func) {
-    const sem = new Semaphore(concurrency);
+    const sem = new semaphore.Semaphore(concurrency);
     return Promise.all(arr.map(async (key, index) => sem.surround(async () => func(key, index))));
+}
+
+async function map_with_concurrency_and_attempts(concurrency, max_attempts, delay_ms, arr, func) {
+    const sem = new semaphore.Semaphore(concurrency);
+    const promises = [];
+    promises.length = arr.length;
+    arr.forEach((v, j) => {
+        promises[j] = (async () => {
+            let i = 0;
+            while (i < max_attempts) {
+                try {
+                    return await sem.surround(async () => func(v, j));
+                } catch (e) {
+                    i += 1;
+                    if (i >= max_attempts) {
+                        throw e;
+                    }
+                    if (delay_ms) {
+                        const backoff = delay_ms * (2 ** (i - 1));
+                        await delay(backoff + Math.random() * backoff);
+                    }
+                }
+            }
+        })();
+    });
+    return Promise.all(promises);
 }
 
 /**
  * map_one_by_one iterates the array and maps its values one by one.
- * 
+ *
  * @template K
  * @template V
  * @param {Array<K>} arr
@@ -76,7 +102,7 @@ async function map_one_by_one(arr, func) {
 /**
  * @see https://stackoverflow.com/questions/48011353/how-to-unwrap-type-of-a-promise
  * @template T
- * @typedef {T extends PromiseLike<infer U> 
+ * @typedef {T extends PromiseLike<infer U>
  *  ? { 0:P.Unwrap<U>; 1:U }[T extends PromiseLike<any> ? 0 : 1]
  *  : T
  * } P.Unwrap;
@@ -85,13 +111,13 @@ async function map_one_by_one(arr, func) {
 /**
  * Return a new object with the same properties of obj
  * after awaiting all its values, concurrently.
- * 
+ *
  * Example:
  *          const { buckets, accounts } = await P.map_props({
  *              buckets: this.load_buckets(),
  *              accounts: this.load_accounts(),
  *          });
- * 
+ *
  * @template T
  * @param {T} obj
  * @returns {Promise<{[K in keyof T]: P.Unwrap<T[K]>}>}
@@ -110,7 +136,7 @@ async function map_props(obj) {
  * any returns the result of the first promise to resolve.
  * first promise to succeed will resolve the entire call and we're done.
  * but if all are settled without anyone resolving, we call reject.
- * 
+ *
  * @template K
  * @template V
  * @param {Array<K>} arr
@@ -135,8 +161,8 @@ const default_create_timeout_err = () => new TimeoutError();
 
 /**
  * When millis is undefined we do NOT set a timeout, and return the provided promise as is.
- * This allows to use it for optional timeout params: P.timeout(options.timeout, promise) 
- * 
+ * This allows to use it for optional timeout params: P.timeout(options.timeout, promise)
+ *
  * @template T
  * @param {number|undefined} millis when millis is undefined promise is returned as is
  * @param {Promise<T>} promise
@@ -148,20 +174,22 @@ async function timeout(millis, promise, create_timeout_err = default_create_time
     if (typeof millis === 'undefined') return promise;
     return new Promise((resolve, reject) => {
         let timer = setTimeout(() => {
-            // wish we could let the promise know so it could save some redundant work 
+            // wish we could let the promise know so it could save some redundant work
             reject(create_timeout_err());
         }, millis);
         if (timer.unref) timer.unref(); // browsers don't have unref
-        promise.then(res => {
-            clearTimeout(timer);
-            timer = null;
-            resolve(res);
-        });
-        promise.catch(err => {
-            clearTimeout(timer);
-            timer = null;
-            reject(err);
-        });
+        promise.then(
+            res => {
+                clearTimeout(timer);
+                timer = null;
+                resolve(res);
+            },
+            err => {
+                clearTimeout(timer);
+                timer = null;
+                reject(err);
+            }
+        );
     });
 }
 
@@ -172,11 +200,12 @@ async function timeout(millis, promise, create_timeout_err = default_create_time
  *  attempts: number, // number of attempts. can be Infinity.
  *  delay_ms: number, // number of milliseconds between retries
  *  func: (attemtpts:number) => Promise<T>, // passing remaining attempts just fyi
+ *  should_retry_func?: (err:Error) => boolean, // function to determine if the error should be retried. Otherwise, the error is thrown
  *  error_logger?: (err:Error) => void,
  * }} params
  * @returns {Promise<T>}
  */
-async function retry({ attempts, delay_ms, func, error_logger }) {
+async function retry({ attempts, delay_ms, func, error_logger, should_retry_func }) {
     for (;;) {
         try {
             // call func and catch errors,
@@ -187,17 +216,18 @@ async function retry({ attempts, delay_ms, func, error_logger }) {
             return res;
 
         } catch (err) {
-
             // check attempts
             attempts -= 1;
-            if (attempts <= 0 || err.DO_NOT_RETRY) {
+            if (attempts <= 0 || err.DO_NOT_RETRY || (should_retry_func && !should_retry_func(err))) {
                 throw err;
             }
 
             if (error_logger) error_logger(err);
 
             // delay and retry next attempt
-            await delay(delay_ms);
+            if (delay_ms) {
+                await delay(delay_ms);
+            }
         }
     }
 }
@@ -208,56 +238,6 @@ async function retry({ attempts, delay_ms, func, error_logger }) {
 // LEGACY UTILITIES - DEPRECATED ! //
 /////////////////////////////////////
 /////////////////////////////////////
-
-/**
- * @deprecated LEGACY PROMISE UTILS - DEPRECATED IN FAVOR OF ASYNC-AWAIT
- */
-class Defer {
-
-    constructor() {
-        this.isPending = true;
-        this.isResolved = false;
-        this.isRejected = false;
-        this.promise = new Promise((resolve, reject) => {
-            this._promise_resolve = resolve;
-            this._promise_reject = reject;
-        });
-        Object.seal(this);
-    }
-
-    // setting resolve and reject to assert that the current code assumes 
-    // the Promise ctor is calling the callback synchronously and not deferring it,
-    // otherwise we might have weird cases that we miss the caller's resolve/reject
-    // events, so we throw to assert 
-
-    /**
-     * @param {any} [res]
-     * @returns {void}
-     */
-    resolve(res) {
-        if (!this.isPending) {
-            return;
-        }
-        this.isPending = false;
-        this.isResolved = true;
-        Object.freeze(this);
-        this._promise_resolve(res);
-    }
-
-    /**
-     * @param {Error} err
-     * @returns {void}
-     */
-    reject(err) {
-        if (!this.isPending) {
-            return;
-        }
-        this.isPending = false;
-        this.isRejected = true;
-        Object.freeze(this);
-        this._promise_reject(err);
-    }
-}
 
 /**
  * Callback is a template typedef to help propagate types correctly
@@ -310,18 +290,6 @@ async function fromCallback(receiver) {
     });
 }
 
-
-/**
- * @deprecated LEGACY PROMISE UTILS - DEPRECATED IN FAVOR OF ASYNC-AWAIT
- * @param {() => boolean} condition 
- * @param {() => Promise} body 
- */
-async function pwhile(condition, body) {
-    while (condition()) {
-        await body();
-    }
-}
-
 /**
  * Wait until an async condition is met.
  * @deprecated LEGACY PROMISE UTILS - DEPRECATED IN FAVOR OF ASYNC-AWAIT
@@ -350,6 +318,7 @@ exports.delay_unblocking = delay_unblocking;
 // mapping
 exports.map = map;
 exports.map_with_concurrency = map_with_concurrency;
+exports.map_with_concurrency_and_attempts = map_with_concurrency_and_attempts;
 exports.map_one_by_one = map_one_by_one;
 exports.map_props = map_props;
 exports.map_any = map_any;
@@ -358,13 +327,13 @@ exports.timeout = timeout;
 exports.TimeoutError = TimeoutError;
 exports.retry = retry;
 // should we deprecated usage of P.resolve/reject/all ?
-exports.resolve = val => Promise.resolve(val);
-exports.reject = err => Promise.reject(err);
+// we should probably keep all and remove resolve/reject
+// when resolve/reject are used, it is probably better to use async/await
+exports.resolve = val => Promise.resolve(val); // 178 occurrences
+exports.reject = err => Promise.reject(err); // 3 occurrences
 exports.all = arr => Promise.all(arr);
 // deprecated
-exports.fromCallback = fromCallback; // 44 occurrences
-exports.fcall = fcall; // 59 occurrences
-exports.ninvoke = ninvoke; // 30 occurrences
-exports.wait_until = wait_until; // 20 occurrences
-exports.Defer = Defer; // 13 occurrences
-exports.pwhile = pwhile; // 15 occurrences
+exports.fromCallback = fromCallback; // 28 occurrences
+exports.fcall = fcall; // 51 occurrences
+exports.ninvoke = ninvoke; // 26 occurrences
+exports.wait_until = wait_until; // 21 occurrences

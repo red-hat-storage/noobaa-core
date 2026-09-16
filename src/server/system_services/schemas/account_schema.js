@@ -22,12 +22,37 @@ module.exports = {
         email: { wrapper: SensitiveString },
         is_support: { type: 'boolean' },
         is_external: { type: 'boolean' },
+        identity_type: { $ref: 'common_api#/definitions/identity_type' },
 
         // password login
         has_login: { type: 'boolean' },
-        password: { wrapper: SensitiveString }, // bcrypted password
-        next_password_change: { date: true },
+        password: { wrapper: SensitiveString }, // bcrypted password - DEPRECATED
+        next_password_change: { date: true }, // DEPRECATED
+        // owner account id for IAM user or role, not present for accounts
+        owner: { objectid: true },
+        tagging: {
+            $ref: 'common_api#/definitions/tagging',
+        },
+        iam_path: { type: 'string' },
+        iam_inline_policies: {
+            type: 'array',
+            items: {
+                $ref: 'common_api#/definitions/iam_inline_policy',
+            }
+        },
 
+        description: { // role-only
+            type: 'string',
+        },
+        max_session_duration: { // role-only
+            type: 'integer',
+            minimum: 3600,
+            maximum: 43200,
+        },
+        assume_role_policy_document: { // role-only
+            $ref: 'common_api#/definitions/iam_trust_policy_document',
+        },
+        creation_date: { idate: true },
         // default policy for new buckets
         default_resource: { objectid: true },
         default_chunk_config: { objectid: true },
@@ -42,6 +67,8 @@ module.exports = {
                 properties: {
                     access_key: { $ref: 'common_api#/definitions/access_key' },
                     secret_key: { $ref: 'common_api#/definitions/secret_key' },
+                    deactivated: { type: 'boolean' },
+                    creation_date: { idate: true },
                 }
             }
         },
@@ -73,6 +100,9 @@ module.exports = {
                     aws_sts_arn: {
                         type: 'string'
                     },
+                    azure_sts_credentials: {
+                        $ref: 'common_api#/definitions/azure_sts_credentials'
+                    },
                     auth_method: {
                         type: 'string',
                         enum: ['AWS_V2', 'AWS_V4']
@@ -82,7 +112,7 @@ module.exports = {
                     cp_code: { type: 'string' },
                     endpoint_type: {
                         type: 'string',
-                        enum: ['AWSSTS', 'AWS', 'AZURE', 'S3_COMPATIBLE', 'GOOGLE', 'FLASHBLADE', 'NET_STORAGE', 'IBM_COS']
+                        enum: ['AWSSTS', 'AWS', 'AZURE', 'AZURESTS', 'S3_COMPATIBLE', 'GOOGLE', 'GOOGLE_STS', 'FLASHBLADE', 'NET_STORAGE', 'IBM_COS']
                     },
                 }
             }

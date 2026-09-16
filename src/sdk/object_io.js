@@ -7,7 +7,7 @@ const stream = require('stream');
 
 const dbg = require('../util/debug_module')(__filename);
 const config = require('../../config');
-const Semaphore = require('../util/semaphore');
+const semaphore = require('../util/semaphore');
 const ChunkCoder = require('../util/chunk_coder');
 const range_utils = require('../util/range_utils');
 const buffer_utils = require('../util/buffer_utils');
@@ -19,6 +19,7 @@ const system_store = require('../server/system_services/system_store').get_insta
 const { MapClient } = require('./map_client');
 const { ChunkAPI } = require('./map_api_types');
 const { RpcError } = require('../rpc');
+const { get_create_object_upload_params, CREATE_MULTIPART_PARAMS, COMPLETE_MULTIPART_PARAMS } = require('../util/object_utils');
 
 Object.isFrozen(RpcError); // otherwise unused
 
@@ -54,6 +55,7 @@ Object.isFrozen(RpcError); // otherwise unused
  * @property {function} [async_get_last_modified_time]
  * @property {function} [upload_chunks_hook]
  * @property {string} [bucket_master_key_id]
+ * @property {boolean} [defer_put_mapping]
  *
  * @typedef {Object} ReadParams
  * @property {Object} client
@@ -62,6 +64,7 @@ Object.isFrozen(RpcError); // otherwise unused
  * @property {number} [end]
  * @property {number} [watermark]
  * @property {function} [missing_part_getter]
+ * @property {nb.ChunkInfo[]} [prefetched_chunks]
  *
  * @typedef {Object} CachedRead
  * @property {nb.ObjectInfo} object_md
@@ -122,7 +125,7 @@ class ObjectIO {
         this._last_io_bottleneck_report = 0;
         this.location_info = location_info;
 
-        this._io_buffers_sem = new Semaphore(config.IO_SEMAPHORE_CAP, {
+        this._io_buffers_sem = new semaphore.Semaphore(config.IO_SEMAPHORE_CAP, {
             timeout: config.IO_STREAM_SEMAPHORE_TIMEOUT,
             timeout_error_code: 'IO_STREAM_ITEM_TIMEOUT'
         });
@@ -169,11 +172,11 @@ class ObjectIO {
         params.tier_id = obj_upload.tier_id;
         params.complete_upload = true;
         params.size = upload_params.end - upload_params.start;
-        params.seq = 0;
+        params.seq = params.seq ?? 0;
         params.bucket_master_key_id = obj_upload.bucket_master_key_id;
 
         try {
-            dbg.log0('upload_object_range: start upload stream', upload_params);
+            dbg.log1('upload_object_range: start upload stream', upload_params);
             return this._upload_stream(params, complete_params);
         } catch (err) {
             dbg.error('upload_object_range: object part upload failed', upload_params, err);
@@ -190,21 +193,13 @@ class ObjectIO {
      * @param {UploadParams} params
      */
     async upload_object(params) {
-        const create_params = _.pick(params,
-            'bucket',
-            'key',
-            'content_type',
-            'content_encoding',
-            'size',
-            'md5_b64',
-            'sha256_b64',
-            'xattr',
-            'tagging',
-            'encryption',
-            'lock_settings',
-            'storage_class',
-            'last_modified_time',
-        );
+        const create_params = get_create_object_upload_params(params);
+        if (!params.copy_source) {
+            // Server may return objectmd in the reply and skip insert (see create_object_upload);
+            // _upload_chunks then defers or flushes put_mapping by size.
+            create_params.defer_put_mapping = true;
+        }
+        /** @type {Object} */
         const complete_params = _.pick(params,
             'obj_id',
             'bucket',
@@ -213,7 +208,7 @@ class ObjectIO {
             'last_modified_time',
         );
         try {
-            dbg.log0('upload_object: start upload', create_params);
+            dbg.log1('upload_object: start upload', create_params);
             const create_reply = await params.client.object.create_object_upload(create_params);
             params.obj_id = create_reply.obj_id;
             params.tier_id = create_reply.tier_id;
@@ -222,13 +217,18 @@ class ObjectIO {
             params.chunk_coder_config = create_reply.chunk_coder_config;
             params.bucket_master_key_id = create_reply.bucket_master_key_id;
             complete_params.obj_id = create_reply.obj_id;
+            if (create_reply.deferred_object_md) {
+                // Only set when server actually deferred (e.g. DISABLED versioning); else object is in DB.
+                params.defer_put_mapping = true;
+                complete_params.deferred_object_md = create_reply.deferred_object_md;
+            }
             if (params.copy_source) {
                 await this._upload_copy(params, complete_params);
             } else {
                 await this._upload_stream(params, complete_params);
             }
 
-            dbg.log0('upload_object: complete upload', complete_params);
+            dbg.log1('upload_object: complete upload', complete_params);
 
             if (params.async_get_last_modified_time) {
                 complete_params.last_modified_time = await params.async_get_last_modified_time();
@@ -241,7 +241,8 @@ class ObjectIO {
             return complete_result;
         } catch (err) {
             dbg.warn('upload_object: failed upload', complete_params, err);
-            if (params.obj_id) {
+            // Deferred create skipped insert_object; abort would no-op / error on missing row.
+            if (params.obj_id && !params.defer_put_mapping) {
                 try {
                     await params.client.object.abort_object_upload(_.pick(params, 'bucket', 'key', 'obj_id'));
                     dbg.log0('upload_object: aborted object upload', complete_params);
@@ -257,25 +258,10 @@ class ObjectIO {
      * @param {UploadParams} params
      */
     async upload_multipart(params) {
-        const create_params = _.pick(params,
-            'obj_id',
-            'bucket',
-            'key',
-            'num',
-            'size',
-            'md5_b64',
-            'sha256_b64',
-            'encryption'
-        );
-        const complete_params = _.pick(params,
-            'multipart_id',
-            'obj_id',
-            'bucket',
-            'key',
-            'num',
-        );
+        const create_params = _.pick(params, CREATE_MULTIPART_PARAMS);
+        const complete_params = _.pick(params, COMPLETE_MULTIPART_PARAMS);
         try {
-            dbg.log0('upload_multipart: start upload', complete_params);
+            dbg.log1('upload_multipart: start upload', complete_params);
             const multipart_reply = await params.client.object.create_multipart(create_params);
             params.tier_id = multipart_reply.tier_id;
             params.bucket_id = multipart_reply.bucket_id;
@@ -289,8 +275,10 @@ class ObjectIO {
             } else {
                 await this._upload_stream(params, complete_params);
             }
-            dbg.log0('upload_multipart: complete upload', complete_params);
-            return params.client.object.complete_multipart(complete_params);
+            dbg.log1('upload_multipart: complete upload', complete_params);
+            const multipart_params = await params.client.object.complete_multipart(complete_params);
+            multipart_params.multipart_id = complete_params.multipart_id;
+            return multipart_params;
         } catch (err) {
             dbg.warn('upload_multipart: failed', complete_params, err);
             // we leave the cleanup of failed multiparts to complete_object_upload or abort_object_upload
@@ -317,7 +305,7 @@ class ObjectIO {
             complete_params.num_parts = num_parts;
             complete_params.md5_b64 = object_md.md5_b64;
             complete_params.sha256_b64 = object_md.sha256_b64;
-            complete_params.etag = object_md.etag; // preserve source etag
+            complete_params.etag = object_md.etag;
         } else {
             const object_md = await params.client.object.read_object_md({
                 bucket,
@@ -375,7 +363,7 @@ class ObjectIO {
     async _upload_stream_internal(params, complete_params) {
 
         params.desc = _.pick(params, 'obj_id', 'num', 'bucket', 'key');
-        dbg.log0('UPLOAD:', params.desc, 'streaming to', params.bucket, params.key);
+        dbg.log1('UPLOAD:', params.desc, 'streaming to', params.bucket, params.key);
 
         // start and seq are set to zero even for multiparts and will be fixed
         // when multiparts are combined to object in complete_object_upload
@@ -433,7 +421,8 @@ class ObjectIO {
         ];
 
         await stream_utils.pipeline(transforms);
-        await stream_utils.wait_finished(uploader);
+        // Explicitly wait for finish as a defensive measure although pipeline should do it
+        await stream.promises.finished(uploader);
 
         if (splitter.md5) complete_params.md5_b64 = splitter.md5.toString('base64');
         if (splitter.sha256) complete_params.sha256_b64 = splitter.sha256.toString('base64');
@@ -467,7 +456,9 @@ class ObjectIO {
                     start: params.start,
                     end: params.start + chunk_info.size,
                     seq: params.seq,
-                    uncommitted: !params.complete_upload,
+                    // Multipart uploads need part positions finalized at complete_object_upload;
+                    // simple uploads stream sequential start/end/seq here, so leave uncommitted unset.
+                    uncommitted: Boolean(!params.complete_upload && params.multipart_id),
                     // millistamp: time_utils.millistamp(),
                     // bucket: params.bucket,
                     // key: params.key,
@@ -487,7 +478,7 @@ class ObjectIO {
                 params.range.end = params.start;
                 complete_params.size += chunk.size;
                 complete_params.num_parts += 1;
-                dbg.log0('UPLOAD: part', { ...params.desc, start: part.start, end: part.end, seq: part.seq });
+                dbg.log1('UPLOAD: part', { ...params.desc, start: part.start, end: part.end, seq: part.seq });
 
                 if (chunk.size > config.MAX_OBJECT_PART_SIZE) {
                     throw new Error(`Chunk size=${chunk.size} exceeds ` +
@@ -497,7 +488,7 @@ class ObjectIO {
                 return chunk;
             });
 
-            /** 
+            /**
              * passing partial object info we have in this context which will be sent to block_stores
              * as block_md.mapping_info so it can be used for recovery in case the db is not available.
              * @type {Partial<nb.ObjectInfo>}
@@ -508,17 +499,42 @@ class ObjectIO {
                 key: params.key,
             };
 
+            // Defer DB put_mapping: either buffer chunks for small objects (complete),
+            // or flush first batch with deferred_object_md for large objects (see below).
+            const is_deferred = Boolean(params.defer_put_mapping);
+            // skip dedup for small objects and if using encryption
+            const check_dups = !is_using_encryption && params.size > config.DEDUP_MIN_OBJ_SIZE;
             const mc = new MapClient({
                 object_md,
                 chunks: map_chunks,
                 location_info: params.location_info,
-                check_dups: !is_using_encryption,
+                check_dups,
+                skip_put_mapping: is_deferred,
                 rpc_client: params.client,
                 desc: params.desc,
                 report_error: (block_md, action, err) => this._report_error_on_object_upload(params, block_md, action, err),
             });
             await mc.run();
             if (mc.had_errors) throw new Error('Upload map errors');
+
+            if (is_deferred) {
+                const api_chunks = mc.chunks
+                    .filter(chunk => !chunk.had_errors)
+                    .map(chunk => chunk.to_api());
+                if (!complete_params.deferred_chunks) complete_params.deferred_chunks = [];
+                complete_params.deferred_chunks.push(...api_chunks);
+                if (complete_params.deferred_chunks.length >= config.DEFERRED_PUT_MAPPING_MAX_PARTS) {
+                    const deferred_object_md = complete_params.deferred_object_md;
+                    delete complete_params.deferred_object_md;
+                    params.defer_put_mapping = false;
+                    await params.client.object.put_mapping({
+                        chunks: complete_params.deferred_chunks,
+                        deferred_object_md,
+                    });
+                    complete_params.deferred_chunks = [];
+                }
+            }
+
             if (params.upload_chunks_hook) params.upload_chunks_hook(params.range.end - params.range.start);
             return callback();
         } catch (err) {
@@ -589,19 +605,27 @@ class ObjectIO {
                 reader.push(reader.pending.shift());
                 return;
             }
-            const io_sem_size = _get_io_semaphore_size(requested_size);
 
             // TODO we dont want to use requested_size as end, because we read entire chunks
             // and we are better off return the data to the stream buffer
             // instead of getting multiple calls from the stream with small slices to return.
 
             const requested_end = Math.min(params.end, reader.pos + requested_size);
+            if (requested_end <= reader.pos) {
+                dbg.log1(`READ reader finished. requested end is less than reader pos. requested_end=${requested_end} reader.pos=${reader.pos}`);
+                reader.push(null);
+                return;
+            }
+            const { chunks: prefetched_chunks, effective_end } =
+            _take_prefetched_chunks_for_range(params.object_md, reader.pos, requested_end);
+            const io_sem_size = _get_io_semaphore_size(effective_end - reader.pos);
             this._io_buffers_sem.surround_count(io_sem_size, async () => {
                 try {
                     const buffers = await this.read_object({
                         ...params,
                         start: reader.pos,
-                        end: requested_end,
+                        end: effective_end,
+                        prefetched_chunks,
                     });
                     if (buffers && buffers.length) {
                         for (const buffer of buffers) {
@@ -624,7 +648,7 @@ class ObjectIO {
                                 reader.pending.push(missing_buf);
                             }
                         }
-                        dbg.log0('READ reader pos', reader.pos);
+                        dbg.log1('READ reader pos', reader.pos);
                         reader.push(reader.pending.shift());
                     } else {
                         reader.push(null);
@@ -692,6 +716,7 @@ class ObjectIO {
             object_md: params.object_md,
             read_start: params.start,
             read_end: params.end,
+            prefetched_chunks: params.prefetched_chunks,
             location_info: this.location_info,
             rpc_client: params.client,
             verification_mode: this._verification_mode,
@@ -867,6 +892,36 @@ function slice_buffers_in_range(chunks, start, end) {
     //     throw new Error('short buffer from parts');
     // }
     return buffers;
+}
+
+/**
+ * Filters prefetched chunk mappings to those overlapping [read_start, read_end) and
+ * clears object_md.prefetched_mappings once all entries are consumed.
+ * Returns the filtered chunks and the effective end the caller should use for the read range.
+ * When matching mappings exist, effective_end is coverage_end capped to read_end.
+ * When there are no mappings or none match, chunks is undefined and effective_end is read_end
+ * so the normal DB path is used.
+ * @param {Partial<nb.ObjectInfo>} object_md
+ * @param {number} read_start - current stream position
+ * @param {number} read_end - watermark-based requested end
+ * @returns {{ chunks: nb.ChunkInfo[] | undefined, effective_end: number }}
+ */
+function _take_prefetched_chunks_for_range(object_md, read_start, read_end) {
+    const { prefetched_mappings } = object_md;
+    if (!prefetched_mappings || !prefetched_mappings.length) return { chunks: undefined, effective_end: read_end };
+
+    let coverage_end = read_start;
+    const chunks = prefetched_mappings.filter(chunk_info => {
+        const part = chunk_info.parts?.[0];
+        if (!part || part.end <= read_start || part.start >= read_end) return false;
+        if (part.end > coverage_end) coverage_end = part.end;
+        return true;
+    });
+
+    object_md.prefetched_mappings = undefined;
+
+    if (!chunks.length) return { chunks: undefined, effective_end: read_end };
+    return { chunks, effective_end: Math.min(coverage_end, read_end) };
 }
 
 function _get_io_semaphore_size(size) {

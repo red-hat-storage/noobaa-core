@@ -1,13 +1,11 @@
 # Copyright (C) 2016 NooBaa
 {
-    'includes': ['common.gypi'],
+    'includes': ['common.gypi', 'warnings.gypi'],
 
     'target_defaults': {
-        'cflags': ['<@(cflags_warnings)'],
         'conditions' : [
-            [ 'OS=="mac"', {
+            [ 'OS=="mac" and node_arch=="x64"', {
                 'xcode_settings': {
-                    'WARNING_CFLAGS': ['<@(cflags_warnings)'],
                      'OTHER_CFLAGS': ['-DUSE_SSSE3', '-msse4.1'],
                 },
             }],
@@ -21,20 +19,21 @@
     },
 
     'targets': [{
-	'variables': {
-            'BUILD_S3SELECT%':0,
-            'BUILD_S3SELECT_PARQUET%':0
-        },
         'target_name': 'nb_native',
+        'variables': {
+            # read BUILD_S3SELECT from env if not provided by GYP_DEFINES
+            'BUILD_S3SELECT%': '<!(echo ${BUILD_S3SELECT:-0})',
+        },
+        'conditions': [
+            [ 'BUILD_S3SELECT==1', {
+                'dependencies': ['s3select/s3select.gyp:s3select'],
+                'defines': ['BUILD_S3SELECT=1']
+            }],
+        ],
         'include_dirs': [
             '<@(napi_include_dirs)',
+            '/usr/local/cuda/include',
         ],
-	'conditions': [
-	    ['BUILD_S3SELECT==1', {
-		'dependencies': ['s3select/s3select.gyp:s3select'],
-		'cflags': ['-DBUILD_S3SELECT=1']
-	    }]
-	],
         'dependencies': [
             '<@(napi_dependencies)',
             'third_party/cm256.gyp:cm256',
@@ -76,10 +75,15 @@
             'util/rabin.cpp',
             'util/snappy.h',
             'util/snappy.cpp',
+            'util/worker.h',
             'util/zlib.h',
             'util/zlib.cpp',
             # fs
             'fs/fs_napi.cpp',
+            # cuobj/cuda
+            'cuobj/cuobj_server_napi.cpp',
+            'cuobj/cuobj_client_napi.cpp',
+            'cuda/cuda_napi.cpp',
         ],
     }, {
         'target_name': 'nb_native_nan',
@@ -115,11 +119,5 @@
             'util/tpool.cpp',
             'util/tpool.h',
         ],
-    }, {
-        'target_name': 'kube_pv_chown',
-        'type': 'executable',
-        'sources': [
-            'tools/kube_pv_chown.cpp'
-        ]
     }],
 }

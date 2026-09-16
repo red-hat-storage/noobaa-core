@@ -1,6 +1,7 @@
 /* Copyright (C) 2024 NooBaa */
 'use strict';
 
+const pkg = require('../../package.json');
 const config = require('../../config');
 const dbg = require('../util/debug_module')(__filename);
 const net = require('net');
@@ -8,18 +9,22 @@ const P = require('../util/promise');
 const string_utils = require('../util/string_utils');
 const native_fs_utils = require('../util/native_fs_utils');
 const ManageCLIError = require('../manage_nsfs/manage_nsfs_cli_errors').ManageCLIError;
-const bucket_policy_utils = require('../endpoint/s3/s3_bucket_policy_utils');
-const { throw_cli_error, get_bucket_owner_account, get_options_from_file, get_boolean_or_string_value,
-    check_root_account_owns_user, is_name_update, is_access_key_update } = require('../manage_nsfs/manage_nsfs_cli_utils');
+const access_policy_utils = require('../util/access_policy_utils');
+const { throw_cli_error, get_options_from_file, get_boolean_or_string_value, get_bucket_owner_account_by_id,
+    is_name_update, is_access_key_update } = require('../manage_nsfs/manage_nsfs_cli_utils');
 const { TYPES, ACTIONS, VALID_OPTIONS, OPTION_TYPE, FROM_FILE, BOOLEAN_STRING_VALUES, BOOLEAN_STRING_OPTIONS,
-    GLACIER_ACTIONS, LIST_UNSETABLE_OPTIONS, ANONYMOUS, DIAGNOSE_ACTIONS, UPGRADE_ACTIONS } = require('../manage_nsfs/manage_nsfs_constants');
-const iam_utils = require('../endpoint/iam/iam_utils');
+    GLACIER_ACTIONS, UNSETTABLE_OPTIONS_OBJ, CLI_EMPTY_VALUES, ANONYMOUS, DIAGNOSE_ACTIONS, UPGRADE_ACTIONS } = require('../manage_nsfs/manage_nsfs_constants');
+const { check_root_account_owns_user } = require('../nc/nc_utils');
+const { validate_username } = require('../util/validation_utils');
+const notifications_util = require('../util/notifications_util');
+const version_utils = require('../util/versions_utils');
+const crypto = require('crypto');
 
 /////////////////////////////
 //// GENERAL VALIDATIONS ////
 /////////////////////////////
 
-/** 
+/**
  * validate_input_types checks if input option are valid.
  * if the the user uses from_file then the validation is on the file (in different iteration)
  * @param {string} type
@@ -27,6 +32,7 @@ const iam_utils = require('../endpoint/iam/iam_utils');
  * @param {object} argv
  */
 async function validate_input_types(type, action, argv) {
+    validate_no_extra_args(argv._);
     validate_type_and_action(type, action);
     // when we use validate_no_extra_options we don't care about the value, only the flags
     const input_options = Object.keys(argv);
@@ -40,11 +46,12 @@ async function validate_input_types(type, action, argv) {
     validate_flags_combination(type, action, input_options);
     validate_flags_value_combination(type, action, input_options_with_data);
     validate_account_name(type, action, input_options_with_data);
+    validate_supplemental_groups(input_options_with_data);
     if (action === ACTIONS.UPDATE) validate_min_flags_for_update(type, input_options_with_data);
 
     // currently we use from_file only in add action
     const path_to_json_options = argv.from_file ? String(argv.from_file) : '';
-    if ((type === TYPES.ACCOUNT || type === TYPES.BUCKET) && action === ACTIONS.ADD && path_to_json_options) {
+    if ((type === TYPES.ACCOUNT || type === TYPES.BUCKET || type === TYPES.CONNECTION) && action === ACTIONS.ADD && path_to_json_options) {
         const input_options_with_data_from_file = await get_options_from_file(path_to_json_options);
         const input_options_from_file = Object.keys(input_options_with_data_from_file);
         if (input_options_from_file.includes(FROM_FILE)) {
@@ -57,6 +64,7 @@ async function validate_input_types(type, action, argv) {
         validate_flags_combination(type, action, input_options_from_file);
         validate_flags_value_combination(type, action, input_options_with_data_from_file);
         validate_account_name(type, action, input_options_with_data_from_file);
+        validate_supplemental_groups(input_options_with_data_from_file);
         return input_options_with_data_from_file;
     }
 }
@@ -78,6 +86,35 @@ function validate_type_and_action(type, action) {
         if (!Object.values(DIAGNOSE_ACTIONS).includes(action)) throw_cli_error(ManageCLIError.InvalidDiagnoseAction);
     } else if (type === TYPES.UPGRADE) {
         if (!Object.values(UPGRADE_ACTIONS).includes(action)) throw_cli_error(ManageCLIError.InvalidUpgradeAction);
+    }
+}
+
+/**
+ * validate_no_extra_args ensures that the parsed arguments contain only the expected type and action
+ * if `argv_` contains more than two elements (type and action), it indicate extra argument which may be due to:
+ *  - Leading spaces in flag values (e.g., `--new_buckets_path= abc/`)
+ *  - Additional unexpected arguments passed from the command line
+ *
+ * ### CLI Parsing Behavior:
+ * When passing arguments via CLI, if a flag's value starts with a space or consists only of whitespace,
+ * the shell may treat it differently:
+ *  - Leading spaces - might be preserved when quoted (`--new_buckets_path=" abc/"`).
+ *  - Unquoted values with spaces - may cause incorrect parsing (`--new_buckets_path= abc/` is interpreted as an empty value).
+ *  - The parsed argument structure typically follows:
+ *      ```json
+ *      { _: [ "command", "action" ], flag1: "value1", flag2: "value2", ... }
+ *      ```
+ *  - The `_` array should contain only the command and action. If additional elements appear,
+ *    it suggests an issue with flag values (e.g., an incorrectly formatted or empty value).
+ *
+ * @param {string[]} argv_
+ * @throws {ManageCLIError}
+ */
+function validate_no_extra_args(argv_) {
+    // checking if 'argv_' contains more then 2 values (i.e, type and action)
+    if (argv_.length > 2) {
+        const details = `unexpected extra arguments detected: ${JSON.stringify(argv_.slice(2))}, ensure flag values are correctly formatted.`;
+        throw_cli_error(ManageCLIError.InvalidArgument, details);
     }
 }
 
@@ -109,7 +146,7 @@ function validate_identifier(type, action, input_options, is_options_from_file) 
  */
 function validate_no_extra_options(type, action, input_options, is_options_from_file) {
     let valid_options; // for performance, we use Set as data structure
-    const from_file_condition = (type === TYPES.ACCOUNT || type === TYPES.BUCKET) &&
+    const from_file_condition = (type === TYPES.ACCOUNT || type === TYPES.BUCKET || type === TYPES.CONNECTION) &&
         action === ACTIONS.ADD && input_options.includes(FROM_FILE);
     if (from_file_condition) {
         valid_options = VALID_OPTIONS.from_file_options;
@@ -125,6 +162,14 @@ function validate_no_extra_options(type, action, input_options, is_options_from_
         valid_options = VALID_OPTIONS.glacier_options[action];
     } else if (type === TYPES.DIAGNOSE) {
         valid_options = VALID_OPTIONS.diagnose_options[action];
+    } else if (type === TYPES.UPGRADE) {
+        valid_options = VALID_OPTIONS.upgrade_options[action];
+    } else if (type === TYPES.NOTIFICATION) {
+        valid_options = VALID_OPTIONS.notification_options[action];
+    } else if (type === TYPES.CONNECTION) {
+        valid_options = VALID_OPTIONS.connection_options[action];
+    } else if (type === TYPES.LIFECYCLE) {
+        valid_options = VALID_OPTIONS.lifecycle_options;
     } else {
         valid_options = VALID_OPTIONS.whitelist_options;
     }
@@ -148,16 +193,19 @@ function validate_no_extra_options(type, action, input_options, is_options_from_
 }
 
 /**
- * validate_options_type_by_value check the type of the value that match what we expect.
+ * validate_options_type_by_value checks the type of the value that match what we expect.
+ * another check is for unset value (specified by ''/'[]') - it'll be allowed only for flags specified in UNSETTABLE_OPTIONS_OBJ
  * @param {object} input_options_with_data object with flag (key) and value
  */
 function validate_options_type_by_value(input_options_with_data) {
     for (const [option, value] of Object.entries(input_options_with_data)) {
         const type_of_option = OPTION_TYPE[option];
         const type_of_value = typeof value;
+        const is_empty_cli_value = CLI_EMPTY_VALUES.has(value);
+        const is_unsettable_option_match_value = UNSETTABLE_OPTIONS_OBJ[option] === value;
         if (type_of_value !== type_of_option) {
-            // special case for unset value (specified by '').
-            if (LIST_UNSETABLE_OPTIONS.includes(option) && value === '') {
+            // if unset is allowed but the type is not string, we allow it
+            if (is_empty_cli_value && is_unsettable_option_match_value) {
                 continue;
             }
             // special case for names, although the type is string we want to allow numbers as well
@@ -168,12 +216,25 @@ function validate_options_type_by_value(input_options_with_data) {
             if (BOOLEAN_STRING_OPTIONS.has(option) && validate_boolean_string_value(value)) {
                 continue;
             }
-            // special case for bucket_policy (from_file)
-            if (option === 'bucket_policy' && type_of_value === 'object') {
+            // special case for bucket_policy, notifications and connections(from_file)
+            if ((option === 'bucket_policy' ||
+                 option === 'notifications' ||
+                 option === 'agent_request_object' ||
+                 option === 'request_options_object') && type_of_value === 'object') {
                 continue;
             }
-            const details = `type of flag ${option} should be ${type_of_option}`;
+            //special case for supplemental groups
+            if (option === 'supplemental_groups' && ((type_of_value === 'object') || (type_of_value === 'number'))) {
+                continue;
+            }
+            const details = `type of flag ${option} should be ${type_of_option} (and the received value is ${value})`;
             throw_cli_error(ManageCLIError.InvalidArgumentType, details);
+        }
+        // special case for unset value (specified by '' or '[]').
+        if (is_empty_cli_value && !is_unsettable_option_match_value) {
+            let details = `flag value of ${option} is '${value}' but this option can't be unset via '${value}'.`;
+            if (UNSETTABLE_OPTIONS_OBJ[option] !== undefined) details += ` Please use '${UNSETTABLE_OPTIONS_OBJ[option]}' instead.`;
+            throw_cli_error(ManageCLIError.UnsetArgumentIsInvalid, details);
         }
     }
 }
@@ -192,6 +253,36 @@ function validate_boolean_string_value(value) {
         return true;
     }
     return false;
+}
+
+/**
+ * validates supplemental groups array.
+ * string type: is comma seperated positive numbers. should not begin or end with a comma.
+ * number type: the number should be positive
+ * object type: should be array of possitive integers
+ * @param {object} input_options_with_data
+ */
+function validate_supplemental_groups(input_options_with_data) {
+    const value = input_options_with_data.supplemental_groups;
+    if (!value) {
+        return;
+    }
+    if (typeof value === 'string') {
+        const regex = /^[0-9]+(,[0-9]+)+$/;
+        if (!regex.test(value)) {
+            throw_cli_error(ManageCLIError.InvalidSupplementalGroupsList);
+        }
+    } else if (typeof value === 'number') {
+        if (value < 0) {
+            throw_cli_error(ManageCLIError.InvalidSupplementalGroupsList);
+        }
+    } else if (typeof value === 'object') {
+        for (const entry of Object.values(value)) {
+            if (isNaN(Number(entry)) || Number(entry) < 0) {
+                throw_cli_error(ManageCLIError.InvalidSupplementalGroupsList);
+            }
+        }
+    }
 }
 
 /**
@@ -259,6 +350,12 @@ function validate_flags_value_combination(type, action, input_options_with_data)
                 throw_cli_error(ManageCLIError.InvalidAccountName, detail);
             }
         }
+        if (action === ACTIONS.DELETE) {
+            if (input_options_with_data.name === ANONYMOUS) {
+                const detail = `Please use --${ANONYMOUS} flag to delete the ${ANONYMOUS} account`;
+                throw_cli_error(ManageCLIError.InvalidAccountName, detail);
+            }
+        }
     }
 }
 
@@ -278,15 +375,14 @@ function validate_account_name(type, action, input_options_with_data) {
     try {
         if (action === ACTIONS.ADD) {
             account_name = String(input_options_with_data.name);
-            iam_utils.validate_username(account_name, 'name');
+            validate_username(account_name, 'name');
         } else if (action === ACTIONS.UPDATE && input_options_with_data.new_name !== undefined) {
             account_name = String(input_options_with_data.new_name);
-            iam_utils.validate_username(account_name, 'new_name');
+            validate_username(account_name, 'new_name');
         }
     } catch (err) {
         if (err instanceof ManageCLIError) throw err;
-        // we receive IAMError and replace it to ManageCLIError
-        // we do not use the mapping errors because it is a general error ValidationError
+        // we replace it to ManageCLIError
         const detail = err.message;
         throw_cli_error(ManageCLIError.InvalidAccountName, detail);
     }
@@ -359,7 +455,7 @@ async function validate_bucket_args(config_fs, data, action) {
         await check_new_name_exists(TYPES.BUCKET, config_fs, action, data);
         // in case we have the fs_backend it changes the fs_context that we use for the path
         const fs_context_fs_backend = native_fs_utils.get_process_fs_context(data.fs_backend);
-        if (!config.NC_DISABLE_ACCESS_CHECK) {
+        if (!data.should_create_underlying_storage && !config.NC_DISABLE_ACCESS_CHECK) {
             const exists = await native_fs_utils.is_path_exists(fs_context_fs_backend, data.path);
             if (!exists) {
                 throw_cli_error(ManageCLIError.InvalidStoragePath, data.path);
@@ -367,10 +463,11 @@ async function validate_bucket_args(config_fs, data, action) {
         }
 
         // bucket owner account validations 
-        const owner_account_data = await get_bucket_owner_account(config_fs, undefined, data.owner_account);
+        const owner_account_data = await get_bucket_owner_account_by_id(config_fs, data.owner_account);
+
         const account_fs_context = await native_fs_utils.get_fs_context(owner_account_data.nsfs_account_config,
             owner_account_data.nsfs_account_config.fs_backend);
-        if (!config.NC_DISABLE_ACCESS_CHECK) {
+        if (!data.should_create_underlying_storage && !config.NC_DISABLE_ACCESS_CHECK) {
             const accessible = await native_fs_utils.is_dir_accessible(account_fs_context, data.path);
             if (!accessible) {
                 throw_cli_error(ManageCLIError.InaccessibleStoragePath, data.path);
@@ -390,7 +487,7 @@ async function validate_bucket_args(config_fs, data, action) {
         }
         if (data.s3_policy) {
             try {
-                await bucket_policy_utils.validate_s3_policy(data.s3_policy, data.name,
+                await access_policy_utils.validate_bucket_policy(data.s3_policy, data.name,
                     async principal => config_fs.is_account_exists_by_principal(principal, { silent_if_missing: true })
                 );
             } catch (err) {
@@ -398,6 +495,30 @@ async function validate_bucket_args(config_fs, data, action) {
                 throw_cli_error(ManageCLIError.MalformedPolicy, data.s3_policy);
             }
         }
+    }
+}
+
+/**
+ * When setting notifications, we are supposed to send a test notification.
+ * If this test fails, we fail the user's request.
+ * @param {object} config_fs
+ * @param {object} user_input user's input, including new notifications, if any
+ * @returns {Promise} Error encountered during notification test, if any
+ */
+async function validate_bucket_notifications(config_fs, user_input) {
+    if (!user_input.notifications) {
+        return;
+    }
+    //test_notification returns an error if notification fails for the given config
+    const test_notif_err = await notifications_util.test_notifications(
+        user_input.notifications,
+        config_fs.config_root,
+        {
+            params: {bucket: user_input.name},
+            request_id: crypto.randomUUID().toString()
+        });
+    if (test_notif_err) {
+        throw_cli_error(ManageCLIError.InvalidArgument, "Failed to update notifications", test_notif_err);
     }
 }
 
@@ -422,6 +543,55 @@ function validate_account_identifier(action, input_options) {
         if (input_options.name === undefined) throw_cli_error(ManageCLIError.MissingAccountNameFlag);
     }
     // in list there is no identifier
+}
+
+/**
+ * validate_role_config validates user_input.role_config when provided.
+ * Accepts a JSON string (--role_config CLI flag)
+ * @param {object} user_input
+ */
+function validate_role_config(user_input) {
+    const raw = user_input.role_config;
+    if (!raw) return; // not provided or explicit unset — nothing to validate
+
+    let role_config;
+    if (typeof raw === 'string') {
+        try {
+            role_config = JSON.parse(raw);
+        } catch (err) {
+            throw_cli_error(ManageCLIError.InvalidRoleConfig, 'role_config is not valid JSON');
+        }
+    } else {
+        role_config = raw; // already an object
+    }
+
+    if (!role_config || typeof role_config !== 'object') {
+        throw_cli_error(ManageCLIError.InvalidRoleConfig, 'role_config must be a JSON object');
+    }
+    if (!role_config.role_name || typeof role_config.role_name !== 'string') {
+        throw_cli_error(ManageCLIError.InvalidRoleConfig, 'role_config must have a non-empty string "role_name"');
+    }
+    const policy = role_config.assume_role_policy;
+    if (!policy || !Array.isArray(policy.statement) || policy.statement.length === 0) {
+        throw_cli_error(ManageCLIError.InvalidRoleConfig,
+            'role_config.assume_role_policy must have a non-empty "statement" array');
+    }
+    for (const statement of policy.statement) {
+        if (statement === null || typeof statement !== 'object' || Array.isArray(statement) ||
+                !statement.effect || !Array.isArray(statement.action) || !Array.isArray(statement.principal)) {
+            throw_cli_error(ManageCLIError.InvalidRoleConfig,
+                'each statement in assume_role_policy must have "effect", "action" (array) and "principal" (array)');
+        }
+        if (statement.effect !== 'allow' && statement.effect !== 'deny') {
+            throw_cli_error(ManageCLIError.InvalidRoleConfig, 'effect must be "allow" or "deny"');
+        }
+        const valid_actions = ['*', 'sts:AssumeRole', 'sts:AssumeRoleWithWebIdentity', 'sts:AssumeRoleWithSAML', 'sts:TagSession', 'sts:*'];
+        for (const action of statement.action) {
+            if (!valid_actions.includes(action)) {
+                throw_cli_error(ManageCLIError.InvalidRoleConfig, 'Policy has invalid action');
+            }
+        }
+    }
 }
 
 /**
@@ -483,14 +653,30 @@ async function validate_account_args(config_fs, data, action, is_flag_iam_operat
  * doesn't have resources related to it
  * 1 - buckets that it owns
  * 2 - accounts that it owns
+ * 3 - IAM roles that it owns (under identities/<account_id>/roles)
  * @param {import('../sdk/config_fs').ConfigFS} config_fs
  * @param {object} data
  */
 async function validate_account_resources_before_deletion(config_fs, data) {
     await validate_account_not_owns_buckets(config_fs, data);
-    // If it is root account (not owned by other account) then we check that it doesn't owns IAM accounts
+    // If it is root account (not owned by other account) then we check that it doesn't owns IAM users
     if (data.owner === undefined) {
         await check_if_root_account_does_not_have_IAM_users(config_fs, data, ACTIONS.DELETE);
+        await validate_account_not_owns_roles(config_fs, data);
+    }
+}
+
+/**
+ * validate_account_not_owns_roles blocks account deletion when
+ * identities/<account_id>/roles contains any role entries.
+ * @param {import('../sdk/config_fs').ConfigFS} config_fs
+ * @param {Object} account_data
+ */
+async function validate_account_not_owns_roles(config_fs, account_data) {
+    const role_names = await config_fs.list_roles_under_account(account_data._id);
+    if (role_names.length > 0) {
+        const detail_msg = `Account ${account_data.name} has IAM roles: ${role_names.join(', ')}`;
+        throw_cli_error(ManageCLIError.AccountDeleteForbiddenHasIAMRoles, detail_msg);
     }
 }
 
@@ -553,7 +739,7 @@ async function check_if_root_account_does_not_have_IAM_users(config_fs, account_
         if (is_root_account_owns_user) {
             const detail_msg = `Account ${account_to_check.name} has IAM account ${account_data.name}`;
             if (action === ACTIONS.DELETE) {
-                throw_cli_error(ManageCLIError.AccountDeleteForbiddenHasIAMAccounts, detail_msg);
+                throw_cli_error(ManageCLIError.AccountDeleteForbiddenHasIAMUsers, detail_msg);
             }
             // else it is called with action ACTIONS.UPDATE
             throw_cli_error(ManageCLIError.AccountCannotBeRootAccountsManager, detail_msg);
@@ -597,12 +783,89 @@ function validate_whitelist_ips(ips_to_validate) {
     }
 }
 
+///////////////////////////////////
+////  CONNECTION VALIDATIONS   ////
+///////////////////////////////////
+
+/**
+ * Checks that combination of cli parameters is valid for the given action.
+ * @param {Object} user_input 
+ * @param {string} action 
+ */
+function validate_connection_args(user_input, action) {
+    //name is mandatory for all except LIST
+    if (action !== ACTIONS.LIST && !user_input.name) {
+        throw_cli_error(ManageCLIError.MissingCliParam, "CLI parameter 'name' is mandatory.");
+    }
+
+    //action specific mandatory options
+    switch (action) {
+        case ACTIONS.ADD:
+            if (!user_input.notification_protocol) {
+                throw_cli_error(ManageCLIError.MissingCliParam, "CLI parameter 'notification_protocol' is missing");
+            }
+            break;
+        case ACTIONS.UPDATE:
+            if (!user_input.key) {
+                throw_cli_error(ManageCLIError.MissingCliParam, "CLI parameter 'key' is mandatory.");
+            }
+            if (!user_input.value && !user_input.remove_key) {
+                throw_cli_error(ManageCLIError.MissingCliParam, "Either 'value' or 'remove_key' is required.");
+            }
+            break;
+        default:
+    }
+}
+
+////////////////////////////
+//// UPGRADE VALIDATION ////
+///////////////////////////
+
+/**
+ * validate_expected_version checks that expected_version is valid
+ * if it's not valid it throws an error
+ * Note: the cases where we used ManageCLIError errors will 
+ *        not be reported as UpgradeFailed and without adding an event
+ * @param {string} expected_version
+ * @param {boolean} [skip_verification]
+ */
+function validate_expected_version(expected_version, skip_verification = false) {
+    if (!expected_version) {
+        throw_cli_error(ManageCLIError.MissingExpectedVersionFlag);
+    }
+    if (!version_utils.is_valid_semantic_version(expected_version)) {
+        const detail = 'expected_version must have sematic version structure (major.minor.patch)';
+        throw_cli_error(ManageCLIError.InvalidArgumentType, detail);
+    }
+    if (!skip_verification && !version_match_to_current_version(expected_version)) {
+        throw new Error(`expected_version must match the package version ${pkg.version}`);
+    }
+}
+
+/**
+ * version_match_to_current_version checks that the version
+ * is the same as the one that was defined in the pkg
+ * @param {string} expected_version
+ * @returns {boolean}
+ */
+function version_match_to_current_version(expected_version) {
+    const package_version = pkg.version;
+    const diff_from_package_version = version_utils.version_compare(expected_version, package_version);
+    return diff_from_package_version === 0;
+}
+
+
 // EXPORTS
 exports.validate_input_types = validate_input_types;
 exports.validate_bucket_args = validate_bucket_args;
+exports.validate_bucket_notifications = validate_bucket_notifications;
 exports.validate_account_args = validate_account_args;
+exports.validate_role_config = validate_role_config;
 exports._validate_access_keys = _validate_access_keys;
 exports.validate_root_accounts_manager_update = validate_root_accounts_manager_update;
 exports.validate_whitelist_arg = validate_whitelist_arg;
 exports.validate_whitelist_ips = validate_whitelist_ips;
 exports.validate_flags_combination = validate_flags_combination;
+exports.validate_connection_args = validate_connection_args;
+exports.validate_no_extra_args = validate_no_extra_args;
+exports.validate_expected_version = validate_expected_version;

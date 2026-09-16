@@ -2,10 +2,7 @@
 'use strict';
 
 const _ = require('lodash');
-const bcrypt = require('bcrypt');
-const ip_module = require('ip');
 
-const P = require('../../util/promise');
 const dbg = require('../../util/debug_module')(__filename);
 const { RpcError } = require('../../rpc');
 const net_utils = require('../../util/net_utils');
@@ -18,144 +15,9 @@ const addr_utils = require('../../util/addr_utils');
 const kube_utils = require('../../util/kube_utils');
 const jwt_utils = require('../../util/jwt_utils');
 const config = require('../../../config');
-const s3_bucket_policy_utils = require('../../endpoint/s3/s3_bucket_policy_utils');
+const iam_utils = require('../../endpoint/iam/iam_utils');
+const access_policy_utils = require('../../util/access_policy_utils');
 
-
-/**
- *
- * CREATE_AUTH
- *
- * authenticate and return an authorized token.
- *
- * the simplest usage is to send email & password, which will be verified
- * to match the existing account, and will return an authorized token containing the account.
- *
- * another usage is to get a system authorization by passing system_name.
- * one option is to combine with email & password, and another is to call without
- * email and password but with existing authorization token which contains
- * a previously authenticated account.
- *
- */
-function create_auth(req) {
-
-    const email = req.rpc_params.email;
-    const password = req.rpc_params.password;
-    const system_name = req.rpc_params.system;
-    let role_name = req.rpc_params.role;
-    let authenticated_account;
-    let target_account;
-    let system;
-
-    return P.resolve()
-        .then(() => {
-
-            // if email is not provided we skip finding target_account by email
-            // and use the current auth account as the authenticated_account
-            if (!email) return;
-
-            // consider email not found the same as bad password to avoid phishing attacks.
-            target_account = system_store.get_account_by_email(email);
-            if (!target_account) {
-                dbg.log0('credentials account not found', email, system_name);
-                throw new RpcError('UNAUTHORIZED', 'credentials not found');
-            }
-
-            // when password is not provided it means we want to give authorization
-            // by the currently authorized to another specific account instead of
-            // using credentials.
-            if (!password) return;
-
-            return P.resolve()
-                .then(() => bcrypt.compare(password.unwrap(), target_account.password.unwrap()))
-                .then(match => {
-                    if (!match) {
-                        dbg.log0('password mismatch', email, system_name);
-                        throw new RpcError('UNAUTHORIZED', 'credentials not found');
-                    }
-                    // authentication passed!
-                    // so this account is the authenticated_account
-                    authenticated_account = target_account;
-                });
-        })
-        .then(() => {
-
-            // if both accounts were resolved (they can be the same account),
-            // then we can skip loading the current authorized account
-            if (!authenticated_account || !target_account) {
-                // find the current authorized account and assign
-                if (!req.auth || !req.auth.account_id) {
-                    dbg.log0('no account_id in auth and no credentials', email, system_name);
-                    throw new RpcError('UNAUTHORIZED', 'credentials not found');
-                }
-
-                const account_arg = system_store.data.get_by_id(req.auth.account_id);
-                target_account = target_account || account_arg;
-                authenticated_account = authenticated_account || account_arg;
-
-            }
-
-            // check the accounts are valid
-            if (!authenticated_account || authenticated_account.deleted) {
-                dbg.log0('authenticated account not found', email, system_name);
-                throw new RpcError('UNAUTHORIZED', 'credentials not found');
-            }
-            if (!target_account || target_account.deleted) {
-                dbg.log0('target account not found', email, system_name);
-                throw new RpcError('UNAUTHORIZED', 'credentials not found');
-            }
-
-            // system is optional, and will not be included in the token if not provided
-            if (system_name) {
-
-                // find system by name
-                system = system_store.data.systems_by_name[system_name];
-                if (!system || system.deleted) throw new RpcError('UNAUTHORIZED', 'system not found');
-
-                // find the role of authenticated_account in the system
-                const roles = system.roles_by_account &&
-                    system.roles_by_account[authenticated_account._id];
-
-                // now approve the role -
-                if (
-                    // support account  can do anything
-                    authenticated_account.is_support ||
-                    // system owner can do anything
-                    // From some reason, which I couldn't find, system store is
-                    // missing roles_by_account from time to time.
-                    String(system.owner._id) === String(authenticated_account._id) ||
-                    // system admin can do anything
-                    _.includes(roles, 'admin') ||
-                    // operator can do anything
-                    _.includes(roles, 'operator') ||
-                    // non admin is not allowed to delegate roles to other accounts
-                    (role_name && _.includes(roles, role_name) &&
-                        String(target_account._id) === String(authenticated_account._id))) {
-                    // "system admin" can use any role
-                    role_name = role_name || 'admin';
-                } else {
-                    throw new RpcError('UNAUTHORIZED', 'account role not allowed');
-                }
-            }
-
-            const token = make_auth_token({
-                account_id: target_account._id,
-                system_id: system && system._id,
-                role: role_name,
-                extra: req.rpc_params.extra,
-                expiry: req.rpc_params.expiry,
-            });
-
-            const info = _get_auth_info(
-                target_account,
-                system,
-                'noobaa',
-                role_name,
-                req.rpc_params.extra,
-            );
-
-            return { token, info };
-        });
-}
 
 /**
  *
@@ -316,7 +178,7 @@ function unauthorized_error(reason) {
  *
  */
 function create_access_key_auth(req) {
-    const access_key = req.rpc_params.access_key.unwrap();
+    const access_key = req.rpc_params.access_key;
     const string_to_sign = req.rpc_params.string_to_sign;
     const signature = req.rpc_params.signature;
 
@@ -324,19 +186,17 @@ function create_access_key_auth(req) {
         throw new RpcError('UNAUTHORIZED', 'signature error');
     }
 
-    const account = _.find(system_store.data.accounts, function(acc) {
-        if (acc.access_keys) {
-            return acc.access_keys[0].access_key.unwrap().toString() === access_key.toString();
-        } else {
-            return false;
-        }
-    });
+    const account = system_store.get_account_by_access_key(access_key);
 
     if (!account || account.deleted) {
         throw new RpcError('UNAUTHORIZED', 'account not found');
     }
 
-    const secret = account.access_keys[0].secret_key.unwrap().toString();
+    const key_pair = account.access_keys.find(key =>
+        key.access_key.unwrap() === access_key.unwrap()
+    );
+
+    const secret = key_pair.secret_key.unwrap();
     const signature_test = signature_utils.get_signature_from_auth_token({ string_to_sign: string_to_sign }, secret);
     if (signature_test !== signature) {
         throw new RpcError('UNAUTHORIZED', 'signature error');
@@ -453,15 +313,16 @@ function _authorize_jwt_token(req) {
 function _authorize_signature_token(req) {
     const auth_token_obj = req.auth_token;
 
-    const account = _.find(system_store.data.accounts, function(acc) {
-        return acc.access_keys &&
-            acc.access_keys[0].access_key.unwrap() ===
-            auth_token_obj.access_key;
-    });
+    const account = system_store.get_account_by_access_key(new SensitiveString(auth_token_obj.access_key));
     if (!account || account.deleted) {
         throw new RpcError('UNAUTHORIZED', 'account not found');
     }
-    const secret_key = account.access_keys[0].secret_key;
+
+    const key_pair = account.access_keys.find(key =>
+        key.access_key.unwrap() === auth_token_obj.access_key
+    );
+
+    const secret_key = key_pair.secret_key;
 
     const role = _.find(system_store.data.roles, function(r) {
         return r.account._id.toString() === account._id.toString();
@@ -520,7 +381,11 @@ function _prepare_auth_request(req) {
     req.load_auth = function() {
         if (req.auth) {
             if (req.auth.account_id) req.account = system_store.data.get_by_id(req.auth.account_id);
+            else if (req.auth.email) req.account = system_store.data.accounts_by_email[req.auth.email];
+
             if (req.auth.system_id) req.system = system_store.data.get_by_id(req.auth.system_id);
+            else if (req.auth.system) req.system = system_store.data.systems_by_name[req.auth.system];
+
             req.role = req.auth.role;
         }
     };
@@ -540,15 +405,15 @@ function _prepare_auth_request(req) {
         dbg.log1('load_auth:', options, req.auth);
         // check that auth has account
         if (!req.account) {
-            if (!allow_missing_account || req.auth.account_id) {
-                throw new RpcError('UNAUTHORIZED', 'account not found ' + req.auth.account_id);
+            if (!allow_missing_account || req.auth.account_id || req.auth.email) {
+                throw new RpcError('UNAUTHORIZED', 'account not found ' + (req.auth.account_id || req.auth.email));
             }
         }
 
         // check that auth contains system
         if (!req.system) {
-            if (!allow_missing_system || req.auth.system_id) {
-                throw new RpcError('UNAUTHORIZED', 'system not found ' + req.auth.system_id);
+            if (!allow_missing_system || req.auth.system_id || req.auth.system) {
+                throw new RpcError('UNAUTHORIZED', 'system not found ' + (req.auth.system_id || req.auth.system));
             }
         }
 
@@ -578,10 +443,10 @@ function _prepare_auth_request(req) {
             const client_ip = net_utils.unwrap_ipv6(req.auth.client_ip);
             if (client_ip) {
                 let is_allowed = false;
-                const client_ip_val = ip_module.toLong(client_ip);
+                const client_ip_val = net_utils.ip_toLong(client_ip);
                 for (const ip_range of req.account.allowed_ips) {
-                    const start = ip_module.toLong(ip_range.start);
-                    const end = ip_module.toLong(ip_range.end);
+                    const start = net_utils.ip_toLong(ip_range.start);
+                    const end = net_utils.ip_toLong(ip_range.end);
                     if (client_ip_val >= start && client_ip_val <= end) {
                         is_allowed = true;
                         break;
@@ -596,16 +461,18 @@ function _prepare_auth_request(req) {
         dbg.log3('load auth system:', req.system && req.system._id);
     };
 
-    req.has_bucket_anonymous_permission = function(bucket, action, bucket_path) {
-        return has_bucket_anonymous_permission(bucket, action, bucket_path);
+    req.has_bucket_anonymous_permission = function(bucket, action, bucket_path, req_query) {
+        return has_bucket_anonymous_permission(
+            bucket, action, bucket_path, _policy_req_with_client_ip(req_query, req.auth?.client_ip)
+        );
     };
 
-    req.has_s3_bucket_permission = async function(bucket, action, bucket_path) {
+    req.has_s3_bucket_permission = async function(bucket, action, bucket_path, req_query) {
         // Since this method can be called both authorized and unauthorized
         // We need to check the anonymous permission only when the bucket is configured to server anonymous requests
         // In case of anonymous function but with authentication flow we roll back to previous code and not return here
         if (req.auth_token && typeof req.auth_token === 'object') {
-            return req.has_bucket_action_permission(bucket, action, bucket_path);
+            return req.has_bucket_action_permission(bucket, action, bucket_path, req_query);
         }
         // If we came with a NooBaa management token then we've already checked the method permissions prior to this function
         // There is nothing specific to bucket permissions for the management credentials
@@ -615,20 +482,26 @@ function _prepare_auth_request(req) {
         }
 
         if (options.anonymous === true) {
-            return req.has_bucket_anonymous_permission(bucket, action, bucket_path);
+            return req.has_bucket_anonymous_permission(bucket, action, bucket_path, req_query);
         }
 
         return false;
     };
 
     req.check_bucket_action_permission = async function(bucket, action, bucket_path) {
-        if (!await has_bucket_action_permission(bucket, req.account, action, bucket_path)) {
+        const policy_req = _policy_req_with_client_ip(undefined, req.auth?.client_ip);
+        if (!await has_bucket_action_permission(bucket, req.account, action, policy_req, bucket_path)) {
             throw new RpcError('UNAUTHORIZED', 'No permission to access bucket');
         }
     };
 
-    req.has_bucket_action_permission = async function(bucket, action, bucket_path) {
-        return has_bucket_action_permission(bucket, req.account, action, bucket_path);
+    req.has_bucket_action_permission = async function(bucket, action, bucket_path, req_query) {
+        const policy_req = _policy_req_with_client_ip(req_query, req.auth?.client_ip);
+        return has_bucket_action_permission(bucket, req.account, action, policy_req, bucket_path);
+    };
+
+    req.has_bucket_ownership_permission = function(bucket) {
+        return has_bucket_ownership_permission(bucket, req.account, req.auth && req.auth.role);
     };
 }
 
@@ -655,12 +528,104 @@ function _get_auth_info(account, system, authorized_by, role, extra) {
 }
 
 /**
+ * is_system_owner checks if the account is the system owner
+ * @param {Record<string, any>} bucket
+ * @param {Record<string, any>} account
+ * @returns {boolean}
+ */
+function is_system_owner(bucket, account) {
+    if (!bucket?.system?.owner?.email || !account?.email) return false;
+    return bucket.system.owner.email.unwrap() === account.email.unwrap();
+}
+
+/**
+ * is_bucket_owner checks if the account is the direct owner of the bucket
+ * @param {Record<string, any>} bucket
+ * @param {Record<string, any>} account
+ * @returns {boolean}
+ */
+function is_bucket_owner(bucket, account) {
+    if (!bucket?.owner_account?.email || !account?.email) return false;
+    return bucket.owner_account.email.unwrap() === account.email.unwrap();
+}
+
+/**
+ * is_bucket_claim_owner checks if the account is the OBC (ObjectBucketClaim) owner of the bucket
+ * @param {Record<string, any>} bucket
+ * @param {Record<string, any>} account
+ * @returns {boolean}
+ */
+function is_bucket_claim_owner(bucket, account) {
+    if (!account?.bucket_claim_owner || !bucket?.name) return false;
+    return account.bucket_claim_owner.name.unwrap() === bucket.name.unwrap();
+}
+
+/**
+ * is_iam_and_same_root_account_owner checks if the account is the IAM user and the same root account owner of the bucket
+ * @param {Record<string, any>} account
+ * @param {Record<string, any>} bucket
+ * @returns {boolean}
+ */
+function is_iam_and_same_root_account_owner(account, bucket) {
+    if (!account?.owner || !bucket?.owner_account) return false;
+    return account.owner._id.toString() === bucket.owner_account._id.toString();
+}
+
+/**
+ * has_bucket_ownership_permission returns true if the account can list the bucket in ListBuckets operation
+ *
+ * aws-compliant behavior:
+ * - System owner can list all the buckets
+ * - Operator account (noobaa cli) can list all the buckets
+ * - Root accounts can list buckets they own
+ * - OBC owner can list their buckets
+ * - IAM users can list their owner buckets
+ *
+ * @param {Record<string, any>} bucket
+ * @param {Record<string, any>} account
+ * @param {string} role
+ * @returns {Promise<boolean>}
+ */
+async function has_bucket_ownership_permission(bucket, account, role) {
+    // system owner can list all the buckets
+    if (is_system_owner(bucket, account)) return true;
+
+    // operator account (noobaa cli) can list all the buckets
+    if (role === 'operator') return true;
+
+    // check direct ownership
+    if (is_bucket_owner(bucket, account)) return true;
+
+    // special case: check bucket claim ownership (OBC)
+    if (is_bucket_claim_owner(bucket, account)) return true;
+
+    // special case: iam user can list the buckets of their owner
+    if (is_iam_and_same_root_account_owner(account, bucket)) return true;
+
+    return false;
+}
+
+/**
+ * Attach the observed client IP onto the synthetic request used for bucket-policy
+ * evaluation in the RPC/object_server path. aws:SourceIp reads req.socket.remoteAddress,
+ * which exists on the HTTP request at the S3 endpoint but not on RPC re-checks unless
+ * we reconstruct it from auth_token.client_ip (the TCP peer address).
+ */
+function _policy_req_with_client_ip(req_query, client_ip) {
+    if (!client_ip) return req_query || null;
+    return {
+        ...(req_query || {}),
+        socket: { remoteAddress: client_ip },
+    };
+}
+
+/**
  * has_bucket_action_permission returns true if the requesting account has permission to perform
  * the given action on the given bucket.
- * 
+ *
  * The evaluation takes into account
- *  @TODO: System owner as a construct needs to be removed 
- *  - system owner must be able to access all buckets 
+ *  @TODO: System owner as a construct needs to be removed
+ *  - system owner must be able to access all buckets
  *  - the bucket's owner account
  *  - the bucket claim owner
  *  - the bucket policy
@@ -668,33 +633,57 @@ function _get_auth_info(account, system, authorized_by, role, extra) {
  * @param {Record<string, any>} account requesting account
  * @param {string} action s3 bucket action (lowercased only)
  * @param {string} bucket_path s3 bucket path (must start from "/")
- * @returns {boolean} true if the account has permission to perform the action on the bucket
+ * @returns  {Promise<boolean>} true if the account has permission to perform the action on the bucket
  */
-async function has_bucket_action_permission(bucket, account, action, bucket_path = "") {
+async function has_bucket_action_permission(bucket, account, action, req_query, bucket_path = "") {
     dbg.log1('has_bucket_action_permission:', bucket.name, account.email, bucket.owner_account.email);
 
-    // If the system owner account wants to access the bucket, allow it
-    if (bucket.system.owner.email.unwrap() === account.email.unwrap()) return true;
+    // system owner can access all buckets
+    if (is_system_owner(bucket, account)) return true;
 
-    const is_owner = (bucket.owner_account.email.unwrap() === account.email.unwrap()) ||
-        (account.bucket_claim_owner && account.bucket_claim_owner.name.unwrap() === bucket.name.unwrap());
+    // check ownership: direct owner or OBC
+    const has_owner_access = is_bucket_owner(bucket, account) || is_bucket_claim_owner(bucket, account);
+
     const bucket_policy = bucket.s3_policy;
 
-    if (!bucket_policy) return is_owner;
+    if (!bucket_policy) {
+        // in case we do not have bucket policy
+        // we allow IAM account to access a bucket that is owned by their root account
+        return has_owner_access || is_iam_and_same_root_account_owner(account, bucket);
+    }
     if (!action) {
         throw new Error('has_bucket_action_permission: action is required');
     }
-
-    const result = await s3_bucket_policy_utils.has_bucket_policy_permission(
+    const arn = account.owner ? iam_utils.create_arn_for_user(account.owner._id.toString(), account.name.unwrap().split(':')[0], account.iam_path) :
+                                    iam_utils.create_arn_for_root(account._id.toString());
+    const result = await access_policy_utils.has_access_policy_permission(
         bucket_policy,
-        account.email.unwrap(),
+        [arn, account._id.toString()],
         action,
         `arn:aws:s3:::${bucket.name.unwrap()}${bucket_path}`,
-        undefined
+        req_query
     );
 
     if (result === 'DENY') return false;
-    return is_owner || result === 'ALLOW';
+
+    let permission_by_arn_owner;
+    // Added to verify the IAM users's owner account have bucket access
+    // If yes, IAM user also should get access
+    if (account.owner) {
+        const owner_account_id = iam_utils.get_owner_account_id(account);
+        const owner_account_identifier_arn = access_policy_utils.create_arn_for_root(owner_account_id);
+        // We support both ARN and account/user ID in bucket policy Principal, So if the bucket policy have only ARN
+        // sharing array of ARN and ID can fix the issue that misses the access just because of bucket policy have ID as principal 
+        permission_by_arn_owner = await access_policy_utils.has_access_policy_permission(
+            bucket_policy,
+            [owner_account_identifier_arn, owner_account_id],
+            action,
+            `arn:aws:s3:::${bucket.name.unwrap()}${bucket_path}`,
+            req_query,
+        );
+        if (permission_by_arn_owner === 'DENY') return false;
+    }
+    return has_owner_access || result === 'ALLOW' || permission_by_arn_owner === 'ALLOW';
 }
 
 /**
@@ -703,18 +692,19 @@ async function has_bucket_action_permission(bucket, account, action, bucket_path
  * @param {Record<string, any>} bucket bucket
  * @param {string} action s3 action (lowercased)
  * @param {string} bucket_path bucket path
- * @returns {boolean} true if the bucket is configured to serve anonymous requests
+ * @returns {Promise<boolean>} true if the bucket is configured to serve anonymous requests
  */
-async function has_bucket_anonymous_permission(bucket, action, bucket_path = "") {
+async function has_bucket_anonymous_permission(bucket, action, bucket_path, req_query) {
+    bucket_path = bucket_path ?? "";
     const bucket_policy = bucket.s3_policy;
     if (!bucket_policy) return false;
-    return await s3_bucket_policy_utils.has_bucket_policy_permission(
+    return await access_policy_utils.has_access_policy_permission(
         bucket_policy,
         // Account is anonymous
         undefined,
         action || `s3:GetObject`,
         `arn:aws:s3:::${bucket.name.unwrap()}${bucket_path}`,
-        undefined
+        req_query
     ) === 'ALLOW';
 }
 
@@ -733,7 +723,7 @@ async function has_bucket_anonymous_permission(bucket, action, bucket_path = "")
  * @return <String> token
  */
 function make_auth_token(options) {
-    let auth = _.pick(options, 'account_id', 'system_id', 'role', 'extra', 'authorized_by');
+    let auth = _.pick(options, 'account_id', 'system_id', 'role', 'extra', 'authorized_by', 'email', 'system');
     auth.authorized_by = auth.authorized_by || 'noobaa';
 
     // don't incude keys if value is falsy, to minimize the token size
@@ -750,7 +740,6 @@ function make_auth_token(options) {
 
 
 // EXPORTS
-exports.create_auth = create_auth;
 exports.read_auth = read_auth;
 exports.create_k8s_auth = create_k8s_auth;
 exports.create_access_key_auth = create_access_key_auth;

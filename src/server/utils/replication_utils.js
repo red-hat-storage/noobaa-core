@@ -5,6 +5,7 @@ const _ = require('lodash');
 const dbg = require('../../util/debug_module')(__filename);
 const SensitiveString = require('../../util/sensitive_string');
 const system_store = require('../system_services/system_store').get_instance();
+const replication_store = require('../system_services/replication_store').instance();
 const prom_reporting = require('../analytic_services/prometheus_reporting');
 const auth_server = require('../common_services/auth_server');
 
@@ -16,6 +17,9 @@ const PARTIAL_SINGLE_BUCKET_REPLICATION_DEFAULTS = {
     last_cycle_writes_size: 0,
     last_cycle_error_writes_num: 0,
     last_cycle_error_writes_size: 0,
+    bucket_last_cycle_total_objects_num: 0,
+    bucket_last_cycle_replicated_objects_num: 0,
+    bucket_last_cycle_error_objects_num: 0,
 };
 
 //TODO: this function is not being used anymore, commenting out and keeping it as reference 
@@ -39,7 +43,7 @@ const PARTIAL_SINGLE_BUCKET_REPLICATION_DEFAULTS = {
 //     return false;
 // }
 
-function get_rule_status(rule, src_cont_token, keys_diff_map, copy_res) {
+function get_rule_and_bucket_status(rule, src_cont_token, keys_diff_map, copy_res) {
     const { num_keys_to_copy, num_bytes_to_copy } = Object.entries(keys_diff_map).reduce(
         (acc, [key, value]) => {
             acc.num_keys_to_copy += value.length;
@@ -48,25 +52,34 @@ function get_rule_status(rule, src_cont_token, keys_diff_map, copy_res) {
         }, { num_keys_to_copy: 0, num_bytes_to_copy: 0 }
     );
 
-    const num_keys_moved = copy_res.num_of_objects;
-    const num_bytes_moved = copy_res.size_of_objects;
+    const num_keys_moved = (copy_res && copy_res.num_of_objects) || 0;
+    const num_bytes_moved = (copy_res && copy_res.size_of_objects) || 0;
 
-    const status = {
+    const rule_status = {
         last_cycle_rule_id: rule,
         last_cycle_writes_num: num_keys_moved,
         last_cycle_writes_size: num_bytes_moved,
         last_cycle_error_writes_num: num_keys_to_copy - num_keys_moved,
         last_cycle_error_writes_size: num_bytes_to_copy - num_bytes_moved,
     };
-    if (src_cont_token) status.last_cycle_src_cont_token = src_cont_token;
-    dbg.log1('get_rule_status: ', status);
-    return status;
+    if (src_cont_token) rule_status.last_cycle_src_cont_token = src_cont_token;
+    dbg.log1('get_rule_and_bucket_status:: rule_status: ', rule_status);
+
+    const bucket_status = {
+        bucket_last_cycle_total_objects_num: num_keys_to_copy,
+        bucket_last_cycle_replicated_objects_num: num_keys_moved,
+        bucket_last_cycle_error_objects_num: num_keys_to_copy - num_keys_moved,
+    };
+    dbg.log1('get_rule_and_bucket_status:: bucket_status: ', bucket_status);
+
+    return {rule_status, bucket_status};
 }
 
-function update_replication_prom_report(bucket_name, replication_policy_id, replication_status) {
+function update_replication_prom_report(bucket_name, replication_policy_id, rule_status, bucket_status) {
     const core_report = prom_reporting.get_core_report();
     const last_cycle_status = _.defaults({
-        ...replication_status,
+        ...rule_status,
+        ...bucket_status,
         bucket_name: bucket_name.unwrap(),
         replication_id: replication_policy_id
     }, PARTIAL_SINGLE_BUCKET_REPLICATION_DEFAULTS);
@@ -74,10 +87,128 @@ function update_replication_prom_report(bucket_name, replication_policy_id, repl
     core_report.set_replication_status(last_cycle_status);
 }
 
+// used by scan-based replication (only) to update metrics when target is unreachable and diff cannot be computed
+function report_failed_replication_cycle(bucket_name, replication_id, rule_id, total) {
+    const core_report = prom_reporting.get_core_report();
+    if (!core_report._metrics) return;
+    const name = bucket_name instanceof SensitiveString ? bucket_name.unwrap() : bucket_name;
+    // per replication_id metrics
+    delete core_report._metrics.replication_status.hashMap[String(replication_id)];
+    core_report._metrics.replication_status.set({ last_cycle_rule_id: rule_id, bucket_name: name, replication_id }, Date.now());
+    core_report._metrics.replication_last_cycle_writes_size.set({ replication_id }, 0);
+    core_report._metrics.replication_last_cycle_writes_num.set({ replication_id }, 0);
+    core_report._metrics.replication_last_cycle_error_writes_size.set({ replication_id }, 0);
+    core_report._metrics.replication_last_cycle_error_writes_num.inc({ replication_id }, 1);
+    // per bucket metrics
+    core_report._metrics.bucket_last_cycle_total_objects_num.set({ bucket_name: name }, total);
+    core_report._metrics.bucket_last_cycle_replicated_objects_num.set({ bucket_name: name }, 0);
+    core_report._metrics.bucket_last_cycle_error_objects_num.inc({ bucket_name: name }, 1);
+    dbg.log0('report_failed_replication_cycle: updated error metrics bucket:', name,
+        'replication_id:', replication_id, 'rule_id:', rule_id, 'total:', total);
+}
+
+function update_replication_target_status(replication_id, source_bucket, target_bucket, is_reachable) {
+    if (!replication_id) return;
+    const core_report = prom_reporting.get_core_report();
+    const src_name = source_bucket instanceof SensitiveString ? source_bucket.unwrap() : source_bucket;
+    const dst_name = target_bucket instanceof SensitiveString ? target_bucket.unwrap() : target_bucket;
+    core_report.set_replication_target_status(String(replication_id), src_name, dst_name, is_reachable);
+}
+
+// clear target reachability metrics when the policy was deleted or has no source bucket (leftover series)
+// orphan policy: replication_id not in replication DB, or no source bucket references it
+function clear_replication_target_status_for_orphan_policy(replication_id) {
+    if (!replication_id) return;
+    const core_report = prom_reporting.get_core_report();
+    core_report.clear_replication_target_status_by_replication_id(String(replication_id));
+}
+
+// reconcile_replication_target_status reconciles target reachability metrics at replication scan start
+// drop stale replication_target_status series: one DB read, then clear gauge entries that no longer match active policies
+async function reconcile_replication_target_status() {
+    const hash_map = prom_reporting.get_core_report()._metrics?.replication_target_status?.hashMap;
+    if (!hash_map) return;
+
+    const keys = Object.keys(hash_map);
+    if (!keys.some(k => hash_map[k]?.labels?.replication_id)) return;
+
+    const replications = await replication_store.get_all_replication_configs();
+    if (!replications?.length) return;
+
+    const valid_label_keys = new Set();
+    const clear_all_ids = new Set();
+
+    // build allowed (replication_id|source|target) valid keys from DB and mark policies with no source for full clear
+    for (const repl of replications) {
+        const repl_id = String(repl._id);
+        if (repl.deleted) {
+            clear_all_ids.add(repl_id);
+            continue;
+        }
+        const rules = repl.rules;
+        if (!rules?.length) {
+            clear_all_ids.add(repl_id);
+            continue;
+        }
+        const { src_bucket } = find_src_and_dst_buckets(rules[0].destination_bucket, repl_id);
+        if (!src_bucket) {
+            clear_all_ids.add(repl_id);
+            continue;
+        }
+        const src_name = bucket_name_for_metrics(src_bucket);
+        // one valid series per rule destination for this policy
+        for (const rule of rules) {
+            const dst_name = await resolve_destination_bucket_name(rule.destination_bucket);
+            valid_label_keys.add(`${repl_id}|${src_name}|${dst_name}`);
+        }
+    }
+
+    // remove gauge samples that are orphaned, policy-less, or no longer match DB labels
+    for (const key of keys) {
+        const labels = hash_map[key]?.labels;
+        if (!labels?.replication_id) continue;
+        const repl_id = String(labels.replication_id);
+        const label_key = `${repl_id}|${labels.source_bucket}|${labels.target_bucket}`;
+        if (clear_all_ids.has(repl_id) || !valid_label_keys.has(label_key)) delete hash_map[key];
+    }
+}
+
+// remove the `-deleting-<timestamp>` suffix noobaa appends while a bucket is being deleted
+function strip_deleting_bucket_suffix(name) {
+    const s = name instanceof SensitiveString ? name.unwrap() : name;
+    if (!s) return '';
+    const m = String(s).match(/^(.*)-deleting-\d+$/);
+    return m ? m[1] : String(s);
+}
+
+// turn a bucket document into a plain string name suitable for metrics labels (unwrap + deleting rename)
+function bucket_name_for_metrics(bucket) {
+    if (!bucket?.name) return '';
+    if (bucket.deleting) return strip_deleting_bucket_suffix(bucket.name);
+    return bucket.name instanceof SensitiveString ? bucket.name.unwrap() : String(bucket.name);
+}
+
+// resolve a destination bucket id to a display name via system_store, then soft-deleted db rows
+async function resolve_destination_bucket_name(dst_bucket_id) {
+    const id = dst_bucket_id?.valueOf ? dst_bucket_id.valueOf() : dst_bucket_id;
+    try {
+        const bucket = system_store.data.get_by_id(id);
+        if (bucket?.name) return bucket_name_for_metrics(bucket);
+
+        const res = await system_store.data.get_by_id_include_deleted(id, 'buckets');
+        if (res?.record?.name) return bucket_name_for_metrics(res.record);
+        dbg.warn('resolve_destination_bucket_name: bucket not found for id:', id);
+    } catch (err) {
+        dbg.warn('resolve_destination_bucket_name failed:', id, err);
+    }
+    // worst-case: no row for this id (stale ref, e.g. bucket removed and recreated with a new _id); labels still need a non-empty string
+    return String(id);
+}
+
 /**
  * @param {any} bucket_name
  * @param {string} key
- * @param {AWS.S3} s3
+ * @param {import('@aws-sdk/client-s3').S3} s3
  * @param {string} version_id
  */
 async function get_object_md(bucket_name, key, s3, version_id) {
@@ -90,14 +221,14 @@ async function get_object_md(bucket_name, key, s3, version_id) {
 
     dbg.log1('get_object_md params:', params);
     try {
-        const head = await s3.headObject(params).promise();
+        const head = await s3.headObject(params);
         //for namespace s3 we are omitting the 'noobaa-namespace-s3-bucket' as it will be defer between buckets
         if (head?.Metadata) head.Metadata = _.omit(head.Metadata, 'noobaa-namespace-s3-bucket');
         dbg.log1('get_object_md: finished successfully', head);
         return head;
     } catch (err) {
-        dbg.error('get_object_md: error:', err);
-        if (err.code === 'NotFound') return;
+        dbg.error('get_object_md: error.name: ', err?.name, ' error: ', err);
+        if (err?.name === 'NotFound') return;
         throw err;
     }
 }
@@ -121,11 +252,15 @@ function get_copy_type() {
     return 'MIX';
 }
 
-async function copy_objects(scanner_semaphore, client, copy_type, src_bucket_name, dst_bucket_name, keys_diff_map) {
+async function copy_objects(scanner_semaphore, client, copy_type, src_bucket_name, dst_bucket_name, keys_diff_map, replication_id) {
+    const keys_length = Object.keys(keys_diff_map || {});
+    if (!keys_length.length) {
+        return { num_of_objects: 0, size_of_objects: 0 };
+    }
+
+    let res;
     try {
-        const keys_length = Object.keys(keys_diff_map);
-        if (!keys_length.length) return;
-        const res = await scanner_semaphore.surround_count(keys_length, //We will do key by key even when a key have more then one version
+        res = await scanner_semaphore.surround_count(keys_length, //We will do key by key even when a key have more then one version
             async () => {
                 try {
                     //calling copy_objects in the replication server
@@ -148,11 +283,21 @@ async function copy_objects(scanner_semaphore, client, copy_type, src_bucket_nam
                     dbg.error('replication_utils copy_objects: error: ', err, src_bucket_name, dst_bucket_name, keys_diff_map);
                 }
             });
-        return res;
     } catch (err) {
         dbg.error('replication_utils copy_objects: semaphore error:', err, err.stack);
         // no need to handle semaphore errors, eventually the object will be uploaded
+        return;
     }
+
+    const moved = Number(res?.num_of_objects) || 0;
+    if (replication_id) {
+        if (moved > 0) {
+            update_replication_target_status(replication_id, src_bucket_name, dst_bucket_name, true);
+        } else {
+            update_replication_target_status(replication_id, src_bucket_name, dst_bucket_name, false);
+        }
+    }
+    return res ?? { num_of_objects: 0, size_of_objects: 0 };
 }
 
 //TODO: probably need to handle it also, getting an objects and not keys array
@@ -185,8 +330,13 @@ async function delete_objects(scanner_semaphore, client, bucket_name, keys) {
 }
 
 // EXPORTS
-exports.get_rule_status = get_rule_status;
+exports.get_rule_and_bucket_status = get_rule_and_bucket_status;
 exports.update_replication_prom_report = update_replication_prom_report;
+exports.report_failed_replication_cycle = report_failed_replication_cycle;
+exports.update_replication_target_status = update_replication_target_status;
+exports.reconcile_replication_target_status = reconcile_replication_target_status;
+exports.clear_replication_target_status_for_orphan_policy = clear_replication_target_status_for_orphan_policy;
+exports.resolve_destination_bucket_name = resolve_destination_bucket_name;
 exports.get_object_md = get_object_md;
 exports.find_src_and_dst_buckets = find_src_and_dst_buckets;
 exports.get_copy_type = get_copy_type;

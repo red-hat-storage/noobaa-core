@@ -3,6 +3,7 @@
 
 const dbg = require('../util/debug_module')(__filename);
 const health = require('./health');
+const usage_stats = require('./usage_stats');
 const config = require('../../config');
 const http_utils = require('../util/http_utils');
 const buffer_utils = require('../util/buffer_utils');
@@ -28,6 +29,9 @@ async function manage_diagnose_operations(action, user_input, config_fs) {
             break;
         case DIAGNOSE_ACTIONS.METRICS:
             await gather_metrics();
+            break;
+        case DIAGNOSE_ACTIONS.USAGE_STATS:
+            await usage_stats.get_usage_stats(config_fs);
             break;
         default:
             throw_cli_error(ManageCLIError.InvalidAction);
@@ -59,9 +63,17 @@ async function gather_metrics() {
             const buffer = await buffer_utils.read_stream_join(res);
             const body = buffer.toString('utf8');
             metrics_output = JSON.parse(body);
+            if (!metrics_output) throw new Error('received empty metrics response', { cause: res.statusCode });
+            write_stdout_response(ManageCLIResponse.MetricsStatus, metrics_output);
+        } else if (res.statusCode >= 500 && res.rawHeaders.includes('application/json')) {
+            const buffer = await buffer_utils.read_stream_join(res);
+            const body = buffer.toString('utf8');
+            const error_output = JSON.parse(body);
+            if (!error_output) throw new Error('received empty metrics response', { cause: res.statusCode });
+            throw_cli_error({ ...ManageCLIError.MetricsStatusFailed, ...error_output });
+        } else {
+            throw new Error('received empty metrics response', { cause: res.statusCode });
         }
-        if (!metrics_output) throw new Error('recieved empty metrics response', { cause: res.statusCode });
-        write_stdout_response(ManageCLIResponse.MetricsStatus, metrics_output);
     } catch (err) {
         dbg.warn('could not receive metrics response', err);
         throw_cli_error({ ...ManageCLIError.MetricsStatusFailed, cause: err?.errors?.[0] || err });

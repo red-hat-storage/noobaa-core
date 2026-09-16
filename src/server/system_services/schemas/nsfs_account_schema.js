@@ -8,11 +8,8 @@ module.exports = {
         '_id',
         'name',
         'email', // temp, keep the email internally
-        'access_keys',
         'nsfs_account_config',
         'creation_date',
-        'allow_bucket_creation',
-        'master_key_id',
     ],
     properties: {
         _id: {
@@ -81,22 +78,57 @@ module.exports = {
                 properties: {
                     uid: { type: 'number' },
                     gid: { type: 'number' },
+                    supplemental_groups: {
+                        $ref: 'common_api#/definitions/supplemental_groups'
+                    },
                     new_buckets_path: { type: 'string' },
                     fs_backend: {
                         $ref: 'common_api#/definitions/fs_backend'
-                    }
+                    },
+                    custom_bucket_path_allowed_list: { type: 'string' },
+                    allow_bypass_governance: { type: 'boolean' },
                 }
             }, {
                 type: 'object',
                 required: [ 'distinguished_name'],
                 properties: {
                     distinguished_name: { type: 'string' },
+                    supplemental_groups: {
+                        $ref: 'common_api#/definitions/supplemental_groups'
+                    },
                     new_buckets_path: { type: 'string' },
                     fs_backend: {
                         $ref: 'common_api#/definitions/fs_backend'
-                    }
+                    },
+                    custom_bucket_path_allowed_list: { type: 'string' },
+                    allow_bypass_governance: { type: 'boolean' },
                 }
             }]
         },
+        default_connection: {
+            type: 'string'
+        },
+        role_config: {
+            $ref: 'common_api#/definitions/role_config'
+        },
+        iam_inline_policies: {
+            type: 'array',
+            items: {
+                $ref: 'common_api#/definitions/iam_inline_policy',
+            }
+        },
+        description: {
+            type: 'string',
+        },
+        max_session_duration: {
+            type: 'number',
+        },
+        assume_role_policy_document: {
+            $ref: 'common_api#/definitions/iam_trust_policy_document',
+        },
+        identity_type: {
+            // to make consistent with containerized
+            $ref: 'common_api#/definitions/identity_type',
+        }
     }
 };

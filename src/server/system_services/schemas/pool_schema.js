@@ -54,28 +54,6 @@ module.exports = {
             objectid: true
         },
         pool_node_type: node_schema.properties.node_type,
-        mongo_pool_info: {
-            type: 'object',
-            properties: {
-                agent_info: {
-                    type: 'object',
-                    properties: {
-                        create_node_token: {
-                            type: 'string'
-                        },
-                        node_token: {
-                            type: 'string'
-                        },
-                        mongo_path: {
-                            type: 'string'
-                        }
-                    }
-                },
-                pending_delete: {
-                    type: 'boolean'
-                },
-            }
-        },
         storage_stats: {
             type: 'object',
             required: ['blocks_size', 'last_update'],
@@ -108,6 +86,7 @@ module.exports = {
                 aws_sts_arn: {
                     type: 'string'
                 },
+               azure_sts_credentials: {$ref: 'common_api#/definitions/azure_sts_credentials' },
                 backingstore: {
                     type: 'object',
                     properties: {
@@ -138,7 +117,7 @@ module.exports = {
                 },
                 endpoint_type: {
                     type: 'string',
-                    enum: ['AWSSTS', 'AWS', 'AZURE', 'S3_COMPATIBLE', 'GOOGLE', 'FLASHBLADE', 'NET_STORAGE', 'IBM_COS']
+                    enum: ['AWSSTS', 'AWS', 'AZURE', 'AZURESTS', 'S3_COMPATIBLE', 'GOOGLE', 'GOOGLE_STS', 'FLASHBLADE', 'NET_STORAGE', 'IBM_COS']
                 },
                 agent_info: {
                     type: 'object',
@@ -159,6 +138,9 @@ module.exports = {
                     type: 'boolean'
                 },
             }
+        },
+        is_default_pool: {
+            type: 'boolean',
         },
         hosts_pool_info: {
             type: 'object',

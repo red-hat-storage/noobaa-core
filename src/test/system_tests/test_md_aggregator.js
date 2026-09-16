@@ -4,7 +4,7 @@
 const _ = require('lodash');
 const util = require('util');
 const argv = require('minimist')(process.argv);
-const http_utils = require('../../../src/util/http_utils');
+const http_utils = require('../../util/http_utils');
 
 const dotenv = require('../../util/dotenv');
 dotenv.load();
@@ -13,6 +13,7 @@ const P = require('../../util/promise');
 const api = require('../../api');
 const os_utils = require('../../util/os_utils');
 const basic_server_ops = require('../utils/basic_server_ops');
+const { make_auth_token } = require('../../server/common_services/auth_server');
 
 const SERVICES_WAIT_IN_SECONDS = 30;
 //This was implemented to work on local servers only
@@ -31,15 +32,10 @@ const client = rpc.new_client({
 function create_auth() {
     const auth_params = {
         email: 'demo@noobaa.com',
-        password: 'DeMo1',
-        system: 'demo'
+        role: 'admin',
+        system: 'demo',
     };
-    return P.fcall(function() {
-            return client.create_auth_token(auth_params);
-        })
-        .then(() => {
-            // do nothing. 
-        });
+    client.options.auth_token = make_auth_token(auth_params);
 }
 
 // Services is an array of strings for each service or ['all']
@@ -59,39 +55,31 @@ function control_services(command, services) {
 }
 
 // Does the Auth and returns the nodes in the system
-function create_bucket(bucket_name) {
-    return P.resolve()
-        .then(() => client.tier.create_tier({
-            name: `${bucket_name}tier`,
-            attached_pools: ['first-pool'],
-            data_placement: 'SPREAD'
-        }))
-        .then(() => client.tiering_policy.create_policy({
-            name: `${bucket_name}tiering`,
-            tiers: [{
-                order: 0,
-                tier: `${bucket_name}tier`,
-                spillover: false,
-                disabled: false
-            }]
-        }))
-        .then(() => client.bucket.create_bucket({
-            name: bucket_name,
-            tiering: `${bucket_name}tiering`,
-        }));
+async function create_bucket(bucket_name) {
+    await client.tier.create_tier({
+        name: `${bucket_name}tier`,
+        attached_pools: ['first-pool'],
+        data_placement: 'SPREAD'
+    });
+    await client.tiering_policy.create_policy({
+        name: `${bucket_name}tiering`,
+        tiers: [{
+            order: 0,
+            tier: `${bucket_name}tier`,
+            spillover: false,
+            disabled: false
+        }]
+    });
+    return await client.bucket.create_bucket({
+        name: bucket_name,
+        tiering: `${bucket_name}tiering`,
+    });
 }
 
-function upload_file_to_bucket(bucket_name) {
-    let fkey;
-    return P.resolve()
-        .then(() => basic_server_ops.generate_random_file(1))
-        .then(fl => {
-            fkey = fl;
-            return basic_server_ops.upload_file(argv.ip, fl, bucket_name, fl);
-        })
-        .then(function() {
-            return fkey;
-        });
+async function upload_file_to_bucket(bucket_name) {
+    const file_key = await basic_server_ops.generate_random_file(1);
+    await basic_server_ops.upload_file(argv.ip, file_key, bucket_name, file_key);
+    return file_key;
 }
 
 async function prepare_buckets_with_objects() {
@@ -222,75 +210,61 @@ function wait_for_s3_and_web(max_seconds_to_wait) {
         });
 }
 
-function wait_for_mongodb_to_start(max_seconds_to_wait) {
-    let isNotListening = true;
+async function wait_for_mongodb_to_start(max_seconds_to_wait) {
+    let is_not_listening = true;
     const MAX_RETRIES = max_seconds_to_wait;
     let wait_counter = 1;
     //wait up to 10 seconds
     console.log('waiting for mongodb to start (1)');
 
-    return P.pwhile(
-            function() {
-                return isNotListening;
-            },
-            function() {
-                return os_utils.exec('supervisorctl status mongo_wrapper', {
-                        ignore_rc: false,
-                        return_stdout: true
-                    })
-                    .then(function(res) {
-                        if (String(res).indexOf('RUNNING') > -1) {
-                            console.log('mongodb started after ' + wait_counter + ' seconds');
-                            isNotListening = false;
-                        } else {
-                            throw new Error('Still waiting');
-                        }
-                    })
-                    .catch(function(err) {
-                        console.log('waiting for mongodb to start(2)');
-                        wait_counter += 1;
-                        if (wait_counter >= MAX_RETRIES) {
-                            console.error('Too many retries after restart mongodb', err);
-                            throw new Error('Too many retries');
-                        }
-                        return P.delay(1000);
-                    });
-            })
-        .then(() => {
-            // do nothing. 
-        });
+    while (is_not_listening) {
+        try {
+            const res = await os_utils.exec('supervisorctl status mongo_wrapper', {
+                ignore_rc: false,
+                return_stdout: true
+            });
+            if (String(res).indexOf('RUNNING') > -1) {
+                console.log('mongodb started after ' + wait_counter + ' seconds');
+                is_not_listening = false;
+            } else {
+                throw new Error('Still waiting');
+            }
+
+        } catch (err) {
+            console.log('waiting for mongodb to start(2)');
+            wait_counter += 1;
+            if (wait_counter >= MAX_RETRIES) {
+                console.error('Too many retries after restart mongodb', err);
+                throw new Error('Too many retries');
+            }
+            await P.delay(1000);
+        }
+    }
 }
 
-function wait_for_server_to_start(max_seconds_to_wait, port) {
-    let isNotListening = true;
+async function wait_for_server_to_start(max_seconds_to_wait, port) {
+    let is_not_listening = true;
     const MAX_RETRIES = max_seconds_to_wait;
     let wait_counter = 1;
     //wait up to 10 seconds
     console.log('waiting for server to start (1)');
 
-    return P.pwhile(
-            function() {
-                return isNotListening;
-            },
-            function() {
-                return http_utils.http_get('http://localhost:' + port)
-                    .then(function() {
-                        console.log('server started after ' + wait_counter + ' seconds');
-                        isNotListening = false;
-                    })
-                    .catch(function(err) {
-                        console.log('waiting for server to start(2)');
-                        wait_counter += 1;
-                        if (wait_counter >= MAX_RETRIES) {
-                            console.error('Too many retries after restart server', err);
-                            throw new Error('Too many retries');
-                        }
-                        return P.delay(1000);
-                    });
-            })
-        .then(() => {
-            // do nothing. 
-        });
+    while (is_not_listening) {
+        try {
+            await http_utils.http_get('http://localhost:' + port);
+            console.log('server started after ' + wait_counter + ' seconds');
+            is_not_listening = false;
+
+        } catch (err) {
+            console.log('waiting for server to start(2)');
+            wait_counter += 1;
+            if (wait_counter >= MAX_RETRIES) {
+                console.error('Too many retries after restart server', err);
+                throw new Error('Too many retries');
+            }
+            await P.delay(1000);
+        }
+    }
 }
 
 exports.run_test = run_test;

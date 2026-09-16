@@ -10,8 +10,8 @@ const { default: Ajv } = require('ajv');
 const crypto = require('crypto');
 const util = require('util');
 const EventEmitter = require('events').EventEmitter;
-const { Pool, Client } = require('pg');
-const { MongoSequence } = require('./mongo_client');
+const { Pool, Client, escapeLiteral } = require('pg');
+const parse_pg_connection_string = require('pg-connection-string').parseIntoClientConfig;
 
 const P = require('./promise');
 const dbg = require('./debug_module')(__filename);
@@ -22,14 +22,23 @@ const mongodb = require('mongodb');
 const mongo_to_pg = require('mongo-query-to-postgres-jsonb');
 const fs = require('fs');
 // TODO: Shouldn't be like that, we shouldn't use MongoDB functions to compare
-const mongo_functions = require('./mongo_functions');
+const aggregate_functions = require('./aggregate_functions');
 const { RpcError } = require('../rpc');
 const SensitiveString = require('./sensitive_string');
 const time_utils = require('./time_utils');
 const config = require('../../config');
 const ssl_utils = require('./ssl_utils');
+const fs_utils = require('./fs_utils');
 
 const DB_CONNECT_ERROR_MESSAGE = 'Could not acquire client from DB connection pool';
+
+// pg-connection-string keeps RFC 3986 brackets on IPv6 literals (e.g. [::1]),
+// which causes getaddrinfo ENOTFOUND when pg passes the host to net.connect.
+// Workaround until fixed upstream: https://github.com/brianc/node-postgres/pull/3698
+function normalize_pg_host(host) {
+    if (!host) return host;
+    return host.replace(/^\[(.+)\]$/, '$1');
+}
 mongodb.Binary.prototype[util.inspect.custom] = function custom_inspect_binary() {
     return `<mongodb.Binary ${this.buffer.toString('base64')} >`;
 };
@@ -48,7 +57,7 @@ const COMPARISON_OPS = [
 // temporary solution for encode\decode
 // perfrom encode\decode json for every query to\from the DB
 // TODO: eventually we want to perform this using the ajv process
-// in schema_utils - handle 
+// in schema_utils - handle
 function decode_json(schema, val) {
     if (!schema) {
         return val;
@@ -88,7 +97,7 @@ function decode_json(schema, val) {
     return val;
 }
 
-// convert certain types to a known representation 
+// convert certain types to a known representation
 function encode_json(schema, val) {
     if (!val || !schema) {
         return val;
@@ -205,7 +214,7 @@ async function log_query(pg_client, query, tag, millitook, should_explain) {
 
     if (millitook > config.LONG_DB_QUERY_THRESHOLD) {
         dbg.warn(
-            `QUERY_LOG: LONG QUERY (OVER ${config.LONG_DB_QUERY_THRESHOLD} ms) - 
+            `QUERY_LOG: LONG QUERY (OVER ${config.LONG_DB_QUERY_THRESHOLD} ms) -
             please check whether the DB and core pods have sufficient CPU and memory `,
             JSON.stringify(log_obj)
         );
@@ -245,8 +254,12 @@ function convert_timestamps(where_clause) {
 }
 
 
-async function _do_query(pg_client, q, transaction_counter) {
+async function _do_query(pg_client, q, transaction_counter, options = {}) {
+    const {log_errors = true} = options;
     query_counter += 1;
+
+    dbg.log3("pg_client.options?.host =", pg_client.options?.host, ", retry =", pg_client.retry_with_default_pool, ", q =", q);
+
     const tag = `T${_.padStart(transaction_counter, 8, '0')}|Q${_.padStart(query_counter.toString(), 8, '0')}`;
     try {
         // dbg.log0(`postgres_client: ${tag}: ${q.text}`, util.inspect(q.values, { depth: 6 }));
@@ -255,14 +268,21 @@ async function _do_query(pg_client, q, transaction_counter) {
         const milliend = time_utils.millistamp();
         const millitook = milliend - millistart;
         if (process.env.PG_ENABLE_QUERY_LOG === 'true' || millitook > config.LONG_DB_QUERY_THRESHOLD) {
-            // noticed that some failures in explain are invalidating the transaction. 
-            // myabe did something wrong but for now don't try to EXPLAIN the query when in transaction. 
+            // noticed that some failures in explain are invalidating the transaction.
+            // myabe did something wrong but for now don't try to EXPLAIN the query when in transaction.
             await log_query(pg_client, q, tag, millitook, /*should_explain*/ transaction_counter === 0);
         }
         return res;
     } catch (err) {
         if (err.routine === 'index_create' && err.code === '42P07') return;
-        dbg.error(`postgres_client: ${tag}: failed with error:`, err);
+        if (log_errors) {
+            dbg.log0(`postgres_client: ${tag}: failed with error:`, err);
+        }
+        await log_query(pg_client, q, tag, 0, /*should_explain*/ false);
+        if (pg_client.retry_with_default_pool) {
+            dbg.warn("retrying with default pool. q = ", q);
+            return _do_query(PostgresClient.instance().get_pool('default'), q, transaction_counter);
+        }
         throw err;
     }
 }
@@ -320,7 +340,7 @@ function buildPostgresArrayQuery(table_name, update, find) {
 
 function convert_array_query(table_name, encoded_update, encoded_find) {
     let query;
-    // translation of '.$.' is currently supported for findAndUpdateOne and more specifcally to $set operations. 
+    // translation of '.$.' is currently supported for findAndUpdateOne and more specifcally to $set operations.
     const update_keys = encoded_update.$set && Object.keys(encoded_update.$set).filter(key => key.includes('.$.'));
     if (update_keys && update_keys.length) {
         query = buildPostgresArrayQuery(table_name, encoded_update.$set, encoded_find);
@@ -329,15 +349,15 @@ function convert_array_query(table_name, encoded_update, encoded_find) {
 }
 class PgTransaction {
 
-    constructor(client) {
+    constructor(pg_pool) {
         this.transaction_id = trans_counter;
         trans_counter += 1;
-        this.client = client;
+        this.pg_pool = pg_pool;
     }
 
     async begin() {
         try {
-            this.pg_client = await this.client.pool.connect();
+            this.pg_client = await this.pg_pool.connect();
         } catch (err) {
             dbg.error(DB_CONNECT_ERROR_MESSAGE, err);
             throw new Error(DB_CONNECT_ERROR_MESSAGE);
@@ -359,6 +379,34 @@ class PgTransaction {
         await this.query('COMMIT TRANSACTION');
     }
 
+    /**
+     * Acquire a connection, wrap the given queries in BEGIN/COMMIT, and send
+     * everything as a single round-trip. On error the transaction is rolled
+     * back before the connection is returned to the pool.
+     * @param {string} batch_text - semicolon-separated SQL (without BEGIN/COMMIT)
+     * @returns {Promise<any[]>} result set for each query (BEGIN/COMMIT entries excluded)
+     */
+    async execute_batch(batch_text) {
+        try {
+            this.pg_client = await this.pg_pool.connect();
+        } catch (err) {
+            dbg.error(DB_CONNECT_ERROR_MESSAGE, err);
+            throw new Error(DB_CONNECT_ERROR_MESSAGE);
+        }
+        this.pg_client.once('error', err => {
+            dbg.error('got error on pg_transaction', err, this.transaction_id);
+        });
+        try {
+            const full_query = `BEGIN; ${batch_text}; COMMIT`;
+            const raw = await _do_query(this.pg_client, { text: full_query }, this.transaction_id);
+            const results = Array.isArray(raw) ? raw : [raw];
+            return results.filter(r => r.command !== 'BEGIN' && r.command !== 'COMMIT');
+        } catch (err) {
+            try { await _do_query(this.pg_client, { text: 'ROLLBACK' }, this.transaction_id); } catch (rollback_err) { dbg.warn('rollback after batch error failed', rollback_err); }
+            throw err;
+        }
+    }
+
     async rollback() {
         await this.query('ROLLBACK TRANSACTION');
     }
@@ -370,24 +418,20 @@ class PgTransaction {
             this.pg_client = null;
         }
     }
-
 }
 
 
 class BulkOp {
-    constructor({ client, name, schema }) {
+    constructor({ pg_pool, name, schema }) {
         this.name = name;
         this.schema = schema;
-        this.transaction = new PgTransaction(client);
+        this.transaction = new PgTransaction(pg_pool);
         this.queries = [];
         this.length = 0;
         // this.nInserted = 0;
         // this.nMatched = 0;
         // this.nModified = 0;
     }
-
-
-
 
     insert(data) {
         const _id = get_id(data);
@@ -402,20 +446,13 @@ class BulkOp {
 
     async execute() {
         let ok = false;
-        let errmsg;
+        let pg_error;
         let nInserted = 0;
         let nMatched = 0;
         let nModified = 0;
         let nRemoved = 0;
-        let should_rollback = false;
         try {
-            await this.transaction.begin();
-            should_rollback = true;
-            const batch_query = this.queries.join('; ');
-            let results = await this.transaction.query(batch_query);
-            if (!Array.isArray(results)) {
-                results = [results];
-            }
+            const results = await this.transaction.execute_batch(this.queries.join('; '));
             for (const res of results) {
                 if (res.command === 'UPDATE') {
                     nModified += res.rowCount;
@@ -426,24 +463,22 @@ class BulkOp {
                     nRemoved += res.rowCount;
                 }
             }
-            await this.transaction.commit();
             ok = true;
         } catch (err) {
-            errmsg = err;
-            dbg.error('PgTransaction execute error', err);
-            if (should_rollback) await this.transaction.rollback();
+            pg_error = err;
+            dbg.error('BulkOp execute error', err);
         } finally {
             this.transaction.release();
         }
 
         return {
-            err: errmsg,
+            err: pg_error,
             ok,
             nInserted,
             nMatched,
             nModified,
             nRemoved,
-            // nUpserted is not used in our code. returning 0 
+            // nUpserted is not used in our code. returning 0
             nUpserted: 0,
             getInsertedIds: not_implemented,
             getLastOp: not_implemented,
@@ -452,15 +487,15 @@ class BulkOp {
             getUpsertedIds: not_implemented,
             getWriteConcernError: _.noop,
             getWriteErrorAt: i => (ok ? undefined : {
-                code: errmsg.code,
+                code: pg_error.code,
                 index: i,
-                errmsg: errmsg.message
+                errmsg: pg_error.message
             }),
             getWriteErrorCount: () => (ok ? 0 : this.queries.length),
             getWriteErrors: () => (ok ? [] : _.times(this.queries.length, i => ({
-                code: errmsg.code,
+                code: pg_error.code,
                 index: i,
-                errmsg: errmsg.message
+                errmsg: pg_error.message
             }))),
             hasWriteErrors: () => !ok
 
@@ -521,31 +556,40 @@ class OrderedBulkOp extends BulkOp {
 
 }
 
+/**
+ * BulkOp that can insert into multiple tables in a single batched transaction.
+ * Extends BulkOp to reuse add_query(), execute(), and transaction lifecycle.
+ * Unlike the single-table BulkOp, the constructor does not require a table
+ * name or schema — those are provided per-entry in insert_many().
+ */
+class MultiTableBulkOp extends BulkOp {
+    constructor({ pg_pool }) {
+        super({ pg_pool, name: undefined, schema: undefined });
+    }
+
+    /**
+     * @param {{ table: PostgresTable, docs: object[] }[]} entries
+     */
+    insert_many(entries) {
+        for (const { table, docs } of entries) {
+            if (!docs || !docs.length) continue;
+            const values = docs.map(doc => {
+                table.validate(doc);
+                const _id = get_id(doc);
+                return `(${escapeLiteral(String(_id))}, ${escapeLiteral(JSON.stringify(encode_json(table.schema, doc)))})`;
+            });
+            this.add_query(`INSERT INTO ${table.name}(_id, data) VALUES ${values.join(', ')}`);
+        }
+        return this;
+    }
+}
+
 class PostgresSequence {
     constructor(params) {
         const { name, client } = params;
         this.name = name;
         this.client = client;
-    }
-
-    // Lazy migration of the old mongo style collection/table based
-    // sequences. If a table with the name matching the sequence one
-    // is found, then:
-    // - fetch the current sequence value from the collection
-    // - return the init value to be used for native sequence
-    // If no table is found, return 1 - clean install
-    async migrateFromMongoSequence(name, pool) {
-        const res = await _do_query(pool, { text: `SELECT count(*) FROM pg_tables WHERE tablename  = '${name}';` }, 0);
-        const count = Number(res.rows[0].count);
-        if (count === 0) {
-            dbg.log0(`Table ${name} not found, skipping sequence migration`);
-            return 1;
-        }
-        dbg.log0(`✅ Table ${name} is found, starting migration to native sequence`);
-        const mongoSeq = new MongoSequence({ name, client: this.client });
-        const start = await mongoSeq.nextsequence();
-
-        return start;
+        this.pool_key = params.postgres_pool || 'default';
     }
 
     seqname() {
@@ -554,23 +598,57 @@ class PostgresSequence {
 
     async _create(pool) {
         try {
-            const start = await this.migrateFromMongoSequence(this.name, pool);
-            await _do_query(pool, { text: `CREATE SEQUENCE IF NOT EXISTS ${this.seqname()} AS BIGINT START ${start};` }, 0);
-            if (start !== 1) {
-                await _do_query(pool, { text: `DROP table IF EXISTS ${this.name};` }, 0);
-                dbg.log0(`✅ Table ${this.name} is dropped, migration to native sequence is completed`);
-            }
+            await _do_query(pool, { text: `CREATE SEQUENCE IF NOT EXISTS ${this.seqname()} AS BIGINT;` }, 0);
         } catch (err) {
             dbg.error('PostgresSequence._create failed', err);
             throw err;
         }
     }
 
+    get_pool() {
+        const pool = this.client.get_pool(this.pool_key);
+        if (!pool) {
+            throw new Error(`The postgres clients pool ${this.pool_key} disconnected`);
+        }
+        return pool;
+    }
+
     async nextsequence() {
         if (this.init_promise) await this.init_promise;
         const q = { text: `SELECT nextval('${this.seqname()}')` };
-        const res = await _do_query(this.client.pool, q, 0);
+        const res = await _do_query(this.get_pool(), q, 0);
         return Number.parseInt(res.rows[0].nextval, 10);
+    }
+
+    async nextNsequences(n) {
+        if (n <= 0) {
+            return { start: 0, end: 0 };
+        }
+
+        if (this.init_promise) await this.init_promise;
+        const conn_pool = await this.get_pool();
+
+        try {
+            await _do_query(conn_pool, { text: 'BEGIN' }, 0);
+            const query =
+                `WITH vals AS (
+                SELECT nextval('${this.seqname()}') AS val
+                FROM generate_series(1, ${n})
+            )
+            SELECT min(val) AS start, max(val) AS end
+            FROM vals;`;
+            const res = await _do_query(conn_pool, { text: query }, 0);
+            await _do_query(conn_pool, { text: 'COMMIT' }, 0);
+
+            return {
+                start: Number.parseInt(res.rows[0].start, 10),
+                end: Number.parseInt(res.rows[0].end, 10)
+            };
+        } catch (e) {
+            dbg.error("error allocating sequences", e);
+            await _do_query(conn_pool, { text: 'ROLLBACK' }, 0);
+            return { start: 0, end: 0 };
+        }
     }
 }
 
@@ -592,7 +670,11 @@ class PostgresTable {
         this.db_indexes = [id_index, ...(db_indexes || [])];
         this.schema = schema;
         this.client = client;
-        // calculate an advisory_lock_key from this collection by taking the first 32 bit 
+
+        // the pool to be used for the table
+        this.pool_key = table_params.postgres_pool || 'default';
+
+        // calculate an advisory_lock_key from this collection by taking the first 32 bit
         // of the sha256 of the table name
         const advisory_lock_key_string = crypto.createHash('sha256')
             .update(name)
@@ -614,16 +696,30 @@ class PostgresTable {
         }
     }
 
+
+    get_pool(key = this.pool_key) {
+        const pool = this.client.get_pool(key);
+        if (!pool) {
+            //if original get_pool was not for the default this.pool_key, try also this.pool_key
+            if (key && key !== this.pool_key) {
+                return this.get_pool();
+            }
+            throw new Error(`The postgres clients pool ${key} disconnected`);
+        }
+        return pool;
+    }
+
+
     initializeUnorderedBulkOp() {
         return new UnorderedBulkOp({
             name: this.name,
-            client: this.client,
+            pg_pool: this.get_pool(),
             schema: this.schema
         });
     }
 
     initializeOrderedBulkOp() {
-        return new OrderedBulkOp({ name: this.name, client: this.client, schema: this.schema });
+        return new OrderedBulkOp({ name: this.name, pg_pool: this.get_pool(), schema: this.schema });
     }
 
     async _create_table(pool) {
@@ -680,7 +776,7 @@ class PostgresTable {
     async single_query(text, values, client, skip_init) {
         if (!skip_init) await this.init_promise;
         const q = { text, values };
-        return _do_query(client || this.client.pool, q, 0);
+        return _do_query(client || this.get_pool(), q, 0);
     }
 
     get_id(data) {
@@ -869,7 +965,7 @@ class PostgresTable {
             query_string += ` OFFSET ${sql_query.offset}`;
         }
         try {
-            const res = await this.single_query(query_string);
+            const res = await this.single_query(query_string, undefined, this.get_pool(options.preferred_pool));
             return res.rows.map(row => decode_json(this.schema, row.data));
         } catch (err) {
             dbg.error('find failed', query, options, query_string, err);
@@ -886,7 +982,7 @@ class PostgresTable {
         }
         query_string += ' LIMIT 1';
         try {
-            const res = await this.single_query(query_string);
+            const res = await this.single_query(query_string, undefined, this.get_pool(options.preferred_pool));
             if (res.rowCount === 0) return null;
             return res.rows.map(row => decode_json(this.schema, row.data))[0];
         } catch (err) {
@@ -936,122 +1032,16 @@ class PostgresTable {
         }
     }
 
-    async _reduceFinalizeFuncStats(rows, scope) {
-
-        let response_times;
-        // this is the reduce part of the map reduce
-        const values = [];
-        rows.map(row => values.push(row.value));
-
-        const reduced = values.reduce((bin, other) => {
-            bin.invoked += other.invoked;
-            bin.fulfilled += other.fulfilled;
-            bin.rejected += other.rejected;
-            bin.aggr_response_time += other.aggr_response_time;
-            bin.max_response_time = Math.max(
-                bin.max_response_time,
-                other.max_response_time
-            );
-            bin.completed_response_times = [
-                ...bin.completed_response_times,
-                ...other.completed_response_times
-            ];
-
-            return bin;
-        });
-
-        // Reduce the sample size to max_samples
-        response_times = reduced.completed_response_times;
-        if (response_times.length > scope.max_samples) {
-            reduced.completed_response_times = Array.from({ length: scope.max_samples },
-                () => response_times[
-                    Math.floor(Math.random() * response_times.length)
-                ]
-            );
-        }
-
-        // this is the finalize part of the map reduce
-        response_times = reduced.completed_response_times.sort((a, b) => a - b);
-
-        const return_value = {
-            invoked: reduced.invoked,
-            fulfilled: reduced.fulfilled,
-            rejected: reduced.rejected,
-            max_response_time: reduced.max_response_time,
-            aggr_response_time: reduced.aggr_response_time,
-            avg_response_time: reduced.fulfilled > 0 ?
-                Math.round(reduced.aggr_response_time / reduced.fulfilled) : 0,
-            response_percentiles: scope.percentiles.map(percentile => {
-                const index = Math.floor(response_times.length * percentile);
-                const value = response_times[index] || 0;
-                return { percentile, value };
-            })
-        };
-
-        return return_value;
-    }
-
-    async mapReduceFuncStats(func, options) {
-        let query_string;
-        let map_reduce_query;
-        let map;
-        const map_reduced_array = [];
-        try {
-            // this is the map part of the map reduce
-            query_string = `SELECT * FROM ${this.name} WHERE ${mongo_to_pg('data', encode_json(this.schema, options.query), {disableContainmentQuery: true})}`;
-            map_reduce_query = `SELECT * FROM ${func}($$${query_string}$$)`;
-            map = await this.single_query(map_reduce_query);
-        } catch (err) {
-            dbg.error('mapReduceFuncStats failed', options, query_string, map_reduce_query, err);
-            throw err;
-        }
-
-        //If there are no matching results then returning an empty array
-        if (map.rows.length === 0) {
-            return map.rows;
-        }
-
-        //Working on all the results from the query
-        let return_value = await this._reduceFinalizeFuncStats(map.rows, options.scope);
-
-        map_reduced_array.push({
-            _id: -1,
-            value: return_value,
-        });
-
-        //Working on each column 
-        try {
-            map = await this.single_query(map_reduce_query);
-        } catch (err) {
-            dbg.error('mapReduceFuncStats failed', options, query_string, map_reduce_query, err);
-            throw err;
-        }
-        const step = options.scope.step;
-        const groupByKeys = _.groupBy(map.rows, r => Math.floor(new Date(r.time_stamp).valueOf() / step) * step);
-        for (const [key, rows] of Object.entries(groupByKeys)) {
-            return_value = await this._reduceFinalizeFuncStats(rows, options.scope);
-            map_reduced_array.push({
-                _id: key,
-                value: return_value,
-            });
-        }
-
-        return map_reduced_array;
-
-    }
-
     async mapReduce(map, reduce, params) {
         switch (map) {
-            case mongo_functions.map_aggregate_objects:
+            case aggregate_functions.map_aggregate_objects:
                 return this.mapReduceAggregate('map_aggregate_objects', params);
-            case mongo_functions.map_aggregate_chunks:
+            case aggregate_functions.map_aggregate_chunks:
                 return this.mapReduceAggregate('map_aggregate_chunks', params);
-            case mongo_functions.map_aggregate_blocks:
+            case aggregate_functions.map_aggregate_blocks:
                 return this.mapReduceAggregate('map_aggregate_blocks', params);
-            case mongo_functions.map_common_prefixes:
+            case aggregate_functions.map_common_prefixes:
                 return this.mapReduceListObjects(params);
-            case mongo_functions.map_func_stats:
-                return this.mapReduceFuncStats('map_func_stats', params);
             default:
                 throw new Error('TODO mapReduce');
         }
@@ -1177,10 +1167,10 @@ class PostgresTable {
 
     /**
      * findOneAndUpdate finds the first entry that matches the selector and applies the given update to it.
-     * 
+     *
      * If upsert is true, it will create the entry if it doesn't exist - this will only create the entry
      * with _id, if more fields are needed to be created "atomically" then `upsert_fields` should be used.
-     * 
+     *
      * `upsert_fields` is not available in mongo as mongo by default creates even the nested fields if missing.
      * @param {Record<string, any>} query aka Selector
      * @param {Record<string, any>} update updates to apply
@@ -1188,8 +1178,8 @@ class PostgresTable {
      *   upsert: boolean,
      *   returnOriginal: boolean,
      *   upsert_fields: Record<string, any>
-     * }} options 
-     * @returns 
+     * }} options
+     * @returns
      */
     async findOneAndUpdate(query, update, options) {
         if (options.returnOriginal !== false) {
@@ -1237,7 +1227,7 @@ class PostgresTable {
             let pg_client;
             let locked;
             try {
-                pg_client = await this.client.pool.connect();
+                pg_client = await this.get_pool().connect();
                 let update_res = await this._updateOneWithClient(pg_client, query, update, options);
                 if (update_res.rowCount === 0) {
                     // try to lock the advisory_lock_key for this table, try update and insert the first doc if 0 docs updated
@@ -1285,7 +1275,7 @@ class PostgresTable {
     }
 
     async stats() {
-        // TODO 
+        // TODO
         return {
             ns: 'TODO',
             count: Infinity,
@@ -1400,10 +1390,7 @@ class PostgresClient extends EventEmitter {
         dbg.log0('disconnect called');
         this._disconnected_state = true;
         this._connect_promise = null;
-        if (this.pool) {
-            this.pool.end();
-            this.pool = null;
-        }
+        this._destroy_all_pools();
         if (this.ssl_cert_info) {
             this.ssl_cert_info.removeListener(this._update_ssl_cert);
         }
@@ -1423,39 +1410,122 @@ class PostgresClient extends EventEmitter {
         return this.new_pool_params.database;
     }
 
+    get_pool(name = 'default') {
+        return this.pools[name].instance;
+    }
+
+    initializeMultiTableBulkOp(pool_name = 'default') {
+        return new MultiTableBulkOp({ pg_pool: this.get_pool(pool_name) });
+    }
+
+    /**
+     * Resolve pool for raw SQL. If `preferred_pool` is missing or unavailable,
+     * falls back to the `default` pool (same name as {@link PostgresClient#get_pool}).
+     *
+     * @param {string} [preferred_pool='default']
+     * @returns {import('pg').Pool}
+     */
+    _get_pool_for_sql(preferred_pool = 'default') {
+        const pool = this.get_pool(preferred_pool);
+        if (!pool) {
+            if (preferred_pool && preferred_pool !== 'default') {
+                return this._get_pool_for_sql('default');
+            }
+            throw new Error(`The postgres clients pool ${preferred_pool} disconnected`);
+        }
+        return pool;
+    }
+
+    /**
+     * Raw SQL against the DB. Uses `preferred_pool` when set; defaults to `default`.
+     * If that pool is unavailable, falls back to the `default` pool.
+     *
+     * @template T
+     * @param {string} query
+     * @param {Array<any>} params
+     * @param {{
+     *   query_name?: string,
+     *   preferred_pool?: string,
+     *   log_errors?: boolean,
+     * }} [options={}]
+     * @returns {Promise<import('pg').QueryResult<T>>}
+     */
+    async executeSQL(query, params, options = {}) {
+        const { query_name, preferred_pool = 'default', log_errors = true } = options;
+        const pool = this._get_pool_for_sql(preferred_pool);
+
+        const q = {
+            text: query,
+            values: params,
+        };
+
+        if (query_name) {
+            q.name = query_name;
+        }
+
+        const res = await _do_query(pool, q, 0, { log_errors });
+
+        return res;
+    }
+
     constructor(params) {
         super();
         this.tables = [];
         this.sequences = [];
-        const postgres_port = parseInt(process.env.POSTGRES_PORT || '5432', 10);
 
-        if (process.env.POSTGRES_CONNECTION_STRING) {
+        this.pools = {
+            default: {
+                instance: null,
+                size: config.POSTGRES_DEFAULT_MAX_CLIENTS
+            },
+            md: {
+                instance: null,
+                size: config.POSTGRES_MD_MAX_CLIENTS
+            },
+            read_only: {
+                instance: null,
+                size: config.POSTGRES_DEFAULT_MAX_CLIENTS,
+                retry_with_default_pool: true
+            }
+        };
+
+
+        if (process.env.POSTGRES_CONNECTION_STRING_PATH) {
+            const connection_string = fs.readFileSync(process.env.POSTGRES_CONNECTION_STRING_PATH, "utf8").trim();
+            const parsed_params = parse_pg_connection_string(connection_string);
+            parsed_params.host = normalize_pg_host(parsed_params.host);
             /** @type {import('pg').PoolConfig} */
             this.new_pool_params = {
-                connectionString: process.env.POSTGRES_CONNECTION_STRING,
+                ...parsed_params,
                 ...params,
             };
         } else {
+            // get the connection configuration. first from env, then from file, then default
+            const host = process.env.POSTGRES_HOST || fs_utils.try_read_file_sync(process.env.POSTGRES_HOST_PATH) || '127.0.0.1';
+            //optional read-only host. if not present defaults to general pg host
+            let host_ro = process.env.POSTGRES_HOST_RO || fs_utils.try_read_file_sync(process.env.POSTGRES_HOST_RO_PATH) || host;
+            //if POSTGRES_USE_READ_ONLY is off, switch to regular host
+            if (!config.POSTGRES_USE_READ_ONLY) {
+                host_ro = host;
+            }
+            const user = process.env.POSTGRES_USER || fs_utils.try_read_file_sync(process.env.POSTGRES_USER_PATH) || 'postgres';
+            const password = process.env.POSTGRES_PASSWORD || fs_utils.try_read_file_sync(process.env.POSTGRES_PASSWORD_PATH) || 'noobaa';
+            const database = process.env.POSTGRES_DBNAME || fs_utils.try_read_file_sync(process.env.POSTGRES_DBNAME_PATH) || 'nbcore';
+            const port = parseInt(process.env.POSTGRES_PORT || fs_utils.try_read_file_sync(process.env.POSTGRES_PORT_PATH) || '5432', 10);
             // TODO: This need to move to another function
             this.new_pool_params = {
-                host: process.env.POSTGRES_HOST || '127.0.0.1',
-                user: process.env.POSTGRES_USER || 'postgres',
-                password: process.env.POSTGRES_PASSWORD || 'noobaa',
-                database: process.env.POSTGRES_DBNAME || 'nbcore',
-                port: postgres_port,
+                host,
+                user,
+                password,
+                database,
+                port,
                 ...params,
             };
+            this.pools.read_only.host = host_ro;
         }
-        // TODO: check the effect of max clients. default is 10
-        this.new_pool_params.max = config.POSTGRES_MAX_CLIENTS;
         // As we now also support external DB we don't want to print secret user data
         // so this code will mask out passwords from the printed pool params
-        this.print_pool_params = _.omit(this.print_pool_params, 'password');
-        if (this.new_pool_params.connectionString) {
-            const original = this.new_pool_params.connectionString;
-            const masked = original.replace(/\/\/(.*?):(.*?)@/, '//$1:*****@');
-            this.print_pool_params.connectionString = masked;
-        }
+        this.print_pool_params = _.omit(this.new_pool_params, 'password');
 
         PostgresClient.implements_interface(this);
         this._ajv = new Ajv({ verbose: true, allErrors: true });
@@ -1530,8 +1600,8 @@ class PostgresClient extends EventEmitter {
         const seq = new PostgresSequence({ ...params, client: this });
         this.sequences.push(seq);
 
-        if (this.pool) {
-            seq.init_promise = seq._create(this.pool).catch(_.noop); // TODO what is best to do when init_collection fails here?
+        if (this.default_pool) {
+            seq.init_promise = seq._create(this.default_pool).catch(_.noop); // TODO what is best to do when init_collection fails here?
         }
 
         return seq;
@@ -1545,8 +1615,8 @@ class PostgresClient extends EventEmitter {
         const table = new PostgresTable({ ...table_params, client: this });
         this.tables.push(table);
 
-        if (this.pool) {
-            table.init_promise = table._create_table(this.pool).catch(_.noop); // TODO what is best to do when init_collection fails here?
+        if (this.default_pool) {
+            table.init_promise = table._create_table(this.default_pool).catch(_.noop); // TODO what is best to do when init_collection fails here?
         }
 
         return table;
@@ -1597,7 +1667,7 @@ class PostgresClient extends EventEmitter {
     }
 
     is_connected() {
-        return Boolean(this.pool);
+        return Boolean(this.default_pool);
     }
 
     async connect(skip_init_db) {
@@ -1609,48 +1679,81 @@ class PostgresClient extends EventEmitter {
     }
 
     async _connect(skip_init_db) {
-        // TODO: check if we need to listen for events from pool (https://node-postgres.com/api/pool#events)
-        // this.pool = new Pool(this.new_pool_params);
-
-        // await this._load_sql_functions();
-        // await this.ta
-        // return this.wait_for_client_init();
-
-        let pool;
         let is_connected = false;
         if (process.env.POSTGRES_SSL_REQUIRED) await this._load_ssl_certs();
         while (!is_connected) {
             try {
                 if (this._disconnected_state) return;
-                if (this.pool) return;
+                if (this.default_pool) return;
                 dbg.log0('_connect: called with', this.print_pool_params);
-                // this._set_connect_timeout();
-                // client = await mongodb.MongoClient.connect(this.url, this.config);
-                pool = new Pool(this.new_pool_params);
+
+                this._create_all_pools();
+
                 if (skip_init_db !== 'skip_init_db') {
-                    await this._init_collections(pool);
+                    await this._init_collections(this.pools.default.instance);
                 }
                 dbg.log0('_connect: connected', this.print_pool_params);
                 // this._reset_connect_timeout();
-                this.pool = pool;
-                this.pool.on('error', err => {
-                    dbg.error('got error on postgres pool', err);
-                });
+                this.default_pool = this.pools.default.instance;
                 this.emit('reconnect');
                 dbg.log0(`connected`);
                 is_connected = true;
-                // return this.mongo_client.db();
             } catch (err) {
                 // autoReconnect only works once initial connection is created,
                 // so we need to handle retry in initial connect.
                 dbg.error('_connect: initial connect failed, will retry', err.message);
-                if (pool) {
-                    pool.end();
-                    pool = null;
-                    this.pool = null;
-                }
+                this._destroy_all_pools();
+                this.default_pool = null;
                 await P.delay(3000);
             }
+        }
+    }
+
+    _create_pool(name) {
+        const pool = this.pools[name];
+        if (!pool) {
+            throw new Error(`create_pool: the pool ${name} is not defined in pools object`);
+        }
+        const new_pool_params = _.clone(this.new_pool_params);
+        if (pool.host) {
+            new_pool_params.host = pool.host;
+        }
+        if (!pool.instance) {
+            pool.instance = new Pool({
+                ...new_pool_params,
+                max: pool.size,
+                connectionTimeoutMillis: config.POSTGRES_CONNECTION_TIMEOUT_MS,
+            });
+            if (!pool._error_listener) {
+                pool.error_listener = err => {
+                    dbg.error(`got error on postgres pool ${name}`, err);
+                };
+            }
+            pool.instance.on('error', pool.error_listener);
+            //propagate retry_with_default_pool into instance so it will be available in _do_query()
+            pool.instance.retry_with_default_pool = pool.retry_with_default_pool;
+        }
+    }
+
+    _create_all_pools() {
+        for (const pool_name of Object.keys(this.pools)) {
+            this._create_pool(pool_name);
+        }
+    }
+
+    _destroy_pool(name) {
+        const pool = this.pools[name];
+        if (pool && pool.instance) {
+            pool.instance.removeListener('error', pool.error_listener);
+            pool.instance.end();
+            pool.instance = null;
+            pool.error_listener = null;
+        }
+    }
+
+    _destroy_all_pools() {
+        for (const pool_name of Object.keys(this.pools)) {
+            this._destroy_pool(pool_name);
         }
     }
 
@@ -1853,4 +1956,8 @@ PostgresClient._instance = undefined;
 
 // EXPORTS
 exports.PostgresClient = PostgresClient;
+exports.PgTransaction = PgTransaction;
 exports.instance = PostgresClient.instance;
+exports.encode_json = encode_json;
+exports.decode_json = decode_json;
+exports.escapeLiteral = escapeLiteral;

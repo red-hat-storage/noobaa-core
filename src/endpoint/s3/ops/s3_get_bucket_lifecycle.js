@@ -15,7 +15,9 @@ async function get_bucket_lifecycle(req) {
         };
 
 
-        if (rule.filter.and) {
+        if (rule.uses_prefix) {
+            current_rule.Prefix = rule.filter.prefix;
+        } else if (rule.filter.and) {
             current_rule.Filter = {
                 And: [{
                         Prefix: rule.filter.prefix,
@@ -40,15 +42,55 @@ async function get_bucket_lifecycle(req) {
             }
         }
 
-        // Generally expiration is optional,
-        // however NooBaa implements expiration only, so it is expected here.
-        current_rule.Expiration = {
-            Days: rule.expiration.days,
-        };
-        if (rule.expiration.date) {
-            current_rule.Expiration.Date = new Date(rule.expiration.date).toISOString();
+
+        if (rule.expiration) {
+            current_rule.Expiration = {
+                Days: rule.expiration.days,
+                Date: rule.expiration.date ? new Date(rule.expiration.date).toISOString() : undefined,
+                ExpiredObjectDeleteMarker: rule.expiration.expired_object_delete_marker,
+            };
+            _.omitBy(current_rule.Expiration, _.isUndefined);
         }
-        return { Rule: current_rule };
+
+        if (rule.noncurrent_version_expiration) {
+            current_rule.NoncurrentVersionExpiration = {
+                NoncurrentDays: rule.noncurrent_version_expiration.noncurrent_days,
+                NewerNoncurrentVersions: rule.noncurrent_version_expiration.newer_noncurrent_versions,
+            };
+            _.omitBy(current_rule.NoncurrentVersionExpiration, _.isUndefined);
+        }
+
+        if (rule.abort_incomplete_multipart_upload) {
+            current_rule.AbortIncompleteMultipartUpload = {
+                DaysAfterInitiation: rule.abort_incomplete_multipart_upload.days_after_initiation,
+            };
+            _.omitBy(current_rule.AbortIncompleteMultipartUpload, _.isUndefined);
+        }
+
+        // encode_xml repeats a tag only when sibling objects in an array share that key
+        // (same pattern as multiple <Rule>s). Putting Transition: [t1, t2] on current_rule
+        // would wrap both items in a single <Transition> tag.
+        const rule_parts = [current_rule];
+        for (const t of rule.transitions || []) {
+            rule_parts.push({
+                Transition: _.omitBy({
+                    Days: t.days,
+                    Date: t.date ? new Date(t.date).toISOString() : undefined,
+                    StorageClass: t.storage_class,
+                }, _.isUndefined),
+            });
+        }
+        for (const t of rule.noncurrent_version_transitions || []) {
+            rule_parts.push({
+                NoncurrentVersionTransition: _.omitBy({
+                    NoncurrentDays: t.noncurrent_days,
+                    NewerNoncurrentVersions: t.newer_noncurrent_versions,
+                    StorageClass: t.storage_class,
+                }, _.isUndefined),
+            });
+        }
+
+        return { Rule: rule_parts };
     });
 
     return { LifecycleConfiguration: rules };

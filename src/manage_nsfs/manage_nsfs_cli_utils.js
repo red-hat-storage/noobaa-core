@@ -2,8 +2,8 @@
 'use strict';
 
 const dbg = require('../util/debug_module')(__filename);
+const os_util = require('../util/os_utils');
 const nb_native = require('../util/nb_native');
-const { CONFIG_TYPES } = require('../sdk/config_fs');
 const native_fs_utils = require('../util/native_fs_utils');
 const ManageCLIError = require('../manage_nsfs/manage_nsfs_cli_errors').ManageCLIError;
 const NSFS_CLI_ERROR_EVENT_MAP = require('../manage_nsfs/manage_nsfs_cli_errors').NSFS_CLI_ERROR_EVENT_MAP;
@@ -11,8 +11,9 @@ const ManageCLIResponse = require('../manage_nsfs/manage_nsfs_cli_responses').Ma
 const NSFS_CLI_SUCCESS_EVENT_MAP = require('../manage_nsfs/manage_nsfs_cli_responses').NSFS_CLI_SUCCESS_EVENT_MAP;
 const { BOOLEAN_STRING_VALUES } = require('../manage_nsfs/manage_nsfs_constants');
 const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
-const mongo_utils = require('../util/mongo_utils');
+const { account_id_cache } = require('../sdk/accountspace_fs');
 
+const NOOBAA_SERVICE_NAME = 'noobaa';
 
 function throw_cli_error(error, detail, event_arg) {
     const error_event = NSFS_CLI_ERROR_EVENT_MAP[error.code];
@@ -35,24 +36,40 @@ function write_stdout_response(response_code, detail, event_arg) {
 }
 
 /**
- * get_bucket_owner_account will return the account of the bucket_owner
+ * get_bucket_owner_account_by_name will return the account of the bucket_owner
  * otherwise it would throw an error
  * @param {import('../sdk/config_fs').ConfigFS} config_fs
- * @param {string} [bucket_owner]
- * @param {string} [owner_account_id]
+ * @param {string} bucket_owner
  */
-async function get_bucket_owner_account(config_fs, bucket_owner, owner_account_id) {
+async function get_bucket_owner_account_by_name(config_fs, bucket_owner) {
     try {
-        const account = bucket_owner ?
-            await config_fs.get_account_by_name(bucket_owner) :
-            await config_fs.get_identity_by_id(owner_account_id, CONFIG_TYPES.ACCOUNT);
+        const account = await config_fs.get_account_by_name(bucket_owner);
         return account;
     } catch (err) {
         if (err.code === 'ENOENT') {
-            const detail_msg = bucket_owner ?
-                `bucket owner name ${bucket_owner} does not exists` :
-                `bucket owner id ${owner_account_id} does not exists`;
-            throw_cli_error(ManageCLIError.BucketSetForbiddenBucketOwnerNotExists, detail_msg, {bucket_owner: bucket_owner});
+            const detail_msg = `bucket owner name ${bucket_owner} does not exist`;
+            throw_cli_error(ManageCLIError.BucketSetForbiddenBucketOwnerNotExists, detail_msg, { bucket_owner: bucket_owner });
+        }
+        throw err;
+    }
+}
+
+/**
+ * get_bucket_owner_account_by_id will return the account of the owner_account id
+ * otherwise it would throw an error
+ * @param {import('../sdk/config_fs').ConfigFS} config_fs
+ * @param {string} owner_account
+ * @param {boolean} show_secrets
+ * @param {boolean} decrypt_secret_key
+ */
+async function get_bucket_owner_account_by_id(config_fs, owner_account, show_secrets = true, decrypt_secret_key = true) {
+    try {
+        const account = await account_id_cache.get_with_cache({ _id: owner_account, show_secrets, decrypt_secret_key, config_fs });
+        return account;
+    } catch (err) {
+        if (err.code === 'ENOENT') {
+            const detail_msg = `bucket owner account id ${owner_account} does not exist`;
+            throw_cli_error(ManageCLIError.BucketSetForbiddenBucketOwnerNotExists, detail_msg, { owner_account: owner_account });
         }
         throw err;
     }
@@ -76,7 +93,30 @@ function get_boolean_or_string_value(value) {
 }
 
 /**
- * get_options_from_file will read a JSON file that include key-value of the options 
+ * This function parse a comma delimited string of numbers ('0,212,111') to an array of numbers.
+ * This function assumes string format was validated before calling the function, wrong string format can
+ * lead to unexpected output (usually array of NaN)
+ * 1. if the value is a number return array with this number (3 => [3])
+ * 2. if the value is a string:
+ *   2.1 if value is an empty string (""). unset the value
+ *   2.2 else return an array of numbers ('0,212,111' => [0,212,111])
+ * 3. for all other types (including object and undefined) return the value itself
+ */
+function parse_comma_delimited_string(value) {
+    if (typeof value === 'number') {
+        return [value];
+    }
+    if (typeof value === 'string') {
+        if (value === '') {
+            return undefined;
+        }
+        return value.split(',').map(val => Number(val));
+    }
+    return value;
+}
+
+/**_
+ * get_options_fromfile will read a JSON file that include key-value of the options
  * (instead of flags) and return its content
  * @param {string} file_path
  */
@@ -84,7 +124,7 @@ async function get_options_from_file(file_path) {
     // we don't pass neither config_root_backend nor fs_backend
     const fs_context = native_fs_utils.get_process_fs_context();
     try {
-        const input_options_with_data = await native_fs_utils.read_file(fs_context, file_path);
+        const input_options_with_data = await native_fs_utils.read_file(fs_context, file_path, { parse_json: true });
         return input_options_with_data;
     } catch (err) {
         if (err.code === 'ENOENT') throw_cli_error(ManageCLIError.InvalidFilePath, file_path);
@@ -114,28 +154,6 @@ function set_debug_level(debug) {
 }
 
 /**
- * generate_id will generate an id that we use to identify entities (such as account, bucket, etc.). 
- */
-// TODO: 
-// - reuse this function in NC NSFS where we used the mongo_utils module
-// - this function implantation should be db_client.new_object_id(), 
-//   but to align with manage nsfs we won't change it now
-function generate_id() {
-    return mongo_utils.mongoObjectId();
-}
-
-/**
- * check_root_account_owns_user checks if an account is owned by root account
- * @param {object} root_account
- * @param {object} account
- */
-function check_root_account_owns_user(root_account, account) {
-    if (account.owner === undefined) return false;
-    return root_account._id === account.owner;
-}
-
-
-/**
  * is_name_update returns true if a new_name flag was provided and it's not equal to 
  * the current name
  * @param {Object} data
@@ -159,15 +177,126 @@ function is_access_key_update(data) {
     return new_access_key && cur_access_key && new_access_key !== cur_access_key;
 }
 
+/**
+ * get_service_status returns the active state of a service
+ * TODO: probablt better to return boolean but requires refactoring in Health script
+ * @param {String} service_name 
+ * @returns {Promise<String>}
+ */
+async function get_service_status(service_name) {
+    let service_status;
+    try {
+        service_status = await os_util.exec('systemctl show -p ActiveState --value ' + service_name, {
+            ignore_rc: false,
+            return_stdout: true,
+            trim_stdout: true,
+        });
+    } catch (err) {
+        dbg.warn('could not receive service active state', service_name, err);
+        service_status = 'missing service status info';
+    }
+    return service_status;
+}
+
+/**
+ * is_desired_time returns true if the given time matches with
+ * the desired time or if 
+ * @param {nb.NativeFSContext} fs_context 
+ * @param {Date} current
+ * @param {string} desire time in format 'hh:mm'
+ * @param {number} delay_limit_mins
+ * @param {string} timestamp_file_path 
+ * @param {"UTC" | "LOCAL"} timezone
+ * @returns {Promise<boolean>}
+ */
+async function is_desired_time(fs_context, current, desire, delay_limit_mins, timestamp_file_path, timezone) {
+    const [desired_hour, desired_min] = desire.split(':').map(Number);
+    if (
+        isNaN(desired_hour) ||
+        isNaN(desired_min) ||
+        (desired_hour < 0 || desired_hour >= 24) ||
+        (desired_min < 0 || desired_min >= 60)
+    ) {
+        throw new Error('invalid desired_time - must be hh:mm');
+    }
+
+    const min_time = get_tz_date(desired_hour, desired_min, 0, timezone);
+    const max_time = get_tz_date(desired_hour, desired_min + delay_limit_mins, 0, timezone);
+
+    if (current >= min_time && current <= max_time) {
+        try {
+            const { data } = await nb_native().fs.readFile(fs_context, timestamp_file_path);
+            const lastrun = new Date(data.toString());
+
+            // Last run should NOT be in this window
+            if (lastrun >= min_time && lastrun <= max_time) return false;
+        } catch (error) {
+            if (error.code === 'ENOENT') return true;
+            console.error('failed to read last run timestamp:', error, 'timestamp_file_path:', timestamp_file_path);
+
+            throw error;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+
+/**
+ * record_current_time stores the current timestamp in ISO format into
+ * the given timestamp file
+ * @param {nb.NativeFSContext} fs_context 
+ * @param {string} timestamp_file_path 
+ */
+async function record_current_time(fs_context, timestamp_file_path) {
+    await nb_native().fs.writeFile(
+        fs_context,
+        timestamp_file_path,
+        Buffer.from(new Date().toISOString()),
+    );
+}
+
+/**
+ * @param {number} hours
+ * @param {number} mins
+ * @param {number} secs
+ * @param {'UTC' | 'LOCAL'} tz
+ * @returns {Date}
+ */
+function get_tz_date(hours, mins, secs, tz) {
+    const date = new Date();
+
+    if (tz === 'UTC') {
+        date.setUTCHours(hours);
+        date.setUTCMinutes(mins);
+        date.setUTCSeconds(secs);
+        date.setUTCMilliseconds(0);
+    } else {
+        date.setHours(hours);
+        date.setMinutes(mins);
+        date.setSeconds(secs);
+        date.setMilliseconds(0);
+    }
+
+    return date;
+}
+
 // EXPORTS
 exports.throw_cli_error = throw_cli_error;
 exports.write_stdout_response = write_stdout_response;
 exports.get_boolean_or_string_value = get_boolean_or_string_value;
-exports.get_bucket_owner_account = get_bucket_owner_account;
+exports.parse_comma_delimited_string = parse_comma_delimited_string;
+exports.get_bucket_owner_account_by_name = get_bucket_owner_account_by_name;
+exports.get_bucket_owner_account_by_id = get_bucket_owner_account_by_id;
 exports.get_options_from_file = get_options_from_file;
 exports.has_access_keys = has_access_keys;
-exports.generate_id = generate_id;
 exports.set_debug_level = set_debug_level;
-exports.check_root_account_owns_user = check_root_account_owns_user;
 exports.is_name_update = is_name_update;
 exports.is_access_key_update = is_access_key_update;
+exports.get_service_status = get_service_status;
+exports.NOOBAA_SERVICE_NAME = NOOBAA_SERVICE_NAME;
+exports.is_desired_time = is_desired_time;
+exports.record_current_time = record_current_time;
+exports.get_tz_date = get_tz_date;
