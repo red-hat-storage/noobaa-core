@@ -1,6 +1,8 @@
 /* Copyright (C) 2016 NooBaa */
 'use strict';
 
+const SensitiveString = require('../util/sensitive_string');
+
 /**
  *
  * BUCKET API
@@ -26,13 +28,15 @@ module.exports = {
                     chunk_split_config: { $ref: 'common_api#/definitions/chunk_split_config' },
                     chunk_coder_config: { $ref: 'common_api#/definitions/chunk_coder_config' },
                     tag: { type: 'string' },
-                    object_lock_configuration: { $ref: '#/definitions/object_lock_configuration' },
+                    object_lock_configuration: { $ref: 'common_api#/definitions/object_lock_configuration' },
                     namespace: { $ref: '#/definitions/namespace_bucket_config' },
+                    archive_policy: { $ref: '#/definitions/archive_policy' },
                     lock_enabled: {
                         type: 'boolean'
                     },
-                    bucket_claim: { $ref: '#/definitions/bucket_claim' },
+                    bucket_claim: { $ref: 'common_api#/definitions/bucket_claim' },
                     force_md5_etag: { type: 'boolean' },
+                    custom_bucket_path: { type: 'string' }
                 }
             },
             reply: {
@@ -300,6 +304,59 @@ module.exports = {
             }
         },
 
+        get_bucket_notification: {
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: [
+                    'name'
+                ],
+                properties: {
+                    name: { $ref: 'common_api#/definitions/bucket_name' },
+                }
+            },
+            reply: {
+                type: 'object',
+                required: [
+                    'notifications'
+                ],
+                properties: {
+                    notifications: {
+                        type: 'array',
+                        items: {
+                            $ref: 'common_api#/definitions/bucket_notification'
+                        }
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        put_bucket_notification: {
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: [
+                    'notifications',
+                    'name',
+                ],
+                properties: {
+                    name: { $ref: 'common_api#/definitions/bucket_name' },
+                    notifications: {
+                        type: 'array',
+                        items: {
+                            $ref: 'common_api#/definitions/bucket_notification'
+                        }
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user'],
+            }
+        },
+
         read_bucket_sdk_info: {
             method: 'GET',
             params: {
@@ -388,6 +445,17 @@ module.exports = {
 
         list_buckets: {
             method: 'GET',
+            params: {
+                type: 'object',
+                properties: {
+                    continuation_token: { $ref: 'common_api#/definitions/continuation_token' },
+                    max_buckets: {
+                        type: 'integer',
+                        minimum: 1,
+                        maximum: 1000
+                    }
+                }
+            },
             reply: {
                 type: 'object',
                 required: ['buckets'],
@@ -401,10 +469,11 @@ module.exports = {
                                 name: { $ref: 'common_api#/definitions/bucket_name' },
                                 creation_date: {
                                     idate: true
-                                },
+                                }
                             }
                         }
-                    }
+                    },
+                    continuation_token: { $ref: 'common_api#/definitions/continuation_token' }
                 }
             },
             auth: {
@@ -621,43 +690,6 @@ module.exports = {
             }
         },
 
-        add_bucket_lambda_trigger: {
-            method: 'PUT',
-            params: {
-                $ref: '#/definitions/new_lambda_trigger'
-            },
-            auth: {
-                system: 'admin'
-            }
-        },
-
-        delete_bucket_lambda_trigger: {
-            method: 'DELETE',
-            required: ['id', 'bucket_name'],
-            params: {
-                type: 'object',
-                properties: {
-                    id: {
-                        objectid: true
-                    },
-                    bucket_name: { $ref: 'common_api#/definitions/bucket_name' },
-                }
-            },
-            auth: {
-                system: 'admin'
-            }
-        },
-
-        update_bucket_lambda_trigger: {
-            method: 'PUT',
-            params: {
-                $ref: '#/definitions/update_lambda_trigger'
-            },
-            auth: {
-                system: 'admin'
-            }
-        },
-
         update_all_buckets_default_pool: {
             method: 'PUT',
             params: {
@@ -681,7 +713,7 @@ module.exports = {
                 required: ['name', 'object_lock_configuration'],
                 properties: {
                     name: { $ref: 'common_api#/definitions/bucket_name' },
-                    object_lock_configuration: { $ref: '#/definitions/object_lock_configuration' },
+                    object_lock_configuration: { $ref: 'common_api#/definitions/object_lock_configuration' },
                 },
             },
             auth: {
@@ -699,7 +731,7 @@ module.exports = {
                 },
             },
             reply: {
-                $ref: '#/definitions/object_lock_configuration'
+                $ref: 'common_api#/definitions/object_lock_configuration'
             },
             auth: {
                 system: 'admin'
@@ -825,9 +857,397 @@ module.exports = {
                 system: ['admin', 'user']
             }
         },
+
+        get_bucket_cors: {
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: ['name'],
+                properties: {
+                    name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                },
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    cors: {
+                        $ref: 'common_api#/definitions/bucket_cors_configuration'
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        put_bucket_cors: {
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: ['name', 'cors_rules'],
+                properties: {
+                    name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                    cors_rules: {
+                        $ref: 'common_api#/definitions/bucket_cors_configuration'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        delete_bucket_cors: {
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: ['name'],
+                properties: {
+                    name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        get_public_access_block: {
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: ['bucket_name'],
+                properties: {
+                    bucket_name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    }
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    public_access_block: {
+                        $ref: 'common_api#/definitions/public_access_block'
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        put_public_access_block: {
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: ['bucket_name', 'public_access_block'],
+                properties: {
+                    bucket_name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                    public_access_block: {
+                        $ref: 'common_api#/definitions/public_access_block'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        delete_public_access_block: {
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: ['bucket_name'],
+                properties: {
+                    bucket_name: {
+                        $ref: 'common_api#/definitions/bucket_name'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        create_vector_bucket: {
+            method: 'POST',
+            params: {
+                type: 'object',
+                // TODO: in the future we might want to add more parameters like vector_db_type and namespace_resource
+                required: ['vector_bucket_name'],
+                properties: {
+                    vector_bucket_name: { wrapper: SensitiveString },
+                    vector_db_type: { $ref: 'common_api#/definitions/vector_db_type' },
+                    namespace_resource: { $ref: '#/definitions/namespace_resource_config'},
+                    bucket_claim: { $ref: 'common_api#/definitions/bucket_claim' }
+                }
+            },
+            reply: {
+                $ref: '#/definitions/vector_bucket_info'
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        get_vector_bucket: {
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: ['vector_bucket_name'],
+                properties: {
+                    vector_bucket_name: { wrapper: SensitiveString },
+                }
+            },
+            reply: {
+                $ref: '#/definitions/vector_bucket_info'
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+
+        delete_vector_bucket: {
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: ['vector_bucket_name'],
+                properties: {
+                    vector_bucket_name: { wrapper: SensitiveString },
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        list_vector_buckets: {
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: [],
+                properties: {
+                    max_results: { type: 'integer' },
+                    prefix: { wrapper: SensitiveString },
+                    next_token: {type: 'string'},
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    items: {
+                        type: 'array',
+                        items: {
+                            $ref: '#/definitions/vector_bucket_info'
+                        }
+                    },
+                    next_token: {type: 'string'},
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        create_vector_index: {
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: ['vector_index_name', 'vector_bucket_name', 'distance_metric', 'dimension'],
+                properties: {
+                    vector_index_name: { wrapper: SensitiveString },
+                    vector_bucket_name: { wrapper: SensitiveString },
+                    data_type: {
+                        type: 'string',
+                        enum: ['float32']
+                    },
+                    distance_metric: {
+                        type: 'string',
+                        enum: ['cosine', 'euclidean']
+                    },
+                    dimension: {
+                        type: 'integer',
+                        minimum: 1,
+                    },
+                    metadata_configuration: { $ref: 'common_api#/definitions/metadata_configuration' },
+                }
+            },
+            reply: {
+                type: 'object',
+                required: ['name'],
+                properties: {
+                    name: { wrapper: SensitiveString }
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        get_vector_index: {
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: ['vector_index_name', 'vector_bucket_name'],
+                properties: {
+                    vector_index_name: { wrapper: SensitiveString },
+                    vector_bucket_name: { wrapper: SensitiveString },
+                }
+            },
+            reply: {
+                $ref: '#/definitions/vector_index_info',
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        list_vector_indices: {
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: ['vector_bucket_name'],
+                properties: {
+                    vector_bucket_name: { wrapper: SensitiveString },
+                    max_results: { type: 'integer' },
+                    prefix: { wrapper: SensitiveString },
+                    next_token: {type: 'string'},
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    items: {
+                        type: 'array',
+                        items: {
+                            $ref: '#/definitions/vector_index_info'
+                        }
+                    },
+                    next_token: {type: 'string'},
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        delete_vector_index: {
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: ['vector_index_name', 'vector_bucket_name'],
+                properties: {
+                    vector_index_name: { wrapper: SensitiveString },
+                    vector_bucket_name: { wrapper: SensitiveString },
+                }
+            },
+            reply: {
+                $ref: '#/definitions/vector_index_info',
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        put_vector_bucket_policy: {
+            method: 'PUT',
+            params: {
+                type: 'object',
+                required: [
+                    'policy',
+                    'vector_bucket_name',
+                ],
+                properties: {
+                    vector_bucket_name: { wrapper: SensitiveString },
+                    policy: {
+                        $ref: 'common_api#/definitions/bucket_policy'
+                    }
+                }
+            },
+            auth: {
+                system: ['admin', 'user'],
+            }
+        },
+
+        get_vector_bucket_policy: {
+            method: 'GET',
+            params: {
+                type: 'object',
+                required: [
+                    'vector_bucket_name'
+                ],
+                properties: {
+                    vector_bucket_name: { wrapper: SensitiveString },
+                }
+            },
+            reply: {
+                type: 'object',
+                properties: {
+                    policy: {
+                        $ref: 'common_api#/definitions/bucket_policy'
+                    },
+                },
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        delete_vector_bucket_policy: {
+            method: 'DELETE',
+            params: {
+                type: 'object',
+                required: [
+                    'vector_bucket_name'
+                ],
+                properties: {
+                    vector_bucket_name: { wrapper: SensitiveString },
+                }
+            },
+            auth: {
+                system: ['admin', 'user']
+            }
+        },
+
+        update_rows_since_index: {
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: ['vector_bucket_name', 'vector_index_name', 'op', 'value'],
+                properties: {
+                    vector_bucket_name: { wrapper: SensitiveString },
+                    vector_index_name: { wrapper: SensitiveString },
+                    op: {
+                        enum: ['SET', 'ADD'],
+                        type: 'string'
+                    },
+                    value: {type: 'integer'},
+                }
+            },
+            auth: {
+                system: ['admin']
+            }
+        }
     },
 
     definitions: {
+        owner_account: {
+            type: 'object',
+            required: ['email', 'id'],
+            properties: {
+                email: { $ref: 'common_api#/definitions/email' },
+                id: { objectid: true }
+            }
+        },
+
         log_replication_endpoint_type: {
             type: 'string',
             enum: ['AWS', 'AZURE'],
@@ -842,17 +1262,11 @@ module.exports = {
                     enum: ['REGULAR', 'NAMESPACE'],
                     type: 'string',
                 },
-                owner_account: {
-                    type: 'object',
-                    required: ['email', 'id'],
-                    properties: {
-                        email: { $ref: 'common_api#/definitions/email' },
-                        id: { objectid: true }
-                    }
-                },
+                owner_account: {$ref: '#/definitions/owner_account'},
                 versioning: { $ref: 'common_api#/definitions/versioning' },
                 namespace: { $ref: '#/definitions/namespace_bucket_config' },
-                bucket_claim: { $ref: '#/definitions/bucket_claim' },
+                archive_policy: { $ref: '#/definitions/archive_policy' },
+                bucket_claim: { $ref: 'common_api#/definitions/bucket_claim' },
                 logging: { $ref: 'common_api#/definitions/bucket_logging' },
                 force_md5_etag: {
                     type: 'boolean'
@@ -863,7 +1277,7 @@ module.exports = {
                 spillover: {
                     type: 'string'
                 },
-                object_lock_configuration: { $ref: '#/definitions/object_lock_configuration' },
+                object_lock_configuration: { $ref: 'common_api#/definitions/object_lock_configuration' },
                 storage: {
                     type: 'object',
                     properties: {
@@ -1013,12 +1427,6 @@ module.exports = {
                 undeletable: {
                     $ref: '#/definitions/undeletable_bucket_reason'
                 },
-                triggers: {
-                    type: 'array',
-                    items: {
-                        $ref: '#/definitions/lambda_trigger_info'
-                    }
-                },
                 tagging: {
                     $ref: 'common_api#/definitions/tagging'
                 },
@@ -1035,17 +1443,44 @@ module.exports = {
             }
         },
 
-        bucket_claim: {
+        vector_bucket_info: {
             type: 'object',
-            required: ['bucket_class', 'namespace'],
+            required: ['name'],
             properties: {
-                // TODO: Fill this with relevant info
-                bucket_class: {
+                name: { wrapper: SensitiveString },
+                owner_account: {$ref: '#/definitions/owner_account'},
+                creation_time: { type: 'integer' },
+                vector_db_type: { $ref: 'common_api#/definitions/vector_db_type' },
+                namespace_resource: { $ref: '#/definitions/namespace_resource_config'},
+                bucket_claim: { $ref: 'common_api#/definitions/bucket_claim' },
+                tags: { $ref: 'common_api#/definitions/tagging' },
+                vector_policy: { $ref: 'common_api#/definitions/bucket_policy'},
+                system_id: { objectid: true },
+                system_owner: {$ref: '#/definitions/owner_account'}
+            }
+        },
+
+        vector_index_info: {
+            type: 'object',
+            required: ['name', 'dimension', 'distance_metric', 'vector_bucket'],
+            properties: {
+                name: { wrapper: SensitiveString },
+                vector_bucket: { wrapper: SensitiveString },
+                distance_metric: {
                     type: 'string',
+                    enum: ['cosine', 'euclidean']
                 },
-                namespace: {
+                dimension: {
+                    type: 'integer',
+                    minimum: 1,
+                },
+                data_type: {
                     type: 'string',
-                }
+                    enum: ['float32'],
+                },
+                metadata_configuration: { $ref: 'common_api#/definitions/metadata_configuration' },
+                owner_account: {$ref: '#/definitions/owner_account'},
+                creation_time: {type: 'integer'},
             }
         },
 
@@ -1067,8 +1502,14 @@ module.exports = {
                 bucket_owner: {
                     $ref: 'common_api#/definitions/email'
                 },
+                bucket_owner_id: {
+                    type: 'string'
+                },
                 website: {
                     $ref: 'common_api#/definitions/bucket_website'
+                },
+                lifecycle_configuration_rules: {
+                    $ref: 'common_api#/definitions/bucket_lifecycle_configuration'
                 },
                 namespace: {
                     type: 'object',
@@ -1107,6 +1548,22 @@ module.exports = {
                         },
                     },
                 },
+                // Extended resource info (not name-only archive_policy) so the endpoint
+                // can build NamespaceS3 via _setup_single_namespace.
+                archive_policy: {
+                    type: 'object',
+                    required: ['deep_archive_resource'],
+                    properties: {
+                        deep_archive_resource: {
+                            type: 'object',
+                            required: ['resource'],
+                            properties: {
+                                resource: { $ref: 'pool_api#/definitions/namespace_resource_extended_info' },
+                                path: { type: 'string' },
+                            },
+                        },
+                    },
+                },
                 active_triggers: {
                     type: 'array',
                     items: {
@@ -1130,6 +1587,18 @@ module.exports = {
                 bucket_info: {
                     $ref: '#/definitions/bucket_info'
                 },
+                notifications: {
+                    type: 'array',
+                    items: {
+                        $ref: 'common_api#/definitions/bucket_notification'
+                    }
+                },
+                cors_configuration_rules: {
+                    $ref: 'common_api#/definitions/bucket_cors_configuration',
+                },
+                public_access_block: {
+                    $ref: 'common_api#/definitions/public_access_block',
+                }
             }
         },
 
@@ -1162,6 +1631,8 @@ module.exports = {
                 // },
                 namespace: { $ref: '#/definitions/namespace_bucket_config' },
                 versioning: { $ref: 'common_api#/definitions/versioning' },
+                archive_policy: { $ref: '#/definitions/archive_policy' },
+                remove_archive_policy: { type: 'boolean' },
             }
         },
         policy_modes: {
@@ -1182,7 +1653,7 @@ module.exports = {
                     type: 'string',
                     enum: [
                         'QUOTA_NOT_SET',
-                        'APPROUCHING_QUOTA',
+                        'APPROACHING_QUOTA',
                         'EXCEEDING_QUOTA',
                         'OPTIMAL'
                     ]
@@ -1192,139 +1663,6 @@ module.exports = {
         undeletable_bucket_reason: {
             enum: ['NOT_EMPTY'],
             type: 'string',
-        },
-
-
-        new_lambda_trigger: {
-            type: 'object',
-            required: ['bucket_name', 'event_name', 'func_name'],
-            properties: {
-                bucket_name: { $ref: 'common_api#/definitions/bucket_name' },
-                event_name: {
-                    $ref: 'common_api#/definitions/bucket_trigger_event'
-                },
-                func_name: {
-                    type: 'string'
-                },
-                func_version: {
-                    type: 'string'
-                },
-                enabled: {
-                    type: 'boolean',
-                },
-                object_prefix: {
-                    type: 'string'
-                },
-                object_suffix: {
-                    type: 'string'
-                },
-                attempts: {
-                    type: 'integer'
-                },
-            }
-        },
-
-        update_lambda_trigger: {
-            type: 'object',
-            required: ['id'],
-            properties: {
-                id: {
-                    objectid: true
-                },
-                bucket_name: { $ref: 'common_api#/definitions/bucket_name' },
-                event_name: {
-                    $ref: 'common_api#/definitions/bucket_trigger_event'
-                },
-                func_name: {
-                    type: 'string'
-                },
-                func_version: {
-                    type: 'string'
-                },
-                enabled: {
-                    type: 'boolean',
-                },
-                object_prefix: {
-                    type: 'string'
-                },
-                object_suffix: {
-                    type: 'string'
-                },
-                attempts: {
-                    type: 'integer'
-                },
-            }
-        },
-
-        lambda_trigger_info: {
-            type: 'object',
-            required: ['id', 'event_name', 'func_name'],
-            properties: {
-                id: {
-                    objectid: true
-                },
-                event_name: {
-                    $ref: 'common_api#/definitions/bucket_trigger_event'
-                },
-                func_name: {
-                    type: 'string'
-                },
-                func_version: {
-                    type: 'string'
-                },
-                enabled: {
-                    type: 'boolean',
-                },
-                permission_problem: {
-                    type: 'boolean',
-                },
-                last_run: {
-                    idate: true
-                },
-                object_prefix: {
-                    type: 'string'
-                },
-                object_suffix: {
-                    type: 'string'
-                },
-                attempts: {
-                    type: 'integer'
-                },
-            }
-        },
-        object_lock_configuration: {
-            type: 'object',
-            properties: {
-                object_lock_enabled: { type: 'string' },
-                rule: {
-                    type: 'object',
-                    properties: {
-                        default_retention: {
-                            oneOf: [{
-                                    type: 'object',
-                                    properties: {
-                                        years: { type: 'integer' },
-                                        mode: {
-                                            type: 'string',
-                                            enum: ['GOVERNANCE', 'COMPLIANCE']
-                                        }
-                                    }
-                                },
-                                {
-                                    type: 'object',
-                                    properties: {
-                                        days: { type: 'integer' },
-                                        mode: {
-                                            type: 'string',
-                                            enum: ['GOVERNANCE', 'COMPLIANCE']
-                                        }
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                }
-            }
         },
 
         // namespace bucket configuration
@@ -1358,6 +1696,13 @@ module.exports = {
             }
         },
 
+        archive_policy: {
+            type: 'object',
+            required: ['deep_archive_resource'],
+            properties: {
+                deep_archive_resource: { $ref: '#/definitions/namespace_resource_config' }
+            }
+        },
 
         replication_policy: {
             type: 'object',

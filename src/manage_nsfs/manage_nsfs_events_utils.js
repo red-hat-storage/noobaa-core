@@ -292,6 +292,26 @@ NoobaaEvent.BUCKET_ALREADY_EXISTS = Object.freeze({
     severity: 'ERROR',
     state: 'HEALTHY',
 });
+NoobaaEvent.BUCKET_OWNER_NOT_EXISTS = Object.freeze({
+    event_code: 'bucket_owner_not_exists',
+    message: 'Bucket owner does not exist',
+    description: 'The specified bucket owner does not exist in the system',
+    entity_type: 'NODE',
+    event_type: 'ERROR',
+    scope: 'NODE',
+    severity: 'ERROR',
+    state: 'HEALTHY'
+});
+NoobaaEvent.BUCKET_OWNER_IS_IAM_ACCOUNT = Object.freeze({
+    event_code: 'bucket_owner_is_iam_account',
+    message: 'The bucket owner is an IAM account',
+    description: 'The specified bucket owner is an IAM account. Please set a root account as the bucket owner',
+    entity_type: 'NODE',
+    event_type: 'ERROR',
+    scope: 'NODE',
+    severity: 'ERROR',
+    state: 'HEALTHY'
+});
 NoobaaEvent.UNAUTHORIZED = Object.freeze({
     event_code: 'noobaa_bucket_access_unauthorized',
     message: 'Bucket is not accessible with current access rights ',
@@ -300,6 +320,16 @@ NoobaaEvent.UNAUTHORIZED = Object.freeze({
     event_type: 'ERROR',
     scope: 'NODE',
     severity: 'ERROR',
+    state: 'HEALTHY',
+});
+NoobaaEvent.BUCKET_RESERVED_TAG_MODIFIED = Object.freeze({
+    event_code: 'noobaa_bucket_reserved_tag_modified',
+    message: 'Bucket reserved tag modified',
+    description: 'Noobaa bucket reserved tag modified',
+    entity_type: 'NODE',
+    event_type: 'INFO',
+    scope: 'NODE',
+    severity: 'INFO',
     state: 'HEALTHY',
 });
 
@@ -345,6 +375,117 @@ NoobaaEvent.LOGGING_FAILED = Object.freeze({
     scope: 'NODE',
     severity: 'ERROR',
     state: 'DEGRADED',
+});
+
+/////////////////////////////////////
+// CONFIG DIRECTORY UPGRADE EVENTS //
+/////////////////////////////////////
+
+NoobaaEvent.CONFIG_DIR_UPGRADE_STARTED = Object.freeze({
+    event_code: 'config_dir_upgrade_started',
+    entity_type: 'NODE',
+    event_type: 'INFO',
+    message: 'Config directory upgrade started.',
+    description: 'Config directory upgrade started.',
+    scope: 'NODE',
+    severity: 'INFO',
+    state: 'HEALTHY',
+});
+
+NoobaaEvent.CONFIG_DIR_UPGRADE_SUCCESSFUL = Object.freeze({
+    event_code: 'config_dir_upgrade_successful',
+    entity_type: 'NODE',
+    event_type: 'INFO',
+    message: 'Config directory upgrade finished successfully.',
+    description: 'Config directory upgrade finished successfully.',
+    scope: 'NODE',
+    severity: 'INFO',
+    state: 'HEALTHY',
+});
+
+NoobaaEvent.CONFIG_DIR_UPGRADE_FAILED = Object.freeze({
+    event_code: 'config_dir_upgrade_failed',
+    entity_type: 'NODE',
+    event_type: 'ERROR',
+    message: 'Config directory upgrade failed.',
+    description: 'Config directory upgrade failed due to an error',
+    scope: 'NODE',
+    severity: 'ERROR',
+    state: 'DEGRADED',
+});
+
+///////////////////////////////
+//   NOTIFICATION EVENTS     //
+///////////////////////////////
+
+NoobaaEvent.NOTIFICATION_LOW_SPACE = Object.freeze({
+    event_code: 'noobaa_notification_low_space',
+    message: 'Pending notification log dir low on space',
+    description: 'Low space',
+    entity_type: 'NODE',
+    event_type: 'WARN',
+    scope: 'NODE',
+    severity: 'WARN',
+    state: 'HEALTHY',
+});
+
+NoobaaEvent.NOTIFICATION_FAILED = Object.freeze({
+    event_code: 'noobaa_notification_failed',
+    message: 'Failed to send notification.',
+    description: 'Notification failed.',
+    entity_type: 'NODE',
+    event_type: 'WARN',
+    scope: 'NODE',
+    severity: 'WARN',
+    state: 'HEALTHY',
+});
+
+////////////////////////////
+//   LIFECYCLE EVENTS     //
+////////////////////////////
+
+NoobaaEvent.LIFECYCLE_STARTED = Object.freeze({
+    event_code: 'noobaa_lifecycle_worker_started',
+    entity_type: 'NODE',
+    event_type: 'INFO',
+    message: 'NooBaa Lifecycle worker run started.',
+    description: 'NooBaa Lifecycle worker run started.',
+    scope: 'NODE',
+    severity: 'INFO',
+    state: 'HEALTHY',
+});
+
+NoobaaEvent.LIFECYCLE_SUCCESSFUL = Object.freeze({
+    event_code: 'noobaa_lifecycle_worker_finished_successfully',
+    entity_type: 'NODE',
+    event_type: 'INFO',
+    message: 'NooBaa Lifecycle worker run finished successfully.',
+    description: 'NooBaa Lifecycle worker finished successfully.',
+    scope: 'NODE',
+    severity: 'INFO',
+    state: 'HEALTHY',
+});
+
+NoobaaEvent.LIFECYCLE_FAILED = Object.freeze({
+    event_code: 'noobaa_lifecycle_worker_failed',
+    message: 'NooBaa Failed to run lifecycle worker.',
+    description: 'NooBaa Lifecycle worker run failed due to an error.',
+    entity_type: 'NODE',
+    event_type: 'ERROR',
+    scope: 'NODE',
+    severity: 'ERROR',
+    state: 'HEALTHY',
+});
+
+NoobaaEvent.LIFECYCLE_TIMEOUT = Object.freeze({
+    event_code: 'noobaa_lifecycle_worker_timeout',
+    message: 'NooBaa lifecycle worker run timed out.',
+    description: 'NooBaa Lifecycle worker run timed out.',
+    entity_type: 'NODE',
+    event_type: 'ERROR',
+    scope: 'NODE',
+    severity: 'ERROR',
+    state: 'HEALTHY',
 });
 
 exports.NoobaaEvent = NoobaaEvent;

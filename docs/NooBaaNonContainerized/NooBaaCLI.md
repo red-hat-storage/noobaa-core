@@ -21,8 +21,20 @@
     1. [Health](#health)
     2. [Metrics](#metrics)
     3. [Gather Logs](#gather-logs)
-9. [Global Options](#global-options)
-10. [Examples](#examples)
+    4. [Usage Stats](#usage-stats)
+9. [Upgrade](#upgrade)
+    1. [Upgrade Start](#upgrade-start)
+    2. [Upgrade Status](#upgrade-status)
+    3. [Upgrade History](#upgrade-history)
+10. [Connections](#connection)
+    1. [Add Connection](#add-connection)
+    2. [Update Connection](#update-connection)
+    3. [Connection Status](#connection-status)
+    4. [List Connections][#list-connections]
+    5. [Delete Connection](#delete-connection)
+11. [Lifecycle](#lifecycle)
+12. [Global Options](#global-options)
+13. [Examples](#examples)
     1. [Bucket Commands Examples](#bucket-commands-examples)
     2. [Account Commands Examples](#account-commands-examples)
     3. [White List Server IP Command Example](#white-list-server-ip-command-example)
@@ -65,7 +77,7 @@ The `account add` command is used to create a new account with customizable opti
 ```sh
 noobaa-cli account add --name <account_name> --uid <uid> --gid <gid> [--user]
 [--new_buckets_path][--access_key][--secret_key][--fs_backend]
-[--allow_bucket_creation][--force_md5_etag][--anonymous][--from_file][--iam_operate_on_root_account]
+[--allow_bucket_creation][--force_md5_etag][--anonymous][--from_file][--iam_operate_on_root_account][--default_connection][--custom_bucket_path_allowed_list]
 ```
 #### Flags -
 - `name` (Required)
@@ -83,6 +95,10 @@ noobaa-cli account add --name <account_name> --uid <uid> --gid <gid> [--user]
 - `user`
     - Type: String
     - Description: Specifies the File system user representing the account. (user can be replaced by --uid and --gid option)
+
+- `supplemental_groups`
+    - Type: String
+    - Description: Specifies additional FS groups (GID) a user can be a part of. Allows access to directories/files having one or more of the provided groups. A String of GIDs separated by commas.
 
 - `new_buckets_path` 
     - Type: String
@@ -119,7 +135,20 @@ noobaa-cli account add --name <account_name> --uid <uid> --gid <gid> [--user]
 
 - `iam_operate_on_root_account`
     - Type: Boolean
-    - Description: Specifies if the account allowed to create root accounts using the IAM API (the default behavior is to create of IAM accounts). See - [IAM - Root Accounts Manager](./../design/iam.md#root-accounts-manager).
+    - Description: Specifies if the account allowed to create root accounts using the IAM API (the default behavior is to create of IAM accounts). See - [IAM - Root Accounts Manager](./../design/iam_nc.md#root-accounts-manager).
+
+- `default_connection`
+    - Type: String
+    - Description: A default account for Kafka external servers. See bucket-notifications.md.
+
+- `custom_bucket_path_allowed_list`
+    - Type: String
+    - Description: Specifies an allowed list where this account can create buckets in using 
+    x-noobaa-custom-bucket-path header in create_bucket
+
+- `allow_bypass_governance`
+    - Type: Boolean
+    - Description: Allow the user to bypass governance-mode retention object lock when deleting or modifying locked objects
 
 ### Update Account
 
@@ -129,7 +158,8 @@ The `account update` command is used to update an existing account with customiz
 ```sh
 noobaa-cli account update --name <account_name> [--new_name][--uid][--gid][--user]
 [--new_buckets_path][--access_key][--secret_key][--regenerate][--fs_backend]
-[--allow_bucket_creation][--force_md5_etag][--anonymous][--iam_operate_on_root_account]
+[--allow_bucket_creation][--force_md5_etag][--anonymous][--iam_operate_on_root_account][--default_connection]
+[--custom_bucket_path_allowed_list][--allow_bypass_governance]
 ```
 #### Flags -
 - `name` (Required)
@@ -152,9 +182,13 @@ noobaa-cli account update --name <account_name> [--new_name][--uid][--gid][--use
     - Type: Number
     - Description: Specifies the File system user representing the account. (user can be replaced by --uid and --gid option)
 
+- `supplemental_groups`
+    - Type: String
+    - Description: Specifies additional FS groups (GID) a user can be a part of. Allows access to directories/files having one or more of the provided groups. A String of GIDs separated by commas. Unset with ''.
+
 - `new_buckets_path` 
     - Type: String
-    - Description: Specifies a file system directory to be used for creating underlying directories that represent buckets created by an account using the S3 API.
+    - Description: Specifies a file system directory to be used for creating underlying directories that represent buckets created by an account using the S3 API. Unset with ''.
 
 - `regenerate`
     - Type: Boolean
@@ -171,7 +205,7 @@ noobaa-cli account update --name <account_name> [--new_name][--uid][--gid][--use
 - `fs_backend`
     - Type: String
     - Enum: none | GPFS | CEPH_FS | NFSv4
-    - Description: Specifies the file system of new_buckets_path (default config.NSFS_NC_STORAGE_BACKEND).
+    - Description: Specifies the file system of new_buckets_path (default config.NSFS_NC_STORAGE_BACKEND). Unset with ''.
 
 - `allow_bucket_creation`
     - Type: Boolean
@@ -179,7 +213,7 @@ noobaa-cli account update --name <account_name> [--new_name][--uid][--gid][--use
 
 - `force_md5_etag`
     - Type: Boolean
-    - Description: Set the account to force md5 ETag calculation.
+    - Description: Set the account to force md5 ETag calculation. Unset with ''.
 
 - `anonymous`
     - Type: Boolean
@@ -187,7 +221,20 @@ noobaa-cli account update --name <account_name> [--new_name][--uid][--gid][--use
 
 - `iam_operate_on_root_account`
     - Type: Boolean
-    - Description: Specifies if the account allowed to create root accounts using the IAM API (the default behavior is to create of IAM accounts). See - [IAM - Root Accounts Manager](./../design/iam.md#root-accounts-manager).
+    - Description: Specifies if the account allowed to create root accounts using the IAM API (the default behavior is to create of IAM accounts). See - [IAM - Root Accounts Manager](./../design/iam_nc.md#root-accounts-manager).
+
+- `default_connection`
+    - Type: String
+    - Description: A default account for Kafka external servers. See bucket-notifications.md.
+
+- `custom_bucket_path_allowed_list`
+    - Type: String
+    - Description: Specifies an allowed list where this account can create buckets in using 
+    x-noobaa-custom-bucket-path header in create_bucket
+
+- `allow_bypass_governance`
+    - Type: Boolean
+    - Description: Allow the user to bypass governance-mode retention object lock when deleting or modifying locked objects
 
 ### Account Status
 
@@ -347,17 +394,24 @@ noobaa-cli bucket update --name <bucket_name> [--new_name] [--owner]
 
 - `bucket_policy`
     - Type: String
-    - Description: Set the bucket policy, type is a string of valid JSON policy.
+    - Description: Set the bucket policy, type is a string of valid JSON policy. Unset with ''.
 
 - `fs_backend`
     - Type: String
     - Enum: none | GPFS | CEPH_FS | NFSv4
-    - Description: Specifies the file system of the bucket (default config.NSFS_NC_STORAGE_BACKEND), unset with ''.
+    - Description: Specifies the file system of the bucket (default config.NSFS_NC_STORAGE_BACKEND), Unset with ''.
 
 - `force_md5_etag`
     - Type: Boolean
-    - Description: Set the bucket to force md5 ETag calculation.
+    - Description: Set the bucket to force md5 ETag calculation. Unset with ''.
 
+- `tag`
+    - Type: String
+    - Description: Set the bucket tags, type is a string of valid JSON. Behaviour is similar to `put-bucket-tagging` S3 API.
+
+- `merge_tag`
+    - Type: String
+    - Description: Merge the bucket tags with previous bucket tags, type is a string of valid JSON.
 
 ### Bucket Status
 
@@ -423,7 +477,7 @@ noobaa-cli whitelist --ips <ips>
 #### Flags -
 - `ips` (Required)
     - Type: String
-    - Description: Specifies the white list of server IPs for S3 access. Example - '["127.0.0.1", "192.0.10.0", "3002:0bd6:0000:0000:0000:ee00:0033:6778"]'
+    - Description: Specifies the white list of server IPs for S3 access. Example - '["127.0.0.1", "192.0.10.0", "3002:0bd6:0000:0000:0000:ee00:0033:6778"]'. Unset with '[]'.
 
 
 ## Managing Glacier
@@ -450,8 +504,232 @@ noobaa-cli diagnose metrics
 The `gather-logs` command is used for extract NooBaa non containerized logs.
 Not implemented yet, running this command will fail with not implemented error.
 
+### Usage Stats
 
-## Global Flags
+The `usage-stats` command gathers aggregate phone-home style usage statistics for a NooBaa NC deployment.
+It scans the config directory and reports counts only (no resource names or secrets):
+
+- Accounts (total, anonymous, root account managers, bucket-creation enabled, default connection, with users)
+- IAM users (total)
+- Buckets and feature adoption (versioning, lifecycle, notifications, logging, bucket policy, encryption, website, CORS, object lock, public access block, tags, force_md5_etag)
+- Top-10 per-bucket rule/statement counts for lifecycle, notifications, CORS, and bucket policy (arrays of counts only, e.g. `lifecycle_top10_rules: [5, 5, 2, 1, 1]`)
+- Connections (total and by protocol)
+- Metadata (`noobaa_version`, `config_dir_version`, `hosts_count`, `collected_at`)
+
+#### Usage
+```sh
+noobaa-cli diagnose usage-stats [--config_root <path>]
+```
+
+## Upgrade
+
+The `upgrade` command is being used for running config directory upgrade operations.
+- **[Start](#upgrade-start)**: Initiate config directory upgrade.
+- **[Status](#upgrade-status)**: Retrieve the in progress config directory upgrade status.
+- **[History](#upgrade-history)**: Retrieve the history information of past config directory upgrades.
+
+For more information about the config directory upgrade, See - [Upgrade](./Upgrade.md#online-upgrade-version--5180)
+
+### Upgrade Start
+
+The `upgrade start` command is used to start a config directory upgrade run.
+
+#### Usage
+```sh
+noobaa-cli upgrade start --expected_version <expected-version> [--expected_hosts] <expected-hosts> [--skip-verification] [--custom_upgrade_scripts_dir]
+```
+
+#### Flags -
+- `expected_version` (Required)
+    - Type: String
+    - Description: Specifies the upgrade's expected target version.
+    - Example - `--expected_version 5.18.0`
+
+- `expected_hosts`
+    - Type: String
+    - Description: Specifies the upgrade's expected hosts. String of hostnames separated by comma (,). 
+    - Example - `--expected_hosts hostname1,hostname2,hostname3`
+
+- `skip_verification`
+    - Type: Boolean
+    - Description: Specifies if NooBaa should skip upgrade verification. </br>
+      The upgrade verification process contains the following checks - </br>
+        * The expected_hosts appear in system.json.
+        * The expected_version is the version that runs in the host that is running the upgrade.
+        * The source code (RPM) in all the expected_hosts is upgraded to the expected_version.
+    - **WARNING:** Can cause corrupted config directory files created by hosts running old code. This should generally not be used and is intended exclusively for NooBaa team support. 
+
+- `custom_upgrade_scripts_dir`
+    - Type: String
+    - Description: Specifies a custom upgrade scripts directory. Used for running custom config directory upgrade scripts.
+    - **WARNING:** Can cause corrupted config directory, specifying a custom upgrade scripts directory will initiate a non NooBaa official config directory upgrade. This should generally not be used and is intended exclusively for NooBaa team support. Requires a special code fix provided by NooBaa dev team and stored in the custom_upgrade_scripts_dir.
+
+### Upgrade Status
+
+The `upgrade status` command is used for displaying the status of an ongoing upgrade run. </br>
+The available status information is upgrade start timestamp, from_version, to_version, config_dir_from_version, config_dir_to_version, running_host etc.
+
+#### Usage
+```sh
+noobaa-cli upgrade status
+```
+
+### Upgrade History
+
+The `upgrade history` command is used for displaying the history information of past config directory upgrades. </br> 
+The available history information is an array of upgrade information - upgrade start timestamp, from_version, to_version, config_dir_from_version,config_dir_to_version, running_host etc.
+
+#### Usage
+```sh
+noobaa-cli upgrade history
+```
+
+## Managing Connections
+
+A connection file holds information needed to send out a notification to an external server.
+The connection files is specified in each notification configuration of the bucket.
+
+- **[Add Connection](#add-connection)**: Create new connections with customizable options.
+- **[Update Connection](#update-connection)**: Modify the settings and configurations of existing connections.
+- **[Connection Status](#connection-status)**: Retrieve the current status and detailed information about a specific connection.
+- **[List Connections](#list-connections)**: Display a list of all existing connections.
+- **[Delete Connection](#delete-connection)**: Remove unwanted or obsolete connections from the system.
+
+### Add Connection
+
+The `connection add` command is used to create a new connection with customizable options.
+
+#### Usage
+```sh
+noobaa-cli connection add --from_file
+```
+#### Flags -
+
+- `name` (Required)
+    - Type: String
+    - Description: A name to identify the connection.
+
+- `notification_protocol` (Required)
+   - Type: String
+   - Enum: http | https | kafka
+   - Description - Target external server's protocol.
+
+- `agent_request_object`
+   - Type: Object
+   - Description: An object given as options to node http(s) agent.
+
+- `request_options_object`
+   - Type: Object
+   - Description: An object given as options to node http(s) request. If "auth" field is specified, it's value is encrypted.
+
+- `kafka_options_object`
+   - Type: Object
+   - Description: An object given as options to kafka client.
+     Options are listed in https://github.com/edenhill/librdkafka/blob/v2.8.0/CONFIGURATION.md.
+     Specifically, 'metadata.broker.list' is used to specify the external kafka server.
+
+- `topic`
+   - Type: String
+   - Description - Topic for kafka messages.
+
+- `from_file`
+    - Type: String
+    - Description: Path to a JSON file which includes connection properties. When using `from_file` flag the connection details must only appear inside the options JSON file. See example below.
+
+### Update Connection
+
+The `connection update` command is used to update an existing bucket with customizable options.
+
+#### Usage
+```sh
+noobaa-cli connection update --name <connection_name> --key [--value] [--remove_key]
+```
+#### Flags -
+- `name` (Required)
+    - Type: String
+    - Description: Specifies the name of the updated connection.
+
+- `key` (Required)
+    - Type: String
+    - Description: Specifies the key to be updated.
+
+- `value`
+    - Type: String
+    - Description: Specifies the new value of the specified key.  
+
+- `remove_key`
+    - Type: Boolean
+    - Description: Specifies that the specified key should be removed.
+
+### Connection Status
+
+The `connection status` command is used to print the status of the connection.
+
+#### Usage
+```sh
+noobaa-cli connection status --name <connection_name>
+```
+#### Flags -
+- `name` (Required)
+    - Type: String
+    - Description: Specifies the name of the connection.
+
+### List Connections
+
+The `connection list` command is used to display a list of all existing connections.
+
+
+#### Usage
+```sh
+noobaa-cli connection list
+```
+
+### Delete Connection
+
+The `connection delete` command is used to delete an existing connection.
+
+#### Usage
+```sh
+noobaa-cli connection delete --name <connection_name>
+```
+#### Flags -
+- `name` (Required)
+    - Type: String
+    - Description: Specifies the name of the connection to be deleted.
+
+## Lifecycle
+
+The `lifecycle` command is being used for running the lifecycle worker.
+
+For more information about the Lifecycle worker, See - [NC Lifecycle Documentation](./Lifecycle.md)
+
+### Usage
+```sh
+noobaa-cli lifecycle [--disable_service_validation] [--disable_runtime_validation] [--short_status] [--continue]
+```
+
+#### Flags -
+- `disable_service_validation`
+    - Type: Boolean
+    - Description: Specifies if the lifecycle worker should validate that the NooBaa service runs.
+    - Example - `--disable_service_validation`
+
+- `disable_runtime_validation`
+    - Type: Boolean
+    - Description: Specifies if the lifecycle worker should validate the run time.
+    - Example - `--disable_runtime_validation`
+
+- `short_status`
+    - Type: Boolean
+    - Description: Specifies if the lifecycle worker should generate a less detailed lifecycle run status.
+    - Example - `--short_status`
+
+- `continue`
+    - Type: Boolean
+    - Description: Specifies if the lifecycle worker should resume the last lifecycle run. In case there was no last run, a new lifecycle run will start.
+    - Example - `--continue`
+
+## Global Options
 
 Global options used by the CLI to define the config directory settings. 
 
@@ -584,7 +862,21 @@ sudo noobaa-cli bucket delete --name bucket1 2>/dev/null
 ```
 
 -----
+### Connection Commands Examples
 
+#### Create Connection in CLI
+
+```sh
+sudo noobaa-cli connection add --name conn1 --notification_protocol http --request_options_object '{"auth": "user:passw"}'
+```
+
+#### Update Connection Field
+
+```sh
+sudo noobaa-cli connection update --name conn1 --key request_options_object --value '{"auth":"user2:pw2"}'
+```
+
+-----
 #### `--from-file` flag usage example
 
 Using `from_file` flag:
@@ -621,9 +913,77 @@ sudo noobaa-cli account add --from_file <options_account_JSON_file_path>
 sudo noobaa-cli bucket add --from_file <options_bucket_JSON_file_path>
 ```
 
+##### 2. Create JSON file for connection:
+
+```json
+{
+    "name": "http_conn",
+    "notification_protocol": "http",
+    "agent_request_object": {"host": "localhost", "port": 9999, "timeout": 100},
+    "request_options_object": {"auth": "user:passw", "path": "/query"}
+}
+```
+
+```bash
+sudo noobaa-cli connection add --from_file <options_connection_JSON_file_path>
+```
+
 ------
 
 ### White List Server IP command example
 ```
 sudo noobaa-cli whitelist --ips ["127.0.0.1", "192.0.10.0", "3002:0bd6:0000:0000:0000:ee00:0033:6778"]'
 ```
+
+### Known issues
+
+1. Bucket with suffix `.json`
+    
+    When the customer creates a bucket with the suffix `.json`, suffix is removed from the bucket config file name. 
+    
+    For example 
+    ```
+    sudo noobaa-cli bucket add --name my-bucket1.json --owner <owner_name> --path <path>
+    ```
+    Actual file name : `{config_root}\buckets\my-test-bucket.json`
+
+    Expected file name : `{config_root}\buckets\my-test-bucket.json.json`
+    
+    I/O is not possible in this bucket. This issue is only reproducible in older versions(5.18.0 and older).
+    Issue fixed version is 5.18.2
+    
+    solution :
+    * Recreate the bucket with same name in new version
+    ```
+    sudo noobaa-cli bucket add --name my-bucket1.json --owner <owner_name> --path <path> 
+    ```
+    * Delete invalid bucket
+    ```
+    bucket delete --name my-bucket1 (bucket name without suffix `.json`)
+    ```
+
+2. Account with suffix `.symlink`
+    
+    When the customer creates an account with the suffix `.symlink`, suffix is removed from the account config file name. 
+    
+    For example 
+    ```
+    sudo noobaa-cli account add --name acc_symlink.symlink --new_buckets_path <path> --uid <uid> --gid <gid>
+    ```
+    Actual file name : `{config_root}\accounts_by_name\acc_symlink.symlink`
+    
+    Expected file name : `{config_root}\accounts_by_name\acc_symlink.symlink.symlink`
+    
+    This issue is only reproducible in older versions(5.18.0 and older).
+    Issue fixed version is 5.18.2
+    
+    solution :
+    * Recreate the account with same name in new version
+    ```
+    sudo noobaa-cli account add --name acc_symlink.symlink --new_buckets_path <path> --uid <uid> --gid <gid>
+    ```
+    * Delete invalid account
+    ```
+    sudo noobaa-cli account delete --name acc_symlink (account name without suffix `.symlink`)
+    ```
+

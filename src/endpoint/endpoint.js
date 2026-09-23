@@ -6,13 +6,12 @@
 require('../util/dotenv').load();
 require('../util/panic');
 require('../util/fips');
+const pkg = require('../../package.json');
 
 const dbg = require('../util/debug_module')(__filename);
 if (!dbg.get_process_name()) dbg.set_process_name('Endpoint');
 
 const util = require('util');
-const http = require('http');
-const https = require('https');
 const os = require('os');
 
 const P = require('../util/promise');
@@ -21,14 +20,14 @@ const s3_rest = require('./s3/s3_rest');
 const blob_rest = require('./blob/blob_rest');
 const sts_rest = require('./sts/sts_rest');
 const iam_rest = require('./iam/iam_rest');
-const lambda_rest = require('./lambda/lambda_rest');
+const vector_rest = require('./vector/vector_rest');
 const endpoint_utils = require('./endpoint_utils');
-const FuncSDK = require('../sdk/func_sdk');
 const StsSDK = require('../sdk/sts_sdk');
 const ObjectIO = require('../sdk/object_io');
 const ObjectSDK = require('../sdk/object_sdk');
+const NBAccountSDK = require('../sdk/nb_account_sdk');
 const xml_utils = require('../util/xml_utils');
-const ssl_utils = require('../util/ssl_utils');
+const http_utils = require('../util/http_utils');
 const net_utils = require('../util/net_utils');
 const addr_utils = require('../util/addr_utils');
 const fork_utils = require('../util/fork_utils');
@@ -43,9 +42,15 @@ const { NamespaceMonitor } = require('../server/bg_services/namespace_monitor');
 const { SemaphoreMonitor } = require('../server/bg_services/semaphore_monitor');
 const prom_reporting = require('../server/analytic_services/prometheus_reporting');
 const { PersistentLogger } = require('../util/persistent_logger');
+const { get_notification_logger } = require('../util/notifications_util');
+const ldap_client = require('../util/ldap_client');
+const { is_nc_environment } = require('../nc/nc_utils');
 const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
+const { VectorBucketsReindexer } = require('../server/bg_services/vector_buckets_reindexer');
+
 const cluster = /** @type {import('node:cluster').Cluster} */ (
-    /** @type {unknown} */ (require('node:cluster'))
+    /** @type {unknown} */
+    (require('node:cluster'))
 );
 
 if (process.env.NOOBAA_LOG_LEVEL) {
@@ -53,26 +58,35 @@ if (process.env.NOOBAA_LOG_LEVEL) {
     dbg_conf.endpoint.map(module => dbg.set_module_level(dbg_conf.level, module));
 }
 
+const SERVICES_TYPES_ENUM = Object.freeze({
+    S3: 'S3',
+    STS: 'STS',
+    IAM: 'IAM',
+    VECTOR: 'VECTOR',
+    METRICS: 'METRICS',
+    FORK_HEALTH: 'FORK_HEALTH',
+});
+
 const new_umask = process.env.NOOBAA_ENDPOINT_UMASK || 0o000;
 const old_umask = process.umask(new_umask);
 let fork_count;
 dbg.log0('endpoint: replacing old umask: ', old_umask.toString(8), 'with new umask: ', new_umask.toString(8));
 
 /**
- * @typedef {http.IncomingMessage & {
+ * @typedef {import('http').IncomingMessage & {
  *  object_sdk?: ObjectSDK;
- *  func_sdk?: FuncSDK;
  *  sts_sdk?: StsSDK;
  *  virtual_hosts?: readonly string[];
  *  bucket_logger?: PersistentLogger;
+ *  notification_logger?: PersistentLogger;
  * }} EndpointRequest
  */
 
 /**
  * @typedef {(
  *  req: EndpointRequest,
- *  res: http.ServerResponse
- * ) => void | Promise<void>} EndpointHandler 
+ *  res: import('http').ServerResponse
+ * ) => void | Promise<void>} EndpointHandler
  */
 
 /**
@@ -81,18 +95,15 @@ dbg.log0('endpoint: replacing old umask: ', old_umask.toString(8), 'with new uma
  *  https_port?: number;
  *  https_port_sts?: number;
  *  https_port_iam?: number;
- *  metrics_port?: number;
+ *  https_port_vector?: number;
+ *  http_metrics_port?: number;
+ *  https_metrics_port?: number;
  *  nsfs_config_root?: string;
  *  init_request_sdk?: EndpointHandler;
  *  forks?: number;
  * }} EndpointOptions
  */
 
-// An internal function to prevent code duplication
-async function create_https_server(ssl_cert_info, honorCipherOrder, endpoint_handler) {
-    const ssl_options = {...ssl_cert_info.cert, honorCipherOrder: honorCipherOrder};
-    return https.createServer(ssl_options, endpoint_handler);
-}
 
 /**
  * @param {EndpointOptions} options
@@ -100,6 +111,7 @@ async function create_https_server(ssl_cert_info, honorCipherOrder, endpoint_han
 /* eslint-disable max-statements */
 async function main(options = {}) {
     let bucket_logger;
+    let notification_logger;
     try {
         // setting process title needed for letting GPFS to identify the noobaa endpoint processes see issue #8039.
         if (config.ENDPOINT_PROCESS_TITLE) {
@@ -108,13 +120,23 @@ async function main(options = {}) {
 
         // the primary just forks and returns, workers will continue to serve
         fork_count = options.forks ?? config.ENDPOINT_FORKS;
-        const metrics_port = options.metrics_port || config.EP_METRICS_SERVER_PORT;
-        if (fork_utils.start_workers(metrics_port, fork_count)) return;
+        const http_port_s3 = options.http_port || config.ENDPOINT_PORT;
+        const forks_base_port = config.ENDPOINT_FORK_PORT_BASE || (http_port_s3 + 1);
+        const http_metrics_port = options.http_metrics_port || config.EP_METRICS_SERVER_PORT;
+        const https_metrics_port = options.https_metrics_port || config.EP_METRICS_SERVER_SSL_PORT;
+        /**
+         * Please notice that we can run the main in 2 states:
+         * 1. Only the primary process runs the main (fork is 0 or undefined) - everything that
+         *    is implemented here would be run by this process.
+         * 2. A primary process with multiple forks (IMPORTANT) - if there is implementation that
+         *    in only relevant to the primary process it should be implemented in
+         *    fork_utils.start_workers because the primary process returns after start_workers
+         *    and the forks will continue executing the code lines in this function
+         *  */
+        const is_workers_started_from_primary = await fork_utils.start_workers(http_metrics_port, https_metrics_port,
+            forks_base_port, options.nsfs_config_root, fork_count);
+        if (is_workers_started_from_primary) return;
 
-        const http_port = options.http_port || config.ENDPOINT_PORT;
-        const https_port = options.https_port || config.ENDPOINT_SSL_PORT;
-        const https_port_sts = options.https_port_sts || Number(process.env.ENDPOINT_SSL_PORT_STS) || 7443;
-        const https_port_iam = options.https_port_iam || config.ENDPOINT_SSL_IAM_PORT;
         const endpoint_group_id = process.env.ENDPOINT_GROUP_ID || 'default-endpoint-group';
 
         const virtual_hosts = Object.freeze(
@@ -136,6 +158,11 @@ async function main(options = {}) {
                 locking: 'SHARED',
                 poll_interval: config.NSFS_GLACIER_LOGS_POLL_INTERVAL,
             });
+
+        notification_logger = config.NOTIFICATION_LOG_DIR && get_notification_logger(
+            'SHARED', //shared locking for endpoitns
+            undefined, //use default namespace based on hostname
+            config.NSFS_GLACIER_LOGS_POLL_INTERVAL);
 
         process.on('warning', e => dbg.warn(e.stack));
 
@@ -174,68 +201,54 @@ async function main(options = {}) {
             init_request_sdk = create_init_request_sdk(rpc, internal_rpc_client, object_io);
         }
 
-        const endpoint_request_handler = create_endpoint_handler(init_request_sdk, virtual_hosts, /*is_sts?*/ false, bucket_logger);
-        const endpoint_request_handler_sts = create_endpoint_handler(init_request_sdk, virtual_hosts, /*is_sts?*/ true);
+        // START S3, STS & IAM SERVERS & CERTS
+        const https_port_s3 = options.https_port || config.ENDPOINT_SSL_PORT;
+        const https_port_sts = options.https_port_sts || config.ENDPOINT_SSL_STS_PORT;
+        const https_port_iam = options.https_port_iam || config.ENDPOINT_SSL_IAM_PORT;
+        const https_port_vector = options.https_port_vector || config.ENDPOINT_SSL_VECTOR_PORT;
 
-        const ssl_cert_info = await ssl_utils.get_ssl_cert_info('S3', options.nsfs_config_root);
-        const https_server = await create_https_server(ssl_cert_info, true, endpoint_request_handler);
-        const sts_ssl_cert_info = await ssl_utils.get_ssl_cert_info('STS');
-        const https_server_sts = await create_https_server(sts_ssl_cert_info, true, endpoint_request_handler_sts);
-
-        ssl_cert_info.on('update', updated_ssl_cert_info => {
-            dbg.log0("Setting updated S3 ssl certs for endpoint.");
-            const updated_ssl_options = { ...updated_ssl_cert_info.cert, honorCipherOrder: true };
-            https_server.setSecureContext(updated_ssl_options);
+        await start_endpoint_server_and_cert(SERVICES_TYPES_ENUM.S3, init_request_sdk, {
+            ...options,
+            https_port: https_port_s3,
+            http_port: http_port_s3,
+            virtual_hosts,
+            bucket_logger,
+            notification_logger
         });
-        sts_ssl_cert_info.on('update', updated_sts_ssl_cert_info => {
-            dbg.log0("Setting updated STS ssl certs for endpoint.");
-            const updated_ssl_options = { ...updated_sts_ssl_cert_info.cert, honorCipherOrder: true };
-            https_server_sts.setSecureContext(updated_ssl_options);
-        });
-        if (options.nsfs_config_root && !config.ALLOW_HTTP) {
-            dbg.warn('HTTP is not allowed for NC NSFS.');
-        } else {
-            const http_server = http.createServer(endpoint_request_handler);
-            if (http_port > 0) {
-                dbg.log0('Starting S3 HTTP', http_port);
-                await listen_http(http_port, http_server);
-                dbg.log0('Started S3 HTTP successfully');
+        await start_endpoint_server_and_cert(SERVICES_TYPES_ENUM.STS, init_request_sdk, { https_port: https_port_sts, virtual_hosts });
+        await start_endpoint_server_and_cert(SERVICES_TYPES_ENUM.IAM, init_request_sdk, { https_port: https_port_iam });
+         await start_endpoint_server_and_cert(SERVICES_TYPES_ENUM.VECTOR, init_request_sdk, { https_port: https_port_vector });
+        const is_nc = is_nc_environment();
+        // fork health server currently runs only on non containerized enviorment
+        if (is_nc) {
+            // current process is the primary and only fork. start the fork server directly with the base port
+            if (cluster.isPrimary) {
+                await fork_message_request_handler({
+                    nsfs_config_root: options.nsfs_config_root,
+                    health_port: forks_base_port
+                });
+                // current process is a worker so we listen to get the port from the primary process.
+            } else {
+                process.on('message', fork_message_request_handler);
+                //send a message to the primary process that we are ready to receive messages
+                process.send({ ready_to_start_fork_server: true });
             }
         }
-        if (https_port > 0) {
-            dbg.log0('Starting S3 HTTPS', https_port);
-            await listen_http(https_port, https_server);
-            dbg.log0('Started S3 HTTPS successfully');
+
+        // START METRICS SERVER
+        if ((http_metrics_port > 0 || https_metrics_port > 0) && cluster.isPrimary) {
+            await prom_reporting.start_server(http_metrics_port, https_metrics_port, false, options.nsfs_config_root);
         }
-        if (https_port_sts > 0) {
-            dbg.log0('Starting STS HTTPS', https_port_sts);
-            await listen_http(https_port_sts, https_server_sts);
-            dbg.log0('Started STS HTTPS successfully');
-        }
-        if (https_port_iam > 0) {
-            dbg.log0('Starting IAM HTTPS', https_port_iam);
-            const endpoint_request_handler_iam = create_endpoint_handler_iam(init_request_sdk);
-            // NOTE: The IAM server currently uses the S3 server's certificate. This *will* cause route failures in Openshift.
-            // TODO: Generate, mount and utilize an appropriate IAM certificate once the service and route are implemented
-            const https_server_iam = await create_https_server(ssl_cert_info, true, endpoint_request_handler_iam);
-            await listen_http(https_port_iam, https_server_iam);
-            dbg.log0('Started IAM HTTPS successfully');
-        }
-        if (metrics_port > 0 && cluster.isPrimary) {
-            dbg.log0('Starting metrics server', metrics_port);
-            await prom_reporting.start_server(metrics_port, false);
-            dbg.log0('Started metrics server successfully');
-        }
-        // TODO: currently NC NSFS deployments don't have internal_rpc_client nor db, 
+
+        // TODO: currently NC NSFS deployments don't have internal_rpc_client nor db,
         // there for namespace monitor won't be registered
         if (internal_rpc_client && config.NAMESPACE_MONITOR_ENABLED) {
             endpoint_stats_collector.instance().set_rpc_client(internal_rpc_client);
-
             // Register a bg monitor on the endpoint
             background_scheduler.register_bg_worker(new NamespaceMonitor({
                 name: 'namespace_fs_monitor',
                 client: internal_rpc_client,
-                should_monitor: nsr => Boolean(nsr.nsfs_config),
+                should_monitor: nsr => Boolean(nsr.nsfs_config && process.env['NSFS_NSR_' + nsr.name]),
             }));
         }
 
@@ -244,6 +257,18 @@ async function main(options = {}) {
                 name: 'semaphore_monitor',
                 object_io: object_io,
             }));
+        }
+
+        if ((internal_rpc_client || options.nsfs_config_root) && config.REINDEX_VECTOR_BUCKETS) {
+            background_scheduler.register_bg_worker(new VectorBucketsReindexer({
+                name: 'Vector_buckets_reindexer',
+                client: internal_rpc_client,
+                nsfs_config_root: options.nsfs_config_root
+            }));
+        }
+
+        if (await ldap_client.is_ldap_configured()) {
+            ldap_client.instance().connect();
         }
         //noobaa started
         new NoobaaEvent(NoobaaEvent.NOOBAA_STARTED).create_event(undefined, undefined, undefined);
@@ -259,94 +284,185 @@ async function main(options = {}) {
 }
 
 /**
+ * start_endpoint_server_and_cert starts the server by type and options and creates a certificate if required
+ * @param {('S3'|'IAM'|'STS'|'VECTOR')} server_type
  * @param {EndpointHandler} init_request_sdk
- * @param {readonly string[]} virtual_hosts
- * @returns {EndpointHandler}
+ * @param {{ http_port?: number, https_port?: number, virtual_hosts?: readonly string[],
+ * bucket_logger?: PersistentLogger, notification_logger?: PersistentLogger,
+ * nsfs_config_root?: string}} options
  */
-function create_endpoint_handler(init_request_sdk, virtual_hosts, sts, logger) {
-    const blob_rest_handler = process.env.ENDPOINT_BLOB_ENABLED === 'true' ? blob_rest : unavailable_handler;
-    const lambda_rest_handler = config.DB_TYPE === 'mongodb' ? lambda_rest : unavailable_handler;
+async function start_endpoint_server_and_cert(server_type, init_request_sdk, options = {}) {
+    const { http_port, https_port, nsfs_config_root } = options;
+    const endpoint_request_handler = create_endpoint_handler(server_type, init_request_sdk, options);
 
-    /** @type {EndpointHandler} */
-    const endpoint_request_handler = (req, res) => {
-        endpoint_utils.set_noobaa_server_header(res);
-        endpoint_utils.prepare_rest_request(req);
-        req.virtual_hosts = virtual_hosts;
-        if (logger) req.bucket_logger = logger;
-        init_request_sdk(req, res);
-        if (req.url.startsWith('/2015-03-31/functions')) {
-            return lambda_rest_handler(req, res);
-        } else if (req.headers['x-ms-version']) {
-            return blob_rest_handler(req, res);
-        } else if (req.url.startsWith('/total_fork_count')) {
-            return fork_count_handler(req, res);
-        } else if (req.url.startsWith('/endpoint_fork_id')) {
-            return endpoint_fork_id_handler(req, res);
+    if (server_type === SERVICES_TYPES_ENUM.S3) {
+        if (nsfs_config_root && !config.ALLOW_HTTP) {
+            dbg.warn('HTTP is not allowed for NC NSFS.');
         } else {
-            return s3_rest.handler(req, res);
+            await http_utils.start_http_server(http_port, server_type, endpoint_request_handler);
         }
-    };
-    /** @type {EndpointHandler} */
-    const endpoint_sts_request_handler = (req, res) => {
-        endpoint_utils.set_noobaa_server_header(res);
-        endpoint_utils.prepare_rest_request(req);
-        init_request_sdk(req, res);
-        return sts_rest(req, res);
-    };
-
-    return sts ? endpoint_sts_request_handler : endpoint_request_handler;
-}
-
-function create_endpoint_handler_iam(init_request_sdk) {
-    /** @type {EndpointHandler} */
-    const endpoint_iam_request_handler = (req, res) => {
-        endpoint_utils.set_noobaa_server_header(res);
-        endpoint_utils.prepare_rest_request(req);
-        init_request_sdk(req, res);
-        return iam_rest(req, res);
-    };
-    return endpoint_iam_request_handler;
-}
-
-function endpoint_fork_id_handler(req, res) {
-    let reply = {};
-    if (cluster.isWorker) {
-        reply = {
-            worker_id: cluster.worker.id,
-        };
     }
-    P.delay(500);
-    res.statusCode = 200;
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Length', Buffer.byteLength(JSON.stringify(reply)));
-    res.end(JSON.stringify(reply));
-}
-
-function fork_count_handler(req, res) {
-    const reply = {
-        fork_count: fork_count,
-    };
-    res.statusCode = 200;
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Length', Buffer.byteLength(JSON.stringify(reply)));
-    res.end(JSON.stringify(reply));
+    if (https_port > 0) {
+        await http_utils.start_https_server(https_port, server_type, endpoint_request_handler, nsfs_config_root);
+    }
 }
 
 /**
- * @param {typeof server_rpc.rpc} rpc 
- * @param {nb.APIClient} internal_rpc_client 
- * @param {ObjectIO} object_io 
+ * @param {('S3'|'IAM'|'STS'|'VECTOR')} server_type
+ * @param {EndpointHandler} init_request_sdk
+ * @param {{virtual_hosts?: readonly string[], bucket_logger?: PersistentLogger, notification_logger?: PersistentLogger}} options
+ * @returns {EndpointHandler}
+ */
+function create_endpoint_handler(server_type, init_request_sdk, { virtual_hosts, bucket_logger, notification_logger }) {
+    if (server_type === SERVICES_TYPES_ENUM.S3) {
+        const blob_rest_handler = process.env.ENDPOINT_BLOB_ENABLED === 'true' ? blob_rest : unavailable_handler;
+
+        /** @type {EndpointHandler} */
+        const s3_endpoint_request_handler = (req, res) => {
+            endpoint_utils.set_noobaa_server_header(res);
+            endpoint_utils.prepare_rest_request(req);
+            req.virtual_hosts = virtual_hosts;
+            if (bucket_logger) req.bucket_logger = bucket_logger;
+            if (notification_logger) req.notification_logger = notification_logger;
+            init_request_sdk(req, res);
+            if (req.headers['x-ms-version']) {
+                return blob_rest_handler(req, res);
+            } else if (req.url.startsWith('/total_fork_count')) {
+                return fork_count_handler(req, res);
+            } else if (req.url.startsWith('/_/')) {
+                // internals non S3 requests
+                const api = req.url.slice('/_/'.length);
+                if (api === 'version') {
+                    return version_handler(req, res);
+                } else {
+                    return internal_api_error(req, res, `Unknown API call ${api}`);
+                }
+            } else {
+                return s3_rest.handler(req, res);
+            }
+        };
+        return s3_endpoint_request_handler;
+    }
+
+    if (server_type === SERVICES_TYPES_ENUM.STS) {
+        /** @type {EndpointHandler} */
+        const sts_endpoint_request_handler = (req, res) => {
+            endpoint_utils.set_noobaa_server_header(res);
+            endpoint_utils.prepare_rest_request(req);
+            // req.virtual_hosts = virtual_hosts;
+            init_request_sdk(req, res);
+            return sts_rest(req, res);
+        };
+        return sts_endpoint_request_handler;
+    }
+
+    if (server_type === SERVICES_TYPES_ENUM.IAM) {
+        /** @type {EndpointHandler} */
+        const iam_endpoint_request_handler = (req, res) => {
+            endpoint_utils.set_noobaa_server_header(res);
+            endpoint_utils.prepare_rest_request(req);
+            init_request_sdk(req, res);
+            return iam_rest(req, res);
+        };
+        return iam_endpoint_request_handler;
+    }
+
+
+    if (server_type === SERVICES_TYPES_ENUM.VECTOR) {
+        /** @type {EndpointHandler} */
+        const vector_endpoint_request_handler = (req, res) => {
+            endpoint_utils.set_noobaa_server_header(res);
+            endpoint_utils.prepare_rest_request(req);
+            init_request_sdk(req, res);
+            return vector_rest(req, res);
+        };
+        return vector_endpoint_request_handler;
+    }
+}
+
+///////////////////////////
+// INTERNAL API HANDLERS //
+///////////////////////////
+
+/**
+ * version_handler returns the version of noobaa package
+ * @param {EndpointRequest} req
+ * @param {import('http').ServerResponse} res
+ */
+function version_handler(req, res) {
+    if (config.NOOBAA_VERSION_AUTH_ENABLED && !http_utils.authorize_bearer(req, res)) return;
+    const noobaa_package_version = pkg.version;
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/plain');
+    res.setHeader('Content-Length', Buffer.byteLength(noobaa_package_version));
+    res.end(noobaa_package_version);
+}
+
+/**
+ * internal_api_error returns an internal api error response
+ * @param {EndpointRequest} req
+ * @param {import('http').ServerResponse} res
+ * @param {string} error_message
+ */
+function internal_api_error(req, res, error_message) {
+    const buffer = Buffer.from(JSON.stringify({ error: 'Internal Server Error', message: error_message }));
+    res.statusCode = 500;
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Length', buffer.length);
+    res.end(buffer);
+}
+
+/**
+ * endpoint_fork_id_handler returns the worker id of the current fork
+ * @param {EndpointRequest} req
+ * @param {import('http').ServerResponse} res
+ */
+function endpoint_fork_id_handler(req, res) {
+    let reply = {};
+    if (cluster.isWorker) {
+        reply = { worker_id: cluster.worker.id };
+    }
+    P.delay(500);
+    res.statusCode = 200;
+    const buffer = Buffer.from(JSON.stringify(reply));
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Length', buffer.length);
+    res.end(buffer);
+}
+
+/**
+ * fork_count_handler returns the total number of forks
+ * @param {EndpointRequest} req
+ * @param {import('http').ServerResponse} res
+ */
+function fork_count_handler(req, res) {
+    const reply = { fork_count: fork_count };
+    res.statusCode = 200;
+    const buffer = Buffer.from(JSON.stringify(reply));
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Length', buffer.length);
+    res.end(buffer);
+}
+
+/**
+ * @param {typeof server_rpc.rpc} rpc
+ * @param {nb.APIClient} internal_rpc_client
+ * @param {ObjectIO} object_io
  * @returns {EndpointHandler}
  */
 function create_init_request_sdk(rpc, internal_rpc_client, object_io) {
     const init_request_sdk = (req, res) => {
         const rpc_client = rpc.new_client();
-        req.func_sdk = new FuncSDK(rpc_client);
         req.sts_sdk = new StsSDK(rpc_client, internal_rpc_client);
         req.object_sdk = new ObjectSDK({
             rpc_client,
             internal_rpc_client,
             object_io,
+            stats: endpoint_stats_collector.instance(),
+        });
+        req.account_sdk = new NBAccountSDK({
+            rpc_client,
+            internal_rpc_client,
             stats: endpoint_stats_collector.instance(),
         });
     };
@@ -470,71 +586,49 @@ function unavailable_handler(req, res) {
     res.end(reply);
 }
 
-function listen_http(port, server) {
-    return new Promise((resolve, reject) => {
-        setup_http_server(server);
-        server.listen(port, err => {
-            if (err) {
-                dbg.error('ENDPOINT FAILED to listen', err);
-                reject(err);
-            } else {
-                resolve();
-            }
-        });
-    });
+/**
+ * handler for the inidivdual fork server. used to handle requests the get the worker id
+ * currently used to check if fork is alive by the health script
+ * @param {EndpointRequest} req
+ * @param {import('http').ServerResponse} res
+ */
+function fork_main_handler(req, res) {
+    endpoint_utils.set_noobaa_server_header(res);
+    endpoint_utils.prepare_rest_request(req);
+    if (req.url.startsWith('/endpoint_fork_id')) {
+        return endpoint_fork_id_handler(req, res);
+    } else {
+        return internal_api_error(req, res, `Unknown API call ${req.url}`);
+    }
 }
 
-function setup_http_server(server) {
-    // Handle 'Expect' header different than 100-continue to conform with AWS.
-    // Consider any expect value as if the client is expecting 100-continue.
-    // See https://github.com/ceph/s3-tests/blob/master/s3tests/functional/test_headers.py:
-    // - test_object_create_bad_expect_mismatch()
-    // - test_object_create_bad_expect_empty()
-    // - test_object_create_bad_expect_none()
-    // - test_object_create_bad_expect_unreadable()
-    // See https://nodejs.org/api/http.html#http_event_checkexpectation
-    server.on('checkExpectation', function on_s3_check_expectation(req, res) {
-        res.writeContinue();
-        server.emit('request', req, res);
-    });
-
-    // See https://nodejs.org/api/http.html#http_event_clienterror
-    server.on('clientError', function on_s3_client_error(err, socket) {
-
-        // On parsing errors we reply 400 Bad Request to conform with AWS
-        // These errors come from the nodejs native http parser.
-        if (typeof err.code === 'string' &&
-            err.code.startsWith('HPE_INVALID_') &&
-            err.bytesParsed > 0) {
-            console.error('ENDPOINT CLIENT ERROR - REPLY WITH BAD REQUEST', err);
-            socket.write('HTTP/1.1 400 Bad Request\r\n');
-            socket.write(`Date: ${new Date().toUTCString()}\r\n`);
-            socket.write('Connection: close\r\n');
-            socket.write('Content-Length: 0\r\n');
-            socket.end('\r\n');
-        }
-
-        // in any case we destroy the socket
-        socket.destroy();
-    });
-
-    server.keepAliveTimeout = config.ENDPOINT_HTTP_SERVER_KEEPALIVE_TIMEOUT;
-    server.requestTimeout = config.ENDPOINT_HTTP_SERVER_REQUEST_TIMEOUT;
-    server.maxRequestsPerSocket = config.ENDPOINT_HTTP_MAX_REQUESTS_PER_SOCKET;
-
-    server.on('error', handle_server_error);
-
-    // This was an attempt to read from the socket in large chunks,
-    // but it seems like it has no effect and we still get small chunks
-    // server.on('connection', function on_s3_connection(socket) {
-    // socket._readableState.highWaterMark = 1024 * 1024;
-    // socket.setNoDelay(true);
-    // });
+/**
+ * fork_message_request_handler is used to handle messages from the primary process.
+ * the primary process sends a message with the designated port to start the fork server.
+ * Only process messages that contain health_port - the primary also sends other message types
+ * (io_stats, op_stats, etc.) and processing those would incorrectly start duplicate servers.
+ * @param {Object} msg
+ */
+async function fork_message_request_handler(msg) {
+    if (msg.health_port === undefined) {
+        dbg.warn('Received message without health_port, ignoring', msg);
+        return;
+    }
+    // DONT_DISABLE_FORK_MESSAGE_HANDLER is a debugging flag in case we want to keep the message listener to log unknown messages
+    if (!process.env.DONT_DISABLE_FORK_MESSAGE_HANDLER || process.env.DONT_DISABLE_FORK_MESSAGE_HANDLER !== 'true') {
+        process.off('message', fork_message_request_handler); // stop listening after we started the server
+    }
+    await http_utils.start_https_server(msg.health_port,
+        SERVICES_TYPES_ENUM.FORK_HEALTH,
+        fork_main_handler,
+        msg.nsfs_config_root
+    );
 }
 
 exports.main = main;
 exports.create_endpoint_handler = create_endpoint_handler;
-exports.create_endpoint_handler_iam = create_endpoint_handler_iam;
 exports.create_init_request_sdk = create_init_request_sdk;
+exports.endpoint_fork_id_handler = endpoint_fork_id_handler;
+exports.fork_message_request_handler = fork_message_request_handler;
 
 if (require.main === module) main();

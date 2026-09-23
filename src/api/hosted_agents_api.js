@@ -59,7 +59,7 @@ module.exports = {
                         },
                     },
 
-                    mongo_info: {
+                     mongo_info: {
                         type: 'object',
                         additionalProperties: true,
                         properties: {}
@@ -102,6 +102,34 @@ module.exports = {
                     },
                     credentials: {
                         $ref: 'common_api#/definitions/access_keys',
+                    }
+                }
+            },
+            auth: {
+                system: 'admin'
+            }
+        },
+
+        update_hosted_agents: {
+            method: 'POST',
+            params: {
+                type: 'object',
+                required: ['pool_ids'],
+                properties: {
+                    pool_ids: {
+                        type: 'array',
+                        items: {
+                            type: 'string',
+                        }
+                    },
+                    credentials: {
+                        $ref: 'common_api#/definitions/access_keys',
+                    },
+                    endpoint: {
+                        type: 'string'
+                    },
+                    endpoint_type: {
+                        type: 'string'
                     }
                 }
             },

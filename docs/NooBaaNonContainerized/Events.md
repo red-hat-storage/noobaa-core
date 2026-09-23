@@ -32,7 +32,10 @@ The following list includes events that indicate on a normal / successful operat
 - Description: NooBaa account was deleted successfully using NooBaa CLI.
 
 #### 4. `noobaa_bucket_created`
-- Arguments: `bucket_name`
+- Arguments:
+    - `bucket_name`
+    - `account_name`
+    - `<tag_value>` (if `event` is `true` for the reserved tag)
 - Description: NooBaa bucket was created successfully using NooBaa CLI or S3.
 
 #### 5. `noobaa_bucket_deleted`
@@ -43,6 +46,11 @@ The following list includes events that indicate on a normal / successful operat
 - Arguments: `whitelist_ips`
 - Description: Whitelist Server IPs updated successfully using NooBaa CLI.  
 
+#### 7. `noobaa_bucket_reserved_tag_modified`
+- Arguments:
+    - `bucket_name`
+    - `<tag_value>` (if `event` is `true` for the reserved tag)
+- Description: NooBaa bucket reserved tag was modified successfully using NooBaa CLI or S3.
 
 ### Error Indicating Events
 
@@ -204,3 +212,19 @@ The following list includes events that indicate on some sort of malfunction or 
     - Bucket is in invalid state. Bucket schema missing required property or invalid property gets added.  
 - Resolutions:
     - Check the bucket schema definition and make sure the required property is missing and the invalid property gets added in the config root path.
+
+#### 18. `noobaa_notification_failed`
+- Arguments
+    - `name`
+- Reasons:
+    - No connectivity to external server.
+- Resolutions:
+    - Check if external server is reachable.
+
+#### 19. `noobaa_notification_low_space`
+- Arguments
+    - `fs_stat`
+- Reasons:
+    - Free space in notification log dir FS is below threshold.
+- Resolutions:
+    - Free up space is FS.

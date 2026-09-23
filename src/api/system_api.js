@@ -196,23 +196,6 @@ module.exports = {
             }
         },
 
-        set_webserver_master_state: {
-            doc: 'Set if webserver is master',
-            method: 'PUT',
-            params: {
-                type: 'object',
-                required: ['is_master'],
-                properties: {
-                    is_master: {
-                        type: 'boolean',
-                    },
-                }
-            },
-            auth: {
-                system: 'admin',
-            }
-        },
-
         delete_system: {
             doc: 'Delete the authorized system',
             method: 'DELETE',
@@ -459,6 +442,19 @@ module.exports = {
             auth: {
                 system: 'admin'
             }
+        },
+
+        get_system_store: {
+            method: 'GET',
+            reply: {
+                type: 'object',
+                properties: {
+                    // [RPC_BUFFERS].data
+                },
+            },
+            auth: {
+                system: false
+            }
         }
     },
 
@@ -551,12 +547,6 @@ module.exports = {
                     type: 'array',
                     items: {
                         $ref: 'account_api#/definitions/account_info'
-                    }
-                },
-                functions: {
-                    type: 'array',
-                    items: {
-                        $ref: 'func_api#/definitions/func_info'
                     }
                 },
                 objects: {
@@ -887,9 +877,6 @@ module.exports = {
                     properties: {
                         path: {
                             type: 'string'
-                        },
-                        mongo_upgrade: {
-                            type: 'boolean'
                         },
                         status: {
                             type: 'string',

@@ -1,7 +1,7 @@
 /* Copyright (C) 2016 NooBaa */
 'use strict';
 
-const { v4: uuid } = require('uuid');
+const crypto = require('crypto');
 const path = require('path');
 const util = require('util');
 const fs = require('fs');
@@ -62,7 +62,7 @@ class HostedAgents {
     reload() {
         // start agents for all existing cloud pools
         const agents_to_start = system_store.data.pools.filter(pool =>
-            (!_.isUndefined(pool.cloud_pool_info) || !_.isUndefined(pool.mongo_pool_info))
+            (!_.isUndefined(pool.cloud_pool_info))
         );
         dbg.log0(`will start agents for these pools: ${util.inspect(agents_to_start)}`);
         return P.map(agents_to_start, pool => this._start_pool_agent(pool));
@@ -79,8 +79,9 @@ class HostedAgents {
     }
 
 
-    _monitor_stats() {
-        P.pwhile(() => true, () => {
+    async _monitor_stats() {
+        /* eslint-disable no-constant-condition */
+        while (true) {
             const cpu_usage = process.cpuUsage(this.cpu_usage); //usage since last sample
             const mem_usage = process.memoryUsage();
             dbg.log0(`hosted_agent_stats_titles - process: cpu_usage_user, cpu_usage_sys, mem_usage_rss`);
@@ -94,16 +95,14 @@ class HostedAgents {
                 }
             }
             this.cpu_usage = cpu_usage;
-            return P.delay(60000);
-        });
+            await P.delay(60000);
+        }
     }
-
-
 
     async _start_pool_agent(pool) {
         if (!this._started) return;
         if (!pool) throw new Error(`Internal error: received pool ${pool}`);
-        if (config.DB_TYPE !== 'mongodb' && pool.resource_type === 'INTERNAL') return;
+        if (pool.resource_type === 'INTERNAL') return;
         dbg.log0(`_start_pool_agent for pool ${pool.name}`);
         const pool_id = String(pool._id);
         const node_name = 'noobaa-internal-agent-' + pool_id;
@@ -115,8 +114,7 @@ class HostedAgents {
 
         const host_id = config.HOSTED_AGENTS_HOST_ID + pool_id;
         const storage_path = path.join(process.cwd(), 'noobaa_storage', node_name);
-        const pool_property_path = pool.resource_type === 'INTERNAL' ?
-            'mongo_pool_info.agent_info.mongo_path' : 'cloud_pool_info.agent_info.cloud_path';
+        const pool_property_path = 'cloud_pool_info.agent_info.cloud_path';
         const pool_path = _.get(pool, pool_property_path, `noobaa_blocks/${pool_id}`);
         const pool_path_property = pool.resource_type === 'INTERNAL' ? 'mongo_path' : 'cloud_path';
         const pool_info_property = pool.resource_type === 'INTERNAL' ? 'mongo_info' : 'cloud_info';
@@ -132,12 +130,10 @@ class HostedAgents {
             role: 'create_node'
         });
         const { token_wrapper, create_node_token_wrapper } = _get_pool_token_wrapper(pool);
-        const info = pool.resource_type === 'INTERNAL' ?
-            pool.mongo_pool_info : pool.cloud_pool_info;
+        const info = pool.cloud_pool_info;
         if (!info.agent_info || !info.agent_info.create_node_token) {
             const existing_token = info.agent_info ? info.agent_info.node_token : null;
-            const pool_agent_path = pool.resource_type === 'INTERNAL' ?
-                'mongo_pool_info' : 'cloud_pool_info';
+            const pool_agent_path = 'cloud_pool_info';
             const update = {
                 pools: [{
                     _id: pool._id,
@@ -163,6 +159,7 @@ class HostedAgents {
                 access_key: pool.cloud_pool_info.access_keys.access_key,
                 secret_key: pool.cloud_pool_info.access_keys.secret_key
             },
+            azure_sts_credentials: pool.cloud_pool_info.azure_sts_credentials,
             aws_sts_arn: pool.cloud_pool_info.aws_sts_arn,
             region: pool.cloud_pool_info.region,
             pool_name: pool.name
@@ -182,6 +179,9 @@ class HostedAgents {
         agent_params[pool_info_property] = pool_info;
         if (pool.cloud_pool_info && pool.cloud_pool_info.storage_limit) agent_params.storage_limit = pool.cloud_pool_info.storage_limit;
         if (pool.cloud_pool_info && pool.cloud_pool_info.aws_sts_arn) agent_params.aws_sts_arn = pool.cloud_pool_info.aws_sts_arn;
+        if (pool.cloud_pool_info && pool.cloud_pool_info.azure_sts_credentials) {
+            agent_params.azure_sts_credentials = pool.cloud_pool_info.azure_sts_credentials;
+        }
         dbg.log0(`running agent with params ${util.inspect(agent_params)}`);
         const agent = new Agent(agent_params);
         this._started_agents[node_name] = {
@@ -197,7 +197,7 @@ class HostedAgents {
     start_local_agent(params) {
         if (!this._started) return;
 
-        const host_id = uuid();
+        const host_id = crypto.randomUUID();
         const node_name = 'noobaa-internal-agent-' + params.name;
         const storage_path = path.join(process.cwd(), 'noobaa_storage', node_name);
 
@@ -277,7 +277,24 @@ class HostedAgents {
                 continue;
             }
             const agent = this._started_agents[node_name].agent;
-            agent.update_credentials(access_keys);
+            agent.update_hosted_agents({access_keys});
+        }
+    }
+
+    update_hosted_agents(params) {
+        const pool_ids = params.pool_ids;
+        for (const pid of pool_ids) {
+            const node_name = 'noobaa-internal-agent-' + pid;
+            if (!this._started_agents[node_name]) {
+                dbg.error(`update_hosted_agents agent ${node_name} does not exist`);
+                continue;
+            }
+            const agent = this._started_agents[node_name].agent;
+            agent.update_hosted_agents({
+                access_keys: params.credentials,
+                endpoint: params.endpoint,
+                endpoint_type: params.endpoint_type,
+            });
         }
     }
 
@@ -308,6 +325,14 @@ async function update_credentials(req) {
         await HostedAgents.instance().update_agents_credentials({ pool_ids, access_keys: credentials });
     } catch (error) {
         dbg.error('update_credentials had failed', error);
+    }
+}
+
+async function update_hosted_agents(req) {
+    try {
+        await HostedAgents.instance().update_hosted_agents(req.rpc_params);
+    } catch (error) {
+        dbg.error('update_hosted_agents had failed', error);
     }
 }
 
@@ -378,8 +403,7 @@ function _get_pool_and_path_for_token(token_pool) {
     const sys = system_store.data.systems[0];
     const pool = sys.pools_by_name[token_pool.name];
     if (!pool) throw new Error(`Pool ${token_pool.name}, ${token_pool._id} does not exist`);
-    const pool_property_path = pool.resource_type === 'INTERNAL' ?
-        'mongo_pool_info.agent_info' : 'cloud_pool_info.agent_info';
+    const pool_property_path = 'cloud_pool_info.agent_info';
     return {
         pool_property_path,
         pool
@@ -391,6 +415,7 @@ HostedAgents._instance = null;
 // EXPORTS
 exports.create_pool_agent = create_pool_agent;
 exports.update_credentials = update_credentials;
+exports.update_hosted_agents = update_hosted_agents;
 exports.update_storage_limit = update_storage_limit;
 exports.remove_pool_agent = remove_pool_agent;
 exports.start = req => HostedAgents.instance().start();

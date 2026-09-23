@@ -1,9 +1,19 @@
 /* Copyright (C) 2020 NooBaa */
 'use strict';
 
+// DO NOT PUT NEW REQUIREMENTS BEFORE SETTING process.env.NC_NSFS_NO_DB_ENV = 'true' 
+// NC nsfs deployments specifying process.env.LOCAL_MD_SERVER=true deployed together with a db
+// when a system_store object is initialized VaccumAnalyzer is being called once a day.
+// when NC nsfs deployed without db we would like to avoid running VaccumAnalyzer in any flow there is
+// because running it will cause a panic.
+if (process.env.LOCAL_MD_SERVER !== 'true') {
+    process.env.NC_NSFS_NO_DB_ENV = 'true';
+}
+
 const dbg = require('../util/debug_module')(__filename);
+if (!dbg.get_process_name()) dbg.set_process_name('noobaa-cli');
+
 const _ = require('lodash');
-const path = require('path');
 const minimist = require('minimist');
 const config = require('../../config');
 const P = require('../util/promise');
@@ -13,26 +23,34 @@ const cloud_utils = require('../util/cloud_utils');
 const native_fs_utils = require('../util/native_fs_utils');
 const mongo_utils = require('../util/mongo_utils');
 const SensitiveString = require('../util/sensitive_string');
+const { account_id_cache } = require('../sdk/accountspace_fs');
 const ManageCLIError = require('../manage_nsfs/manage_nsfs_cli_errors').ManageCLIError;
 const ManageCLIResponse = require('../manage_nsfs/manage_nsfs_cli_responses').ManageCLIResponse;
 const manage_nsfs_glacier = require('../manage_nsfs/manage_nsfs_glacier');
+const { NCLifecycle } = require('../manage_nsfs/nc_lifecycle');
 const manage_nsfs_logging = require('../manage_nsfs/manage_nsfs_logging');
 const noobaa_cli_diagnose = require('../manage_nsfs/diagnose');
 const noobaa_cli_upgrade = require('../manage_nsfs/upgrade');
 const { print_usage } = require('../manage_nsfs/manage_nsfs_help_utils');
 const { TYPES, ACTIONS, LIST_ACCOUNT_FILTERS, LIST_BUCKET_FILTERS, GLACIER_ACTIONS } = require('../manage_nsfs/manage_nsfs_constants');
-const { throw_cli_error, get_bucket_owner_account, write_stdout_response, get_boolean_or_string_value, has_access_keys, set_debug_level,
-    is_name_update, is_access_key_update } = require('../manage_nsfs/manage_nsfs_cli_utils');
+const { throw_cli_error, get_bucket_owner_account_by_name,
+    write_stdout_response, get_boolean_or_string_value, has_access_keys, set_debug_level,
+    is_name_update, is_access_key_update, parse_comma_delimited_string } = require('../manage_nsfs/manage_nsfs_cli_utils');
 const manage_nsfs_validations = require('../manage_nsfs/manage_nsfs_validations');
 const nc_mkm = require('../manage_nsfs/nc_master_key_manager').get_instance();
+const notifications_util = require('../util/notifications_util');
+const BucketSpaceFS = require('../sdk/bucketspace_fs');
+const NoobaaEvent = require('../manage_nsfs/manage_nsfs_events_utils').NoobaaEvent;
+
+///////////////
+//// GENERAL //
+///////////////
 
 let config_fs;
 
 async function main(argv = minimist(process.argv.slice(2))) {
     try {
-        if (process.getuid() !== 0 || process.getgid() !== 0) {
-            throw new Error('Root permissions required for Manage NSFS execution.');
-        }
+        config.EVENT_LOGGING_ENABLED = true;
         const type = argv._[0] || '';
         const action = argv._[1] || '';
         if (argv.help || argv.h) {
@@ -67,22 +85,37 @@ async function main(argv = minimist(process.argv.slice(2))) {
         } else if (type === TYPES.DIAGNOSE) {
             await noobaa_cli_diagnose.manage_diagnose_operations(action, user_input, config_fs);
         } else if (type === TYPES.UPGRADE) {
-            await noobaa_cli_upgrade.manage_upgrade_operations(action, config_fs);
+            await noobaa_cli_upgrade.manage_upgrade_operations(action, user_input, config_fs);
+        } else if (type === TYPES.NOTIFICATION) {
+            await notification_management();
+        } else if (type === TYPES.CONNECTION) {
+            await connection_management(action, user_input);
+        } else if (type === TYPES.LIFECYCLE) {
+            await lifecycle_management(argv);
         } else {
             throw_cli_error(ManageCLIError.InvalidType);
         }
     } catch (err) {
         dbg.log1('NSFS Manage command: exit on error', err.stack || err);
-        const manage_err = ((err instanceof ManageCLIError) && err) ||
-            new ManageCLIError({
-                ...(ManageCLIError.FS_ERRORS_TO_MANAGE[err.code] ||
-                ManageCLIError.RPC_ERROR_TO_MANAGE[err.rpc_code] ||
-                ManageCLIError.InternalError), cause: err });
+        const manage_err = ((err instanceof ManageCLIError) && err) || (() => {
+            try {
+                throw_cli_error({
+                    ...(ManageCLIError.FS_ERRORS_TO_MANAGE[err.code] ||
+                    ManageCLIError.RPC_ERROR_TO_MANAGE[err.rpc_code] ||
+                    ManageCLIError.InternalError), // fallback to InternalError and record the event
+                    cause: err
+                });
+            } catch (e) { return e; }
+        })();
         process.stdout.write(manage_err.to_string() + '\n', () => {
             process.exit(1);
         });
     }
 }
+
+///////////////
+//// BUCKETS //
+///////////////
 
 // in name and new_name we allow type number, hence convert it to string
 async function fetch_bucket_data(action, user_input) {
@@ -98,9 +131,9 @@ async function fetch_bucket_data(action, user_input) {
         should_create_underlying_storage: action === ACTIONS.ADD ? false : undefined,
         new_name: user_input.new_name === undefined ? undefined : String(user_input.new_name),
         fs_backend: user_input.fs_backend === undefined ? config.NSFS_NC_STORAGE_BACKEND : String(user_input.fs_backend),
-        force_md5_etag: user_input.force_md5_etag === undefined || user_input.force_md5_etag === '' ? user_input.force_md5_etag : get_boolean_or_string_value(user_input.force_md5_etag)
-        };
-
+        force_md5_etag: user_input.force_md5_etag === undefined || user_input.force_md5_etag === '' ? user_input.force_md5_etag : get_boolean_or_string_value(user_input.force_md5_etag),
+        notifications: user_input.notifications
+    };
     if (user_input.bucket_policy !== undefined) {
         if (typeof user_input.bucket_policy === 'string') {
             // bucket_policy deletion specified with empty string ''
@@ -113,16 +146,42 @@ async function fetch_bucket_data(action, user_input) {
             data.s3_policy = user_input.bucket_policy;
         }
     }
+    if (action === ACTIONS.ADD || action === ACTIONS.UPDATE) {
+        if (user_input.should_create_underlying_storage !== undefined) {
+            data.should_create_underlying_storage = Boolean(user_input.should_create_underlying_storage);
+        }
+    }
     if (action === ACTIONS.UPDATE || action === ACTIONS.DELETE) {
         // @ts-ignore
         data = _.omitBy(data, _.isUndefined);
         data = await merge_new_and_existing_config_data(data);
     }
 
+    if ((action === ACTIONS.UPDATE && user_input.tag) || (action === ACTIONS.ADD)) {
+        const tags = JSON.parse(user_input.tag || '[]');
+        data.tag = BucketSpaceFS._merge_reserved_tags(
+            data.tag || BucketSpaceFS._default_bucket_tags(),
+            tags,
+            action === ACTIONS.ADD ? true : await _is_bucket_empty(data),
+        );
+    }
+
+    if ((action === ACTIONS.UPDATE && user_input.merge_tag) || (action === ACTIONS.ADD)) {
+        const merge_tags = JSON.parse(user_input.merge_tag || '[]');
+        data.tag = _.merge(
+            data.tag,
+            BucketSpaceFS._merge_reserved_tags(
+                data.tag || BucketSpaceFS._default_bucket_tags(),
+                merge_tags,
+                action === ACTIONS.ADD ? true : await _is_bucket_empty(data),
+            )
+        );
+    }
+
     //if we're updating the owner, needs to override owner in file with the owner from user input.
     //if we're adding a bucket, need to set its owner id field
     if ((action === ACTIONS.UPDATE && user_input.owner) || (action === ACTIONS.ADD)) {
-        const account = await get_bucket_owner_account(config_fs, String(user_input.owner));
+        const account = await get_bucket_owner_account_by_name(config_fs, String(user_input.owner));
         data.owner_account = account._id;
     }
 
@@ -136,7 +195,6 @@ async function fetch_bucket_data(action, user_input) {
 
     return data;
 }
-
 
 /**
  * merge_new_and_existing_config_data returns the merged object of the existing bucket data and the user data
@@ -165,8 +223,26 @@ async function merge_new_and_existing_config_data(user_input_bucket_data) {
 async function add_bucket(data) {
     data._id = mongo_utils.mongoObjectId();
     const parsed_bucket_data = await config_fs.create_bucket_config_file(data);
-    await set_bucker_owner(parsed_bucket_data);
-    return { code: ManageCLIResponse.BucketCreated, detail: parsed_bucket_data, event_arg: { bucket: data.name }};
+
+    const account = await account_id_cache.get_with_cache({ _id: parsed_bucket_data.owner_account, config_fs });
+    await set_bucker_owner(parsed_bucket_data, account);
+
+    const [reserved_tag_event_args] = BucketSpaceFS._generate_reserved_tag_event_args({}, data.tag);
+    if (parsed_bucket_data.should_create_underlying_storage) {
+        await BucketSpaceFS._create_uls(
+            config_fs.fs_context,
+            await native_fs_utils.get_fs_context(account.nsfs_account_config, parsed_bucket_data.fs_backend),
+            data.name,
+            data.path,
+            config_fs.get_bucket_path_by_name(data.name)
+        );
+    }
+
+    return {
+        code: ManageCLIResponse.BucketCreated,
+        detail: parsed_bucket_data,
+        event_arg: { ...(reserved_tag_event_args || {}), bucket: data.name, account: parsed_bucket_data.bucket_owner },
+    };
 }
 
 /**
@@ -202,6 +278,7 @@ async function update_bucket(data) {
     data = _.omit(data, cli_bucket_flags_to_remove);
 
     let parsed_bucket_data;
+
     if (name_update) {
         parsed_bucket_data = await config_fs.create_bucket_config_file({ ...data, name: new_name });
         await config_fs.delete_bucket_config_file(cur_name);
@@ -221,32 +298,111 @@ async function update_bucket(data) {
  */
 async function delete_bucket(data, force) {
     try {
-        const temp_dir_name = native_fs_utils.get_bucket_tmpdir_name(data._id);
+        const bucket_empty = await _is_bucket_empty(data);
+        if (!bucket_empty && !force) {
+            throw_cli_error(ManageCLIError.BucketDeleteForbiddenHasObjects, data.name);
+        }
+
         const bucket_temp_dir_path = native_fs_utils.get_bucket_tmpdir_full_path(data.path, data._id);
-        // fs_contexts for bucket temp dir (storage path)
         const fs_context_fs_backend = native_fs_utils.get_process_fs_context(data.fs_backend);
-        let entries;
-        try {
-            entries = await nb_native().fs.readdir(fs_context_fs_backend, data.path);
-        } catch (err) {
-            dbg.warn(`delete_bucket: bucket name ${data.name},` +
-                `got an error on readdir with path: ${data.path}`, err);
-            // if the bucket's path was deleted first (encounter ENOENT error) - continue deletion
-            if (err.code !== 'ENOENT') throw err;
-        }
-        if (entries) {
-            const object_entries = entries.filter(element => !element.name.endsWith(temp_dir_name));
-            if (object_entries.length > 0 && !force) {
-                throw_cli_error(ManageCLIError.BucketDeleteForbiddenHasObjects, data.name);
-            }
-        }
+
         await native_fs_utils.folder_delete(bucket_temp_dir_path, fs_context_fs_backend, true);
         await config_fs.delete_bucket_config_file(data.name);
-        return { code: ManageCLIResponse.BucketDeleted, detail: '', event_arg: { bucket: data.name } };
+        if (data.should_create_underlying_storage) {
+            try {
+                await nb_native().fs.rmdir(config_fs.fs_context, data.path);
+            } catch (error) {
+                dbg.warn('failed to delete underlying storage directory:', error);
+            }
+        }
+        return { code: ManageCLIResponse.BucketDeleted, detail: { name: data.name }, event_arg: { bucket: data.name } };
     } catch (err) {
         if (err.code === 'ENOENT') throw_cli_error(ManageCLIError.NoSuchBucket, data.name);
         throw err;
     }
+}
+
+
+/**
+ * filter_bucket will return true or false based on whether a bucket meets the criteria defined by the supported flags.
+ * @param {object} bucket
+ * @param {object} [filters]
+ */
+function filter_bucket(bucket, filters) {
+    for (const [key, val] of Object.entries(filters)) {
+        if (bucket[key] !== val) { // We will never reach here if we will not add an appropriate field to the filter 
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * list_bucket_config_files will list all the bucket config files (json) in a given config directory
+ * @param {boolean} [wide]
+ * @param {object} [filters]
+ */
+async function list_bucket_config_files(wide, filters = {}) {
+    let entry_names = [];
+    const should_filter = Object.keys(filters).length > 0;
+    const is_filter_by_name = filters.name !== undefined;
+
+    const options = {
+        silent_if_missing: true
+    };
+
+    // in case we have a filter by name, we don't need to read all the entries and iterate them
+    // instead we "mock" the entries array to have one entry and it is the name by the filter (we add it for performance)
+    if (is_filter_by_name) {
+        entry_names = [filters.name];
+    } else {
+        entry_names = await config_fs.list_buckets();
+    }
+
+    let config_files_list = await P.map_with_concurrency(10, entry_names, async entry_name => {
+        if (wide || should_filter) {
+            const data = await config_fs.get_bucket_by_name(entry_name, options);
+            if (!data) return undefined;
+            if (should_filter && !filter_bucket(data, filters)) return undefined;
+            if (!wide) return { name: entry_name };
+            await set_bucker_owner(data);
+            return data;
+        } else {
+            return { name: entry_name };
+        }
+    });
+    // it inserts undefined for the entry '.noobaa-config-nsfs' and we wish to remove it
+    // in case the entry was deleted during the list it also inserts undefined
+    config_files_list = config_files_list.filter(item => item);
+
+    return config_files_list;
+}
+
+/**
+ * _is_bucket_empty returns true if the given bucket is empty
+ *
+ * @param {*} data 
+ * @returns {Promise<boolean>}
+ */
+async function _is_bucket_empty(data) {
+    const temp_dir_name = native_fs_utils.get_bucket_tmpdir_name(data._id);
+    // fs_contexts for bucket temp dir (storage path)
+    const fs_context_fs_backend = native_fs_utils.get_process_fs_context(data.fs_backend);
+    let entries;
+    try {
+        entries = await nb_native().fs.readdir(fs_context_fs_backend, data.path);
+    } catch (err) {
+        dbg.warn(`_is_bucket_empty: bucket name ${data.name},` +
+            `got an error on readdir with path: ${data.path}`, err);
+        // if the bucket's path was deleted first (encounter ENOENT error) - continue deletion
+        if (err.code !== 'ENOENT') throw err;
+    }
+    if (entries) {
+        const object_entries = entries.filter(element => !element.name.endsWith(temp_dir_name));
+        return object_entries.length === 0;
+    }
+
+    return true;
 }
 
 /**
@@ -262,6 +418,7 @@ async function delete_bucket(data, force) {
 async function bucket_management(action, user_input) {
     const data = action === ACTIONS.LIST ? undefined : await fetch_bucket_data(action, user_input);
     await manage_nsfs_validations.validate_bucket_args(config_fs, data, action);
+    await manage_nsfs_validations.validate_bucket_notifications(config_fs, user_input);
 
     let response = {};
     if (action === ACTIONS.ADD) {
@@ -269,20 +426,41 @@ async function bucket_management(action, user_input) {
     } else if (action === ACTIONS.STATUS) {
         response = await get_bucket_status(data);
     } else if (action === ACTIONS.UPDATE) {
-        response = await update_bucket(data);
+        const bucket_path = config_fs.get_bucket_path_by_name(user_input.name);
+        const bucket_lock_file = `${bucket_path}.lock`;
+        await native_fs_utils.lock_and_run(config_fs.fs_context, bucket_lock_file, async () => {
+            const prev_bucket_info = await fetch_bucket_data(action, _.omit(user_input, ['tag', 'merge_tag']));
+            const bucket_info = await fetch_bucket_data(action, user_input);
+
+            const tagging_object = BucketSpaceFS._objectify_tagging_arr(prev_bucket_info.tag);
+            const [
+                reserved_tag_event_args,
+                reserved_tag_modified,
+            ] = BucketSpaceFS._generate_reserved_tag_event_args(tagging_object, bucket_info.tag);
+
+            response = await update_bucket(bucket_info);
+            if (reserved_tag_modified) {
+                new NoobaaEvent(NoobaaEvent.BUCKET_RESERVED_TAG_MODIFIED)
+                    .create_event(undefined, { ...reserved_tag_event_args, bucket_name: user_input.name });
+            }
+        });
     } else if (action === ACTIONS.DELETE) {
         const force = get_boolean_or_string_value(user_input.force);
         response = await delete_bucket(data, force);
     } else if (action === ACTIONS.LIST) {
         const bucket_filters = _.pick(user_input, LIST_BUCKET_FILTERS);
         const wide = get_boolean_or_string_value(user_input.wide);
-        const buckets = await list_config_files(TYPES.BUCKET, wide, undefined, bucket_filters);
+        const buckets = await list_bucket_config_files(wide, bucket_filters);
         response = { code: ManageCLIResponse.BucketList, detail: buckets };
     } else {
         throw_cli_error(ManageCLIError.InvalidAction);
     }
     write_stdout_response(response.code, response.detail, response.event_arg);
 }
+
+////////////////
+//// ACCOUNTS //
+////////////////
 
 /**
  * set_access_keys will set the access keys either given or generated.
@@ -325,8 +503,12 @@ async function fetch_account_data(action, user_input) {
             uid: user_input.user ? undefined : user_input.uid,
             gid: user_input.user ? undefined : user_input.gid,
             new_buckets_path: user_input.new_buckets_path,
-            fs_backend: user_input.fs_backend ? String(user_input.fs_backend) : config.NSFS_NC_STORAGE_BACKEND
-        }
+            fs_backend: user_input.fs_backend ? String(user_input.fs_backend) : config.NSFS_NC_STORAGE_BACKEND,
+            custom_bucket_path_allowed_list: user_input.custom_bucket_path_allowed_list,
+            allow_bypass_governance: user_input.allow_bypass_governance === undefined || user_input.allow_bypass_governance === '' ? user_input.allow_bypass_governance : get_boolean_or_string_value(user_input.allow_bypass_governance),
+        },
+        default_connection: user_input.default_connection === undefined ? undefined : String(user_input.default_connection),
+        role_config: _build_role_config(user_input),
     };
     if (action === ACTIONS.UPDATE || action === ACTIONS.DELETE) {
         // @ts-ignore
@@ -344,6 +526,11 @@ async function fetch_account_data(action, user_input) {
         data.access_keys[0].secret_key = data.access_keys[0].secret_key === undefined ? undefined :
             new SensitiveString(String(data.access_keys[0].secret_key));
     }
+    //since supplemental_groups is an array, new list will merge with the old one instead of replacing it in fetch_existing_account_data
+    //so we need to replace this value after merging the data
+    data.nsfs_account_config.supplemental_groups = user_input.supplemental_groups === undefined ?
+        data.nsfs_account_config.supplemental_groups : parse_comma_delimited_string(user_input.supplemental_groups);
+
     if (data.new_access_key) data.new_access_key = new SensitiveString(data.new_access_key);
     // fs_backend deletion specified with empty string '' (but it is not part of the schema)
     data.nsfs_account_config.fs_backend = data.nsfs_account_config.fs_backend || undefined;
@@ -358,8 +545,25 @@ async function fetch_account_data(action, user_input) {
     } else { // string of true or false
         data.allow_bucket_creation = user_input.allow_bucket_creation.toLowerCase() === 'true';
     }
-
+    // custom_bucket_path_allowed_list deletion specified with empty string ''
+    data.nsfs_account_config.custom_bucket_path_allowed_list = data.nsfs_account_config.custom_bucket_path_allowed_list || undefined;
+    data.nsfs_account_config.allow_bypass_governance = data.nsfs_account_config.allow_bypass_governance === '' ? undefined : data.nsfs_account_config.allow_bypass_governance;
+    // role_config deletion specified with empty string ''
+    data.role_config = data.role_config === '' ? undefined : data.role_config;
     return data;
+}
+
+/**
+ * _build_role_config parses user_input into the role_config object.
+ * cli input --role_config <json_string>
+ * @param {object} user_input
+ */
+function _build_role_config(user_input) {
+    if (user_input.role_config === undefined) return undefined;
+    if (user_input.role_config === '') return '';
+    if (typeof user_input.role_config === 'string') return JSON.parse(user_input.role_config);
+    if (typeof user_input.role_config === 'object') return user_input.role_config;
+    return undefined;
 }
 
 async function fetch_existing_account_data(action, target, decrypt_secret_key) {
@@ -445,7 +649,7 @@ async function update_account(data) {
  */
 async function delete_account(data) {
     await config_fs.delete_account_config_file(data);
-    return { code: ManageCLIResponse.AccountDeleted, detail: '', event_arg: { account: data.name } };
+    return { code: ManageCLIResponse.AccountDeleted, detail: { name: data.name }, event_arg: { account: data.name } };
 }
 
 /**
@@ -473,64 +677,9 @@ async function get_account_status(data, show_secrets) {
 }
 
 /**
- * account_management does the following - 
- * 1. sets variables by the user input options
- * 2. iniates nc_master_key_manager on UPDATE/ADD/show_secrets
- * 2. validates account args - TODO - we should split it to validate_account_args 
- * and validations of the merged account (user_input + existing account config)
- * 3. call account operation based on the action argument
- * 4. write output to stdout
- * @param {'add'|'update'|'delete'|'status'|'list'} action 
- * @param {Object} user_input 
- */
-async function account_management(action, user_input) {
-    const show_secrets = get_boolean_or_string_value(user_input.show_secrets);
-    const is_flag_iam_operate_on_root_account = get_boolean_or_string_value(user_input.iam_operate_on_root_account);
-    const account_filters = _.pick(user_input, LIST_ACCOUNT_FILTERS);
-    const wide = get_boolean_or_string_value(user_input.wide);
-    if (get_boolean_or_string_value(user_input.anonymous)) {
-        user_input.name = config.ANONYMOUS_ACCOUNT_NAME;
-        user_input.email = config.ANONYMOUS_ACCOUNT_NAME;
-    }
-    // init nc_mkm here to avoid concurrent initializations
-    // init if actions is add/update (require encryption) or show_secrets = true (require decryption)
-    if ([ACTIONS.ADD, ACTIONS.UPDATE].includes(action) || show_secrets) await nc_mkm.init();
-    const data = action === ACTIONS.LIST ? undefined : await fetch_account_data(action, user_input);
-    await manage_nsfs_validations.validate_account_args(config_fs, data, action, is_flag_iam_operate_on_root_account);
-
-    let response = {};
-    if (action === ACTIONS.ADD) {
-        response = await add_account(data);
-    } else if (action === ACTIONS.STATUS) {
-        response = await get_account_status(data, show_secrets);
-    } else if (action === ACTIONS.UPDATE) {
-        response = await update_account(data);
-    } else if (action === ACTIONS.DELETE) {
-        response = await delete_account(data);
-    } else if (action === ACTIONS.LIST) {
-        const accounts = await list_config_files(TYPES.ACCOUNT, wide, show_secrets, account_filters);
-        response = { code: ManageCLIResponse.AccountList, detail: accounts };
-    } else {
-        throw_cli_error(ManageCLIError.InvalidAction);
-    }
-    write_stdout_response(response.code, response.detail, response.event_arg);
-
-}
-
-/**
- * filter_list_item will return an answer of filter_account() or filter_bucket() based on the entity type
- * @param {string} type
- * @param {object} entity
- * @param {string[]} [filters]
- */
-function filter_list_item(type, entity, filters) {
-    return type === TYPES.ACCOUNT ? filter_account(entity, filters) : filter_bucket(entity, filters);
-}
-
-/**
  * filter_account will return true or false based on whether an account meets the criteria defined by the supported flags.
  * @param {object} account
- * @param {string[]} [filters]
+ * @param {object} [filters]
  */
 function filter_account(account, filters) {
     for (const [key, val] of Object.entries(filters)) {
@@ -554,36 +703,25 @@ function filter_account(account, filters) {
 }
 
 /**
- * filter_bucket will return true or false based on whether a bucket meets the criteria defined by the supported flags.
- * currently not implemented
- * @param {object} bucket
- * @param {string[]} [filters]
- */
-function filter_bucket(bucket, filters) {
-    for (const [key, val] of Object.entries(filters)) {
-        if (bucket[key] !== val) { // We will never reach here if we will not add an appropriate field to the filter 
-            return false;
-        }
-    }
-    return true;
-}
-/**
- * list_config_files will list all the config files (json) in a given config directory
- * @param {string} type
+ * list_account_config_files will list all the account config files (json) in a given config directory
  * @param {boolean} [wide]
  * @param {boolean} [show_secrets]
  * @param {object} [filters]
  */
-async function list_config_files(type, wide, show_secrets, filters = {}) {
+async function list_account_config_files(wide, show_secrets, filters = {}) {
     let entry_names = [];
     const should_filter = Object.keys(filters).length > 0;
     const is_filter_by_name = filters.name !== undefined;
 
-    // decryption causing mkm initalization
+    // decryption causing mkm initialization
     // decrypt only if data has access_keys and show_secrets = true (no need to decrypt if show_secrets = false but should_filter = true)
     const options = {
         show_secrets: show_secrets || should_filter,
         decrypt_secret_key: show_secrets,
+        // in case we have an error on secret_key decryption 
+        // we will neither return the secret_key nor the encrypted_secret_key
+        // and add the property of decryption_err with the error we had
+        return_on_decryption_error: true,
         silent_if_missing: true
     };
 
@@ -591,32 +729,18 @@ async function list_config_files(type, wide, show_secrets, filters = {}) {
     // instead we "mock" the entries array to have one entry and it is the name by the filter (we add it for performance)
     if (is_filter_by_name) {
         entry_names = [filters.name];
-    } else if (type === TYPES.ACCOUNT) {
+    } else {
         entry_names = await config_fs.list_accounts();
-    } else if (type === TYPES.BUCKET) {
-        entry_names = await config_fs.list_buckets();
     }
 
-    // temporary cache for mapping bucker owner_account (id) -> bucket_owner (name)
-    const bucket_owners_map = {};
     let config_files_list = await P.map_with_concurrency(10, entry_names, async entry_name => {
         if (wide || should_filter) {
-            const data = type === TYPES.ACCOUNT ?
-                await config_fs.get_account_by_name(entry_name, options) :
-                await config_fs.get_bucket_by_name(entry_name, options);
+            const data = await config_fs.get_account_by_name(entry_name, options);
             if (!data) return undefined;
-            if (should_filter && !filter_list_item(type, data, filters)) return undefined;
+            if (should_filter && !filter_account(data, filters)) return undefined;
             // remove secrets on !show_secrets && should filter
             if (!wide) return { name: entry_name };
-            if (type === TYPES.ACCOUNT) return _.omit(data, show_secrets ? [] : ['access_keys']);
-            if (type === TYPES.BUCKET) {
-                data.bucket_owner = bucket_owners_map[data.owner_account];
-                if (!data.bucket_owner) {
-                    await set_bucker_owner(data);
-                    bucket_owners_map[data.owner_account] = data.bucket_owner;
-                }
-                return data;
-            }
+            return _.omit(data, show_secrets ? [] : ['access_keys']);
         } else {
             return { name: entry_name };
         }
@@ -626,6 +750,52 @@ async function list_config_files(type, wide, show_secrets, filters = {}) {
     config_files_list = config_files_list.filter(item => item);
 
     return config_files_list;
+}
+
+/**
+ * account_management does the following - 
+ * 1. sets variables by the user input options
+ * 2. iniates nc_master_key_manager on UPDATE/ADD/show_secrets
+ * 2. validates account args - TODO - we should split it to validate_account_args 
+ * and validations of the merged account (user_input + existing account config)
+ * 3. call account operation based on the action argument
+ * 4. write output to stdout
+ * @param {'add'|'update'|'delete'|'status'|'list'} action 
+ * @param {Object} user_input 
+ */
+async function account_management(action, user_input) {
+    const show_secrets = get_boolean_or_string_value(user_input.show_secrets);
+    const is_flag_iam_operate_on_root_account = get_boolean_or_string_value(user_input.iam_operate_on_root_account);
+    const account_filters = _.pick(user_input, LIST_ACCOUNT_FILTERS);
+    const wide = get_boolean_or_string_value(user_input.wide);
+    if (get_boolean_or_string_value(user_input.anonymous)) {
+        user_input.name = config.ANONYMOUS_ACCOUNT_NAME;
+        user_input.email = config.ANONYMOUS_ACCOUNT_NAME;
+    }
+    // init nc_mkm here to avoid concurrent initializations
+    // init if actions is add/update (require encryption) or show_secrets = true (require decryption)
+    if ([ACTIONS.ADD, ACTIONS.UPDATE].includes(action) || show_secrets) await nc_mkm.init();
+    if (action === ACTIONS.ADD || action === ACTIONS.UPDATE) manage_nsfs_validations.validate_role_config(user_input);
+    const data = action === ACTIONS.LIST ? undefined : await fetch_account_data(action, user_input);
+    await manage_nsfs_validations.validate_account_args(config_fs, data, action, is_flag_iam_operate_on_root_account);
+
+    let response = {};
+    if (action === ACTIONS.ADD) {
+        response = await add_account(data);
+    } else if (action === ACTIONS.STATUS) {
+        response = await get_account_status(data, show_secrets);
+    } else if (action === ACTIONS.UPDATE) {
+        response = await update_account(data);
+    } else if (action === ACTIONS.DELETE) {
+        response = await delete_account(data);
+    } else if (action === ACTIONS.LIST) {
+        const accounts = await list_account_config_files(wide, show_secrets, account_filters);
+        response = { code: ManageCLIResponse.AccountList, detail: accounts };
+    } else {
+        throw_cli_error(ManageCLIError.InvalidAction);
+    }
+    write_stdout_response(response.code, response.detail, response.event_arg);
+
 }
 
 /**
@@ -655,10 +825,34 @@ function get_access_keys(action, user_input) {
 /**
  * set_bucker_owner gets bucket owner from cache by its id and sets bucket_owner name on the bucket data
  * @param {object} bucket_data 
+ * @param {*} [account_data]
  */
-async function set_bucker_owner(bucket_data) {
-    const account_data = await config_fs.get_identity_by_id(bucket_data.owner_account, TYPES.ACCOUNT, { silent_if_missing: true});
+async function set_bucker_owner(bucket_data, account_data) {
+    try {
+        if (!account_data) {
+            account_data = await account_id_cache.get_with_cache({ _id: bucket_data.owner_account, config_fs });
+        }
+    } catch (err) {
+        dbg.warn(`set_bucker_owner.couldn't find bucket owner data by id ${bucket_data.owner_account}`);
+    }
     bucket_data.bucket_owner = account_data?.name;
+}
+
+////////////////////
+//// IP WHITELIST //
+////////////////////
+/**
+ * @returns {Promise<[boolean, object]>} - [config_exists, config_data] - config_exists is a boolean that indicates if the config.json exists
+ * and config_data is the parsed data from the config.json file. returns empty object for config_data if config.json does not exist.
+ */
+async function _get_config_json_if_exist() {
+    try {
+        const config_json = await config_fs.get_config_json();
+        return [true, config_json];
+    } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+        return [false, {}];
+    }
 }
 
 async function whitelist_ips_management(args) {
@@ -667,18 +861,25 @@ async function whitelist_ips_management(args) {
 
     const whitelist_ips = JSON.parse(ips);
     manage_nsfs_validations.validate_whitelist_ips(whitelist_ips);
-    const config_path = path.join(config_fs.config_root, 'config.json');
     try {
-        const config_data = require(config_path);
+        const [config_exists, config_data] = await _get_config_json_if_exist();
         config_data.S3_SERVER_IP_WHITELIST = whitelist_ips;
         const data = JSON.stringify(config_data);
-        await config_fs.update_config_json_file(data);
+        if (config_exists) {
+            await config_fs.update_config_json_file(data);
+        } else {
+            await config_fs.create_config_json_file(data);
+        }
     } catch (err) {
-        dbg.error('manage_nsfs.whitelist_ips_management: Error while updation config.json,  path ' + config_path, err);
-        throw_cli_error(ManageCLIError.WhiteListIPUpdateFailed, config_path);
+        dbg.error('manage_nsfs.whitelist_ips_management: Error while updation config.json, path:', config_fs.config_json_path, err);
+        throw_cli_error(ManageCLIError.WhiteListIPUpdateFailed);
     }
     write_stdout_response(ManageCLIResponse.WhiteListIPUpdated, ips);
 }
+
+///////////////
+//// GLACIER //
+///////////////
 
 async function glacier_management(argv) {
     const action = argv._[1] || '';
@@ -696,13 +897,121 @@ async function manage_glacier_operations(action, argv) {
         case GLACIER_ACTIONS.EXPIRY:
             await manage_nsfs_glacier.process_expiry();
             break;
+        case GLACIER_ACTIONS.RECLAIM:
+            await manage_nsfs_glacier.process_reclaim();
+            break;
         default:
             throw_cli_error(ManageCLIError.InvalidGlacierOperation);
     }
 }
 
+//////////////////////
+//// BUCKET LOGGING //
+//////////////////////
+
 async function logging_management() {
     await manage_nsfs_logging.export_bucket_logging(config_fs);
+}
+
+/////////////////////
+//// NOTIFICATIONS //
+////////////////////
+
+async function notification_management() {
+    await new notifications_util.Notificator({
+        fs_context: config_fs.fs_context,
+        connect_files_dir: config_fs.connections_dir_path,
+        nc_config_fs: config_fs,
+    }).process_notification_files();
+}
+
+async function connection_management(action, user_input) {
+    manage_nsfs_validations.validate_connection_args(user_input, action);
+
+    //don't reply the internal '_' field.
+    delete user_input._;
+
+    let response = {};
+    let data;
+
+    try {
+        switch (action) {
+            case ACTIONS.ADD:
+                data = await notifications_util.add_connect_file(user_input, config_fs);
+                response = { code: ManageCLIResponse.ConnectionCreated, detail: data };
+                break;
+            case ACTIONS.DELETE:
+                await config_fs.delete_connection_config_file(user_input.name);
+                response = { code: ManageCLIResponse.ConnectionDeleted, detail: {name: user_input.name} };
+                break;
+            case ACTIONS.UPDATE:
+                await notifications_util.update_connect_file(user_input.name, user_input.key,
+                    user_input.value, user_input.remove_key, config_fs);
+                response = { code: ManageCLIResponse.ConnectionUpdated, detail: {name: user_input.name} };
+                break;
+            case ACTIONS.STATUS:
+                data = await new notifications_util.Notificator({
+                    fs_context: config_fs.fs_context,
+                    connect_files_dir: config_fs.connections_dir_path,
+                    nc_config_fs: config_fs,
+                }).parse_connect_file(user_input.name, user_input.decrypt);
+                response = { code: ManageCLIResponse.ConnectionStatus, detail: data };
+                break;
+            case ACTIONS.LIST:
+                data = await list_connections();
+                response = { code: ManageCLIResponse.ConnectionList, detail: data };
+                break;
+            default:
+                throw_cli_error(ManageCLIError.InvalidAction);
+        }
+
+        write_stdout_response(response.code, response.detail, response.event_arg);
+    } catch (err) {
+        if (err.code === 'EEXIST') throw_cli_error(ManageCLIError.ConnectionAlreadyExists, user_input.name);
+        if (err.code === 'ENOENT') throw_cli_error(ManageCLIError.NoSuchConnection, user_input.name);
+        throw err;
+    }
+}
+
+/**
+ * list_connections
+ * @returns An array with names of all connection files.
+ */
+async function list_connections() {
+    let conns = await config_fs.list_connections();
+    // it inserts undefined for the entry '.noobaa-config-nsfs' and we wish to remove it
+    // in case the entry was deleted during the list it also inserts undefined
+    conns = conns.filter(item => item);
+
+    return conns;
+}
+
+////////////////////
+///// LIFECYCLE ////
+////////////////////
+
+/**
+ * lifecycle_management runs the nc lifecycle management
+ * @returns {Promise<void>}
+ */
+async function lifecycle_management(args) {
+    const disable_service_validation = get_boolean_or_string_value(args.disable_service_validation);
+    const disable_runtime_validation = get_boolean_or_string_value(args.disable_runtime_validation);
+    const short_status = get_boolean_or_string_value(args.short_status);
+    const should_continue_last_run = get_boolean_or_string_value(args.continue);
+    try {
+        const options = { disable_service_validation, disable_runtime_validation, short_status, should_continue_last_run };
+        const nc_lifecycle = new NCLifecycle(config_fs, options);
+        const { should_run, lifecycle_run_status } = await nc_lifecycle.run_lifecycle_under_lock();
+        if (should_run) {
+            write_stdout_response(ManageCLIResponse.LifecycleSuccessful, lifecycle_run_status);
+        } else {
+            write_stdout_response(ManageCLIResponse.LifecycleWorkerNotRunning);
+        }
+    } catch (err) {
+        dbg.error('manage_nsfs.lifecycle_management: Error while running run_lifecycle_under_lock', config_fs.config_json_path, err);
+        throw_cli_error(err);
+    }
 }
 
 exports.main = main;

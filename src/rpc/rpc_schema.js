@@ -33,8 +33,7 @@ class RpcSchema {
         this._ajv.addKeyword(schema_keywords.KEYWORDS.idate);
         this._ajv.addKeyword(schema_keywords.KEYWORDS.objectid);
         this._ajv.addKeyword(schema_keywords.KEYWORDS.binary);
-        if (global.window === global ||
-            (process.argv[1] && process.argv[1].includes('src/test/qa'))) {
+        if (global.window === global) {
             this._ajv.addKeyword(schema_keywords.KEYWORDS.wrapper_check_only);
         } else {
             this._ajv.addKeyword(schema_keywords.KEYWORDS.wrapper);
@@ -143,12 +142,6 @@ class RpcSchema {
     _generate_client_factory() {
         const client_proto = {
             RPC_BUFFERS,
-
-            async create_auth_token(params) {
-                const res = await this.auth.create_auth(params);
-                this.options.auth_token = res.token;
-                return res;
-            },
 
             async create_access_key_auth(params) {
                 const res = await this.auth.create_access_key_auth(params);
