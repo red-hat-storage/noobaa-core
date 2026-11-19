@@ -1,21 +1,27 @@
 /* Copyright (C) 2024 NooBaa */
 'use strict';
 
+const _ = require('lodash');
 const dbg = require('../util/debug_module')(__filename);
 const { ManageCLIError } = require('./manage_nsfs_cli_errors');
 const { UPGRADE_ACTIONS } = require('./manage_nsfs_constants');
+const { NCUpgradeManager } = require('../upgrade/nc_upgrade_manager');
 const { ManageCLIResponse } = require('../manage_nsfs/manage_nsfs_cli_responses');
-const { throw_cli_error, write_stdout_response } = require('./manage_nsfs_cli_utils');
+const { throw_cli_error, write_stdout_response, get_boolean_or_string_value } = require('./manage_nsfs_cli_utils');
+const { NoobaaEvent } = require('./manage_nsfs_events_utils');
+const { validate_expected_version } = require('./manage_nsfs_validations');
 
 /**
  * manage_upgrade_operations handles cli upgrade operations
  * @param {string} action 
+ * @param {string} user_input 
+ * @param {import('../sdk/config_fs').ConfigFS} config_fs
  * @returns {Promise<Void>}
  */
-async function manage_upgrade_operations(action, config_fs) {
+async function manage_upgrade_operations(action, user_input, config_fs) {
     switch (action) {
         case UPGRADE_ACTIONS.START:
-            await exec_config_dir_upgrade();
+            await start_config_dir_upgrade(user_input, config_fs);
             break;
         case UPGRADE_ACTIONS.STATUS:
             await get_upgrade_status(config_fs);
@@ -29,16 +35,39 @@ async function manage_upgrade_operations(action, config_fs) {
 }
 
 /**
- * exec_config_dir_upgrade handles cli upgrade operation
+ * start_config_dir_upgrade handles cli upgrade operation
+ * @param {Object} user_input
+ * @param {import('../sdk/config_fs').ConfigFS} config_fs
  * @returns {Promise<Void>}
  */
-async function exec_config_dir_upgrade() {
+async function start_config_dir_upgrade(user_input, config_fs) {
     try {
-        // TODO - add verifications and a call to the config directory upgrade
-        throw new Error('Upgrade Config Directory is not implemented yet');
+        const skip_verification = get_boolean_or_string_value(user_input.skip_verification);
+        const expected_version = user_input.expected_version;
+        const expected_hosts = user_input.expected_hosts && user_input.expected_hosts.split(',').filter(host => !_.isEmpty(host));
+        const custom_upgrade_scripts_dir = user_input.custom_upgrade_scripts_dir;
+
+        new NoobaaEvent(NoobaaEvent.CONFIG_DIR_UPGRADE_STARTED).create_event(undefined, { expected_version, expected_hosts }, undefined);
+
+        validate_expected_version(expected_version, skip_verification);
+        if (!expected_hosts) dbg.warn('expected_hosts flag is empty, config dir upgrade will be performed without hosts version verification');
+
+        const nc_upgrade_manager = new NCUpgradeManager(config_fs, { custom_upgrade_scripts_dir });
+        const upgrade_res = await nc_upgrade_manager.upgrade_config_dir(expected_version, expected_hosts, { skip_verification });
+        if (!upgrade_res) throw new Error('Upgrade config directory failed', { cause: upgrade_res });
+        write_stdout_response(
+            upgrade_res.code || ManageCLIResponse.UpgradeSuccessful,
+            upgrade_res.upgrade_info, { expected_version, expected_hosts }
+        );
     } catch (err) {
-        dbg.error('could not upgrade config directory successfully - err', err);
-        throw_cli_error({ ...ManageCLIError.UpgradeFailed, cause: err });
+        if (err instanceof ManageCLIError) {
+            // those are errors that the admin made in the CLI, the upgrade didn't start
+            // therefore, we won't report it as UpgradeFailed and without adding an event
+            throw err;
+        } else {
+            dbg.error('could not upgrade config directory successfully - error', err);
+            throw_cli_error({ ...ManageCLIError.UpgradeFailed, cause: err }, undefined, { error: err.stack || err });
+        }
     }
 }
 

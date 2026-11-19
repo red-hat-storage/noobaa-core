@@ -7,14 +7,18 @@ const net = require('net');
 const dbg = require('../../util/debug_module')(__filename);
 const s3_ops = require('./ops');
 const S3Error = require('./s3_errors').S3Error;
-const s3_bucket_policy_utils = require('./s3_bucket_policy_utils');
+const access_policy_utils = require('../../util/access_policy_utils');
 const s3_logging = require('./s3_bucket_logging');
 const time_utils = require('../../util/time_utils');
 const http_utils = require('../../util/http_utils');
 const signature_utils = require('../../util/signature_utils');
 const config = require('../../../config');
+const s3_utils = require('./s3_utils');
+const iam_utils = require('../iam/iam_utils');
 
 const S3_MAX_BODY_LEN = 4 * 1024 * 1024;
+
+const S3_AUTH_ERROR_CODES = new Set(['AccessDenied', 'InvalidAccessKeyId', 'SignatureDoesNotMatch', 'ExpiredToken', 'InvalidToken']);
 
 const S3_XML_ROOT_ATTRS = Object.freeze({
     xmlns: 'http://s3.amazonaws.com/doc/2006-03-01/'
@@ -35,7 +39,7 @@ const BUCKET_SUB_RESOURCES = Object.freeze({
     'policy': 'policy',
     'policyStatus': 'policy_status',
     'replication': 'replication',
-    'requestPayment': 'requestPayment',
+    'requestPayment': 'request_payment',
     'tagging': 'tagging',
     'uploads': 'uploads',
     'versioning': 'versioning',
@@ -44,7 +48,8 @@ const BUCKET_SUB_RESOURCES = Object.freeze({
     'encryption': 'encryption',
     'object-lock': 'object_lock',
     'legal-hold': 'legal_hold',
-    'retention': 'retention'
+    'retention': 'retention',
+    'publicAccessBlock': 'public_access_block'
 });
 
 const OBJECT_SUB_RESOURCES = Object.freeze({
@@ -57,6 +62,7 @@ const OBJECT_SUB_RESOURCES = Object.freeze({
     'legal-hold': 'legal_hold',
     'retention': 'retention',
     'select': 'select',
+    'attributes': 'attributes',
 });
 
 let usage_report = new_usage_report();
@@ -72,24 +78,17 @@ async function s3_rest(req, res) {
             try {
                 await s3_logging.send_bucket_op_logs(req, res); // logging again with error
             } catch (err1) {
-                dbg.error("Could not log bucket operation:", err1);
+                dbg.error("Could not log bucket operation (after handle_error):", err1);
             }
         }
     }
 }
 
 async function handle_request(req, res) {
+    req.start_time = Date.now();
 
     http_utils.validate_server_ip_whitelist(req);
     http_utils.set_amz_headers(req, res);
-    http_utils.set_cors_headers_s3(req, res);
-
-    if (req.method === 'OPTIONS') {
-        dbg.log1('OPTIONS!');
-        res.statusCode = 200;
-        res.end();
-        return;
-    }
 
     const headers_options = {
         ErrorClass: S3Error,
@@ -103,6 +102,13 @@ async function handle_request(req, res) {
         error_token_expired: S3Error.ExpiredToken,
         auth_token: () => signature_utils.make_auth_token_from_request(req)
     };
+    // AWS s3 returns an empty response when s3 request sends without host header.
+    if (!req.headers.host) {
+        dbg.warn('s3_rest: handle_request: S3 request is missing host header, header ', req.headers);
+        res.statusCode = 400;
+        res.end();
+        return;
+    }
     http_utils.check_headers(req, headers_options);
 
     const redirect = await populate_request_additional_info_or_redirect(req);
@@ -114,6 +120,18 @@ async function handle_request(req, res) {
     }
 
     const op_name = parse_op_name(req);
+    const cors = req.params.bucket && await req.object_sdk.read_bucket_sdk_cors_info(req.params.bucket);
+
+    http_utils.set_cors_headers_s3(req, res, cors);
+
+    if (req.method === 'OPTIONS') {
+        dbg.log1('s3_rest: handle_request : S3 request method is ', req.method);
+        const error_code = req.headers.origin && req.headers['access-control-request-method'] ? 403 : 400;
+        const res_headers = res.getHeaders(); // We will check if we found a matching rule - if no we will return error_code
+        res.statusCode = res_headers['access-control-allow-origin'] && res_headers['access-control-allow-methods'] ? 200 : error_code;
+        res.end();
+        return;
+    }
     const op = s3_ops[op_name];
     if (!op || !op.handler) {
         dbg.error('S3 NotImplemented', op_name, req.method, req.originalUrl);
@@ -125,6 +143,14 @@ async function handle_request(req, res) {
     authenticate_request(req);
     await authorize_request(req);
 
+    dbg.log2('S3 AUTH OK', {
+        request_id: req.request_id,
+        op: op_name,
+        bucket: req.params?.bucket,
+        key: req.params?.key,
+        client_ip: http_utils.parse_client_ip(req),
+        access_key: req.object_sdk?.get_auth_token()?.access_key?.slice(-4),
+    });
     dbg.log1('S3 REQUEST', req.method, req.originalUrl, 'op', op_name, 'request_id', req.request_id, req.headers);
     usage_report.s3_usage_info.total_calls += 1;
     usage_report.s3_usage_info[op_name] = (usage_report.s3_usage_info[op_name] || 0) + 1;
@@ -133,7 +159,7 @@ async function handle_request(req, res) {
         try {
             await s3_logging.send_bucket_op_logs(req); // logging intension - no result
         } catch (err) {
-            dbg.error("Could not log bucket operation:", err);
+            dbg.error(`Could not log bucket operation (before operation ${req.op_name}):`, err);
         }
     }
 
@@ -159,12 +185,13 @@ async function handle_request(req, res) {
 
     await http_utils.read_and_parse_body(req, options);
     const reply = await op.handler(req, res);
+    req.log_ts = new Date();
     http_utils.send_reply(req, res, reply, options);
     collect_bucket_usage(op, req, res);
     try {
-        await s3_logging.send_bucket_op_logs(req, res); // logging again with result
+        await s3_logging.send_bucket_op_logs(req, res, reply); // logging again with result
     } catch (err) {
-        dbg.error("Could not log bucket operation:", err);
+        dbg.error(`Could not log bucket operation (after operation ${req.op_name}):`, err);
     }
 
 }
@@ -203,34 +230,60 @@ function authenticate_request(req) {
 
 async function authorize_request(req) {
     await req.object_sdk.load_requesting_account(req);
-    await Promise.all([
-        req.object_sdk.authorize_request_account(req),
-        // authorize_request_policy(req) is supposed to
-        // allow owners access unless there is an explicit DENY policy
-        authorize_request_policy(req)
-    ]);
+    await req.object_sdk.authorize_request_account(req);
+    const extra_actions = extra_s3_actions_from_req(req);
+    const result_auth_iam_policy = await authorize_request_iam_policy(req, extra_actions);
+    const result_policy_auth = await authorize_request_policy(req, extra_actions);
+
+    if (result_policy_auth?.has_bucket_policy) {
+        _assert_s3_allowed_by_iam_and_bucket_policy(result_auth_iam_policy, result_policy_auth);
+    } else if (result_auth_iam_policy?.permission === 'IMPLICIT_DENY') {
+        _throw_iam_access_denied_error_for_s3_operation(
+            result_auth_iam_policy.account,
+            result_policy_auth?.method ?? _get_method_from_req(req),
+            result_auth_iam_policy.resource_arn,
+            result_auth_iam_policy.principal_arn,
+        );
+    }
 }
 
-async function authorize_request_policy(req) {
+/**
+ * authorize_request_policy evaluates bucket policy for the request.
+ * Extra header actions (Bypass, lock-on-upload) are passed into has_access_policy_permission.
+ * @param {nb.S3Request} req
+ * @param {string[]} [extra_actions]
+ * @returns {Promise<undefined|{ has_bucket_policy: boolean, is_owner: boolean, is_same_account: boolean, method: string|string[], bucket_policy_permission?: 'ALLOW'|'DENY'|'IMPLICIT_DENY' }>}
+ *   undefined when policy auth does not apply or access was already decided (for example: no bucket, put_bucket, anonymous, system owner).
+ *   object when IAM/bucket policy evaluation is needed — has_bucket_policy false without s3_policy, true with bucket_policy_permission set.
+ * @throws {S3Error} on explicit deny or unauthorized access
+ */
+async function authorize_request_policy(req, extra_actions = []) {
     if (!req.params.bucket) return;
     if (req.op_name === 'put_bucket') return;
-
     // owner_account is { id: bucket.owner_account, email: bucket.bucket_owner };
-    const { s3_policy, system_owner, bucket_owner, owner_account } = await req.object_sdk.read_bucket_sdk_policy_info(req.params.bucket);
+    const {
+        s3_policy,
+        system_owner,
+        bucket_owner,
+        bucket_owner_id,
+        owner_account,
+        public_access_block,
+    } = await req.object_sdk.read_bucket_sdk_policy_info(req.params.bucket);
+
+    dbg.log2('authorize_request_policy:', { bucket_owner, owner_account });
     const auth_token = req.object_sdk.get_auth_token();
     const arn_path = _get_arn_from_req_path(req);
     const method = _get_method_from_req(req);
 
     const is_anon = !(auth_token && auth_token.access_key);
     if (is_anon) {
-        await authorize_anonymous_access(s3_policy, method, arn_path, req);
+        await authorize_anonymous_access(s3_policy, method, arn_path, req, public_access_block, extra_actions);
         return;
     }
 
     const account = req.object_sdk.requesting_account;
-    const account_identifier_name = req.object_sdk.nsfs_config_root ? account.name.unwrap() : account.email.unwrap();
-    const account_identifier_id = req.object_sdk.nsfs_config_root ? account._id : undefined;
-
+    const is_nc_deployment = Boolean(req.object_sdk.nsfs_config_root);
+    const account_identifier_name = is_nc_deployment ? account.name.unwrap() : account.email.unwrap();
     // deny delete_bucket permissions from bucket_claim_owner accounts (accounts that were created by OBC from openshift\k8s)
     // the OBC bucket can still be delete by normal accounts according to the access policy which is checked below
     if (req.op_name === 'delete_bucket' && account.bucket_claim_owner) {
@@ -242,54 +295,188 @@ async function authorize_request_policy(req) {
     const is_system_owner = Boolean(system_owner) && system_owner.unwrap() === account_identifier_name;
     if (is_system_owner) return;
 
-    const is_owner = (function() {
-        if (account.bucket_claim_owner && account.bucket_claim_owner.unwrap() === req.params.bucket) return true;
-        if (owner_account && owner_account.id === account._id) return true;
-        if (account_identifier_name === bucket_owner.unwrap()) return true; // TODO: change it to root accounts after we will have the /users structure
-        return false;
-    }());
+    const is_owner = _is_bucket_owner(account, req.params.bucket, {
+        owner_account,
+        bucket_owner,
+        account_identifier_name,
+    });
 
+    const is_same_account = iam_utils.is_same_account_as_bucket_owner({
+        requesting_account: account, bucket_owner_id, owner_account, is_nc_deployment, is_owner,
+    });
     if (!s3_policy) {
         // in case we do not have bucket policy
         // we allow IAM account to access a bucket that is owned by their root account
-        const is_iam_account_and_same_root_account_owner = account.owner !== undefined &&
-            owner_account && account.owner === owner_account.id;
-        if (is_owner || is_iam_account_and_same_root_account_owner) return;
+        let is_iam_account_and_same_root_account_owner = false;
+        if (account.owner !== undefined) {
+            const owner_account_to_compare = is_nc_deployment ? (owner_account && owner_account.id) : bucket_owner_id;
+            is_iam_account_and_same_root_account_owner = iam_utils.get_owner_account_id(account) === String(owner_account_to_compare);
+        }
+        if (is_owner || is_iam_account_and_same_root_account_owner) {
+            return { has_bucket_policy: false, is_owner, is_same_account, method };
+        }
         throw new S3Error(S3Error.AccessDenied);
     }
-    let permission;
-    // In NC, we allow principal to be:
-    // 1. account name (for backwards compatibility)
-    // 2. account id
-    // we start the permission check on account identifier intentionally
-    if (account_identifier_id) {
-        permission = await s3_bucket_policy_utils.has_bucket_policy_permission(
-            s3_policy, account_identifier_id, method, arn_path, req);
-    }
-
-    if (!account_identifier_id || permission === "IMPLICIT_DENY") {
-        permission = await s3_bucket_policy_utils.has_bucket_policy_permission(
-            s3_policy, account_identifier_name, method, arn_path, req);
-    }
-
+    // in case we have bucket policy
+    //
+    // here an account can be represented in multiple formats in a policy principal - ID, Name or ARN
+    // checking all identifiers together is critical for correct policy evaluation:
+    //   - for Principal: if any identifier matches, the statement applies (grant access)
+    //   - for NotPrincipal: if any identifier matches, the account is excluded from the statement
+    //
+    // build an array of all account identifiers:
+    //   - ID and ARN are always included (ARN is the standard AWS format)
+    //   - NC also includes name for backward compatibility (root accounts only)
+    const account_identifiers = _get_account_identifiers(
+        account, is_nc_deployment, account_identifier_name);
+    const policy_opts = {
+        disallow_public_access: public_access_block?.restrict_public_buckets,
+        extra_methods: extra_actions,
+    };
+    const permission = await access_policy_utils.has_access_policy_permission(
+        s3_policy, account_identifiers, method, arn_path, req, policy_opts
+    );
+    dbg.log3('authorize_request_policy: permission', permission);
     if (permission === "DENY") throw new S3Error(S3Error.AccessDenied);
-    if (permission === "ALLOW" || is_owner) return;
 
+    let permission_by_owner;
+    // ARN and ID check for IAM users under the account
+    if (account.owner !== undefined) {
+        const owner_account_id = iam_utils.get_owner_account_id(account);
+        const owner_account_identifier_arn = access_policy_utils.create_arn_for_root(owner_account_id);
+        permission_by_owner = await access_policy_utils.has_access_policy_permission(
+            s3_policy, [owner_account_identifier_arn, owner_account_id], method, arn_path, req, policy_opts
+        );
+        dbg.log3('authorize_request_policy permission_by_arn_owner', permission_by_owner);
+        if (permission_by_owner === "DENY") throw new S3Error(S3Error.AccessDenied);
+    }
+
+    const bucket_policy_permission = access_policy_utils.bucket_policy_results_to_permission(permission, permission_by_owner);
+    return { has_bucket_policy: true, bucket_policy_permission, is_owner, is_same_account, method };
+}
+
+/**
+ * _assert_s3_allowed_by_iam_and_bucket_policy merges IAM and bucket policy results and throws on deny
+ * @param {object|undefined} result_iam_policy
+ * @param {object} result_policy_auth
+ */
+function _assert_s3_allowed_by_iam_and_bucket_policy(result_iam_policy, result_policy_auth) {
+    const { bucket_policy_permission, is_owner, is_same_account, method } = result_policy_auth;
+    if (is_owner) return;
+    if (!result_iam_policy) {
+        if (bucket_policy_permission === 'ALLOW') return;
+        throw new S3Error(S3Error.AccessDenied);
+    }
+    const iam_policy_permission = result_iam_policy.permission;
+
+    const allowed = access_policy_utils.is_allowed_by_iam_and_bucket_policy({ iam_policy_permission, bucket_policy_permission, is_owner,
+        is_same_account });
+    if (allowed) return;
+
+    if (iam_policy_permission === 'DENY') {
+        _throw_iam_access_denied_error_for_s3_operation(result_iam_policy.account, method,
+            result_iam_policy.resource_arn, result_iam_policy.principal_arn);
+    }
     throw new S3Error(S3Error.AccessDenied);
 }
 
-async function authorize_anonymous_access(s3_policy, method, arn_path, req) {
+/**
+ * Extra S3 actions from request headers (Bypass, lock-on-upload).
+ * Same role as `_get_method_from_req`: map the request to action names.
+ * Passed through IAM and bucket policy as extra_methods.
+ * No header → empty list → extra-auth is a no-op.
+ * @param {nb.S3Request} req
+ * @returns {string[]}
+ */
+function extra_s3_actions_from_req(req) {
+    const actions = [];
+    if (s3_utils.is_bypass_governance_requested(req)) {
+        actions.push(access_policy_utils.EXTRA_S3_ACTIONS.bypass_governance);
+    }
+    if (s3_utils.is_object_lock_legal_hold_requested(req)) {
+        actions.push(access_policy_utils.EXTRA_S3_ACTIONS.object_lock_legal_hold);
+    }
+    if (s3_utils.is_object_lock_retention_requested(req)) {
+        actions.push(access_policy_utils.EXTRA_S3_ACTIONS.object_lock_retention);
+    }
+    return actions;
+}
+
+function _is_bucket_owner(account, bucket_name, {
+    owner_account, bucket_owner, account_identifier_name,
+}) {
+    // Containerized: bucket_claim_owner or email
+    if (account.bucket_claim_owner && account.bucket_claim_owner.unwrap() === bucket_name) return true;
+    // NC: owner id is unique; name is last for backward compatibility
+    if (owner_account && owner_account.id === account._id) return true;
+    if (account.owner === undefined && Boolean(bucket_owner) &&
+        account_identifier_name === bucket_owner.unwrap()) return true;
+    return false;
+}
+
+function _get_account_identifiers(account, is_nc_deployment, account_identifier_name) {
+    const account_identifier_id = access_policy_utils.get_account_identifier_id(is_nc_deployment, account);
+    const account_identifier_arn = access_policy_utils.get_policy_principal_arn(account);
+    const account_identifiers = [];
+    if (account_identifier_id) account_identifiers.push(account_identifier_id);
+    if (is_nc_deployment && account.owner === undefined) account_identifiers.push(account_identifier_name);
+    account_identifiers.push(account_identifier_arn);
+    return account_identifiers;
+}
+
+async function authorize_request_iam_policy(req, extra_actions = []) {
+    const method = _get_method_from_req(req);
+    const bucket_name = req.params.bucket;
+
+    const authorize_result = await iam_utils.authorize_request_iam_policy_impl(
+        req, method, bucket_name, 's3', extra_actions);
+    if (!authorize_result) return;
+
+    // Only explicit IAM Deny throws here. IMPLICIT_DENY is deferred to bucket policy merge
+    if (authorize_result.invalid_assumed_role_session || authorize_result.permission === 'DENY') {
+        _throw_iam_access_denied_error_for_s3_operation(
+            authorize_result.account,
+            method,
+            authorize_result.resource_arn,
+            authorize_result.principal_arn
+        );
+    }
+    return authorize_result;
+}
+
+function _throw_iam_access_denied_error_for_s3_operation(requesting_account, method, resource_arn, principal_arn) {
+    const message_with_details = iam_utils.create_detailed_message_for_iam_user_access(
+        requesting_account,
+        method,
+        resource_arn,
+        principal_arn
+    );
+    const { code, http_code } = S3Error.AccessDenied;
+    throw new S3Error({ code, message: message_with_details, http_code});
+}
+
+async function authorize_anonymous_access(s3_policy, method, arn_path, req, public_access_block, extra_actions = []) {
     if (!s3_policy) throw new S3Error(S3Error.AccessDenied);
 
-    const permission = await s3_bucket_policy_utils.has_bucket_policy_permission(
-        s3_policy, undefined, method, arn_path, req);
+    const permission = await access_policy_utils.has_access_policy_permission(
+        s3_policy, undefined, method, arn_path, req,
+        {
+            disallow_public_access: public_access_block?.restrict_public_buckets,
+            extra_methods: extra_actions,
+        }
+    );
     if (permission === "ALLOW") return;
 
     throw new S3Error(S3Error.AccessDenied);
 }
 
+/**
+ * _get_method_from_req parses the permission needed according to the bucket policy
+ * @param {nb.S3Request} req
+ * @returns {string|string[]}
+ */
 function _get_method_from_req(req) {
-    const s3_op = s3_bucket_policy_utils.OP_NAME_TO_ACTION[req.op_name];
+    const s3_op = access_policy_utils.OP_NAME_TO_ACTION[req.op_name];
     if (!s3_op) {
         dbg.error(`Got a not supported S3 op ${req.op_name} - doesn't suppose to happen`);
         throw new S3Error(S3Error.InternalError);
@@ -301,6 +488,7 @@ function _get_method_from_req(req) {
 }
 
 function _get_arn_from_req_path(req) {
+    if (!req.params.bucket) return;
     const bucket = req.params.bucket;
     const key = req.params.key;
     let arn_path = `arn:aws:s3:::${bucket}`;
@@ -354,6 +542,14 @@ function get_bucket_and_key(req) {
             key = suffix;
         }
     }
+
+    if (key?.length && !s3_utils.verify_string_byte_length(key, config.S3_MAX_KEY_LENGTH)) {
+        throw new S3Error(S3Error.KeyTooLongError);
+    }
+    if (bucket?.length && !s3_utils.verify_string_byte_length(bucket, config.S3_MAX_BUCKET_NAME_LENGTH)) {
+        throw new S3Error(S3Error.InvalidBucketName);
+    }
+
     return {
         bucket,
         // decode and replace hadoop _$folder$ in key
@@ -412,7 +608,7 @@ function _prepare_error(req, res, err) {
             if (res.headersSent) {
                 dbg.log0('Sent reply in body, bit too late for Etag header');
             } else {
-                res.setHeader('ETag', err.rpc_data.etag);
+                res.setHeader('ETag', '"' + err.rpc_data.etag + '"');
             }
         }
         if (err.rpc_data.last_modified) {
@@ -442,16 +638,35 @@ function _prepare_error(req, res, err) {
     return s3err;
 }
 
+function _log_s3_request_error(req, err, s3err, reply) {
+    if (s3err.code === 'NoSuchKey' && (req.method === 'GET' || req.method === 'HEAD')) {
+        dbg.log1('S3 NoSuchKey', req.method, req.originalUrl, req.request_id);
+    } else {
+        dbg.error('S3 ERROR', reply,
+            req.method, req.originalUrl,
+            JSON.stringify(req.headers),
+            err.stack || err,
+            err.context ? `- context: ${err.context?.trim()}` : '',
+        );
+    }
+}
+
 function handle_error(req, res, err) {
     const s3err = _prepare_error(req, res, err);
 
     const reply = s3err.reply(req.originalUrl, req.request_id);
-    dbg.error('S3 ERROR', reply,
-        req.method, req.originalUrl,
-        JSON.stringify(req.headers),
-        err.stack || err,
-        err.context ? `- context: ${err.context?.trim()}` : '',
-    );
+    if (S3_AUTH_ERROR_CODES.has(s3err.code)) {
+        dbg.error('S3 AUTH FAILURE', {
+            request_id: req.request_id,
+            code: s3err.code,
+            op: req.op_name,
+            bucket: req.params?.bucket,
+            client_ip: http_utils.parse_client_ip(req),
+            access_key: req.object_sdk?.get_auth_token()?.access_key?.slice(-4),
+            duration_ms: req.start_time ? Date.now() - req.start_time : undefined,
+        });
+    }
+    _log_s3_request_error(req, err, s3err, reply);
     if (res.headersSent) {
         dbg.log0('Sending error xml in body, but too late for headers...');
     } else {
@@ -478,10 +693,7 @@ async function _handle_html_response(req, res, err) {
         </body> \
         </html>`;
     res.statusCode = s3err.http_code;
-    dbg.error('S3 ERROR', reply,
-        req.method, req.originalUrl,
-        JSON.stringify(req.headers),
-        err.stack || err);
+    _log_s3_request_error(req, err, s3err, reply);
     res.setHeader('Content-Type', 'text/html');
     res.setHeader('Content-Length', Buffer.byteLength(reply));
     res.end(reply);

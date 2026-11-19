@@ -76,10 +76,10 @@ Run `NC mocha tests` with root permissions -
 * Run `NC mocha` tests **locally** -  
   **Warning:** Running tests locally will do changes to your file system.
     * Run **all** NC mocha tests locally -  
-        Command: `sudo NC_CORETEST=true node node_modules/mocha/bin/mocha src/test/unit_tests/nc_index.js`.  
+        Command: `sudo NC_CORETEST=true node node_modules/mocha/bin/mocha src/test/utils/index/nc_index.js`.  
 
     * Run **a single** mocha test locally -  
-        Command: `sudo NC_CORETEST=true node node_modules/mocha/bin/mocha src/test/unit_tests/{test_name}.js`.   
+        Command: `sudo NC_CORETEST=true node node_modules/mocha/bin/mocha src/test/{test_type}/{test_name}.js`.   
 
 * Run `NC jest tests` - 
     * Command: `sudo jest --testRegex=jest_tests/test_nc`. 
@@ -87,25 +87,36 @@ Run `NC mocha tests` with root permissions -
 
 #### NC mocha tests 
 The following is a list of `NC mocha test` files -   
-1. `test_nc_nsfs_cli.js` - Tests NooBaa CLI.  
-2. `test_nc_nsfs_health` - Tests NooBaa Health CLI.  
+1. `test_nc_cli.js` - Tests NooBaa CLI.  
+2. `test_nc_health` - Tests NooBaa Health CLI.  
 3. `test_nsfs_glacier_backend.js` - Tests NooBaa Glacier Backend.  
+4. `test_nc_with_a_couple_of_forks.js` - Tests the `bucket_namespace_cache` when running with a couple of forks. Please notice that it uses `nc_coretest` with setup that includes a couple of forks.
+5. `test_nc_online_upgrade_s3_integrations.js` - Tests S3 operations during mocked config directory upgrade.
 
 #### NC Jest test files
 The following is a list of `NC jest tests` files -   
 1. `test_nc_account_invalid_mkm_integration.test.js` - Tests NC invalid master key manager scenarios.  
 2. `test_nc_master_keys.test.js` - Tests NC master key manager (store type = file).  
 3. `test_nc_master_keys_exec.test.js` - Tests NC master key manager (store type = executable).  
-4. `test_nc_nsfs_bucket_cli.test.js` - Tests NooBaa CLI bucket commands.  
-5. `test_nc_nsfs_account_cli.test.js` - Tests NooBaa CLI account commands.  
-6. `test_nc_nsfs_anonymous_cli.test.js` - Tests NooBaa CLI anonymous account commands.  
+4. `test_nc_bucket_cli.test.js` - Tests NooBaa CLI bucket commands.  
+5. `test_nc_account_cli.test.js` - Tests NooBaa CLI account commands.  
+6. `test_nc_anonymous_cli.test.js` - Tests NooBaa CLI anonymous account commands.  
 7. `test_nc_nsfs_config_schema_validation.test.js` - Tests NC config.json schema validation.  
 8. `test_nc_nsfs_bucket_schema_validation.test.js` - Tests NC bucket schema validation.  
 9. `test_nc_nsfs_account_schema_validation.test.js` - Tests NC account schema validation.  
 10. `test_nc_nsfs_new_buckets_path_validation.test.js` - Tests new_buckets_path RW access.  
 11. `test_config_fs.test.js` - Tests ConfigFS methods.
-12. `test_nsfs_concurrency` - Tests concurrent operations.
-13. `test_versioning_concurrency` - Tests concurrent operations on versioned enabled bucket.
+12. `test_nsfs_concurrency.test.js` - Tests concurrent operations.
+13. `test_versioning_concurrency.test.js` - Tests concurrent operations on versioned enabled bucket.
+14. `test_config_dir_restructure_upgrade_script.test.js` - Tests of the config directory restructure upgrade script.
+15. `test_config_dir_structure.test.js` - Tests of the configFS functions created for the new config directory structure.
+16. `test_config_fs_backward_compatibility.test.js` - Tests of the backwards compatibility of configFS functions.
+17. `test_nc_upgrade_manager.test.js` - Tests of the NC upgrade manager.
+18. `test_cli_upgrade.test.js` - Tests of the upgrade CLI commands.
+19. `test_nc_online_upgrade_cli_integrations.test.js` - Tests CLI commands during mocked config directory upgrade.
+20. `test_nc_connection_cli.test.js` - Tests NooBaa CLI connection commands.
+21. `test_nc_lifecycle_posix_integration.test` - Tests NC lifecycle POSIX related configuration.
+(Note: in this layer we do not test the validation related to lifecycle configuration and it is done in `test_lifecycle.js` - which currently is running only in containerized deployment, but it is mutual code)
 
 #### nc_index.js File
 * The `nc_index.js` is a file that runs several NC and NSFS mocha related tests.  
@@ -114,7 +125,7 @@ The following is a list of `NC jest tests` files -
 #### nc_coretest.js File
 * The `nc_coretest.js` is a file that runs setup and teardown before/after NC integration tests run.  
 * Moreover, `nc_coretest.js` includes mapping between RPC API calls to NooBaa CLI calls in order to be able to run same integration tests on both containerized and non containerized deployments.  
-* Use `NC_CORETEST=true` environment variable when running NC NSFS integration test (test_bucketspace.js).
+* Use `NC_CORETEST=true` environment variable when running NC NSFS integration test (test_nsfs_integration.js).
 
 ##### Differences Between Containerized and Non Containerized
 * `new_buckets_path` -
@@ -151,10 +162,10 @@ Run `NSFS tests` with root permissions -
 * Run `NSFS mocha` tests **locally** -  
   **Warning:** Running tests locally will do changes to your file system.
     * Run **all** NSFS mocha tests locally -  
-        Command: `sudo node node_modules/mocha/bin/mocha src/test/unit_tests/sudo_index.js`.  
+        Command: `sudo node node_modules/mocha/bin/mocha src/test/utils/index/sudo_index.js`.  
 
     * Run **a single** mocha test locally -  
-        Command: `sudo node node_modules/mocha/bin/mocha src/test/unit_tests/{test_name}.js`.   
+        Command: `sudo node node_modules/mocha/bin/mocha src/test/{test_type}/{test_name}.js`.   
 
 
 #### NSFS Tests Files List
@@ -164,7 +175,7 @@ Consequently, there are now distinct test files, each with a unique scope -
 1. `test_namespace_fs.js` - Tests NamespaceFS API.
 2. `test_ns_list_objects.js` - Tests NamespaceFS list objects API.
 3. `test_nsfs_access.js` - Tests uid and gid accessibility of Napi native code.  
-4. `test_bucketspace.js` - Tests s3 flows on top of NSFS namespace resources.
+4. `test_nsfs_integration.js` - Tests s3 flows on top of NSFS namespace resources.
 5. `test_nb_native_fs.js` - Tests Napi native code.
 6. `test_nb_native_gpfs.js` - Tests Napi native code on top of GPFS.
 7. `test_nsfs_versioning.js` - Tests NamespaceFS versioning API.

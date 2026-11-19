@@ -7,10 +7,12 @@ const crypto = require('crypto');
 const config = require('../../../config');
 const db_client = require('../../util/db_client').instance();
 const dbg = require('../../util/debug_module')(__filename);
+const js_utils = require('../../util/js_utils');
 const SensitiveString = require('../../util/sensitive_string');
 const LRUCache = require('../../util/lru_cache');
 const fs = require('fs');
 const path = require('path');
+const P = require('../../util/promise');
 
 // dummy object id of root key
 const ROOT_KEY = '00000000aaaabbbbccccdddd';
@@ -36,7 +38,7 @@ class MasterKeysManager {
                     decipher = crypto.createDecipheriv(m_key.cipher_type, m_key.cipher_key, m_key.cipher_iv);
                 }
                 return new SensitiveString(decipher.update(
-                Buffer.from(params.encrypted_value, 'base64')).toString());
+                    Buffer.from(params.encrypted_value, 'base64')).toString());
             }
         });
     }
@@ -86,18 +88,20 @@ class MasterKeysManager {
         this.last_load_time = new Date();
         const root_keys = await fs.promises.readdir(config.ROOT_KEY_MOUNT);
         const active_root_key_id = await fs.promises.readFile(active_root_key_path, 'utf8');
-        for (const key_id of root_keys) {
-            // skipping file named active_root_key - as we already handled it
-            // also skipping some garbage files k8s adding to the mount
-            if (key_id === 'active_root_key' || key_id.startsWith('..')) continue;
+        this.active_root_key = active_root_key_id;
+        dbg.log0(`load_root_keys_from_mount: Root keys was updated at: ${this.last_load_time}. ` +
+            `active root key is: ${this.active_root_key}`);
+        // we won't load the active_root_key and not keys starting with '..'
+        const filtered_root_keys = root_keys.filter(key_id => key_id !== 'active_root_key' && !key_id.startsWith('..'));
+        // we will load newer keys first - active key will be first(sorting by epoch)
+        const sorted_keys = filtered_root_keys.sort(js_utils.sort_compare_by(key_id => Number(key_id.split('-')[1]), -1));
+        await P.map_with_concurrency(20, sorted_keys, async key_id => {
             const current_key_path = path.join(config.ROOT_KEY_MOUNT, key_id);
             const key_cipher = await fs.promises.readFile(current_key_path, 'utf8');
             const r_key = this._add_to_resolved_keys(key_id, key_cipher, key_id !== active_root_key_id);
             this.root_keys_by_id[key_id] = r_key;
-        }
-        this.active_root_key = active_root_key_id;
-        dbg.log0(`load_root_keys_from_mount: Root keys was updated at: ${this.last_load_time}. ` +
-            `active root key is: ${this.active_root_key}`);
+        });
+        dbg.log0(`load_root_keys_from_mount: done loading all root_keys from mount: ${sorted_keys.length} keys.`);
         this.is_initialized = true;
     }
 
@@ -162,7 +166,7 @@ class MasterKeysManager {
         if (this.is_root_key(_id)) return this.get_root_key();
         const mkey = this.master_keys_by_id[_id.toString()];
         const rkey = this.root_keys_by_id[_id.toString()];
-        if (!mkey && !rkey) throw new Error('NO_SUCH_KEY');
+        if (!mkey && !rkey) throw new Error('NO_SUCH_KEY: ' + _id.toString());
         return this.resolved_master_keys_by_id[_id.toString()] ||
             (mkey && this._resolve_master_key(mkey));
     }
@@ -298,7 +302,7 @@ class MasterKeysManager {
         if (!_id) throw new Error(`set_m_key_disabled_val: master key id ${_id} was not found`);
         const m_key = this.get_master_key_by_id(_id);
         if (!m_key) throw new Error('NO_SUCH_KEY');
-        this.resolved_master_keys_by_id[_id.toString()] = {...m_key, disabled: val };
+        this.resolved_master_keys_by_id[_id.toString()] = { ...m_key, disabled: val };
     }
 
     remove_secret_key_pair_from_cache(old_encrypted_sec_key) {

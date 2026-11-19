@@ -1,0 +1,16 @@
+name: Hadoop S3A NC Tests
+on: [workflow_call, workflow_dispatch]
+
+jobs:
+  hadoop-s3a-nc-tests:
+    name: Hadoop S3A NC Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run Hadoop S3A tests
+        run: |
+          set -euo pipefail
+          make hadoop-s3a-nc-tests

@@ -1,6 +1,8 @@
 /* Copyright (C) 2016 NooBaa */
 'use strict';
 
+/* eslint-disable max-statements */
+
 // load .env file before any other modules so that it will contain
 // all the arguments even when the modules are loading.
 require('../util/dotenv').load();
@@ -19,12 +21,14 @@ const lifecycle = require('./bg_services/lifecycle');
 const cluster_hb = require('./bg_services/cluster_hb');
 const server_rpc = require('./server_rpc');
 const db_client = require('../util/db_client');
+const { MessageQueueType } = require('../util/message_queue_client');
 const { BucketsReclaimer } = require('./bg_services/buckets_reclaimer');
 const { ObjectsReclaimer } = require('./bg_services/objects_reclaimer');
+const { LifecycleReclaimer } = require('./bg_services/lifecycle_reclaimer');
+const { RestoreWorker } = require('./bg_services/restore_worker');
 const { MirrorWriter } = require('./bg_services/mirror_writer');
 const { TieringTTFWorker } = require('./bg_services/tier_ttf_worker');
 const { TieringSpillbackWorker } = require('./bg_services/tier_spillback_worker');
-const cluster_master = require('./bg_services/cluster_master');
 const AgentBlocksVerifier = require('./bg_services/agent_blocks_verifier').AgentBlocksVerifier;
 const AgentBlocksReclaimer = require('./bg_services/agent_blocks_reclaimer').AgentBlocksReclaimer;
 const stats_aggregator = require('./system_services/stats_aggregator');
@@ -38,23 +42,16 @@ const background_scheduler = require('../util/background_scheduler').get_instanc
 const stats_collector = require('./bg_services/stats_collector');
 const dedup_indexer = require('./bg_services/dedup_indexer');
 const db_cleaner = require('./bg_services/db_cleaner');
+const message_queue_cleaner = require('./bg_services/message_queue_cleaner');
 const { KeyRotator } = require('./bg_services/key_rotator');
 const prom_reporting = require('./analytic_services/prometheus_reporting');
 const { TieringTTLWorker } = require('./bg_services/tier_ttl_worker');
+const { Notificator } = require('../util/notifications_util');
+const system_store = require('./system_services/system_store').get_instance();
+const api = require('../api');
+const bg_task_executor = require('./bg_services/bg_task_executor');
 
-const MASTER_BG_WORKERS = [
-    'scrubber',
-    'mirror_writer',
-    'tier_mover',
-    'system_server_stats_aggregator',
-    'md_aggregator',
-    'usage_aggregator',
-    'dedup_indexer',
-    'db_cleaner',
-    'agent_blocks_verifier',
-    'agent_blocks_reclaimer',
-    'key_rotator'
-];
+const BG_WORKERS_MODES = Object.freeze({ DEFAULT: 'default', EXECUTOR: 'executor' });
 
 function register_rpc() {
     server_rpc.register_bg_services();
@@ -68,15 +65,8 @@ function register_rpc() {
 }
 
 const register_bg_worker =
-    (worker, run_batch_function) =>
-    background_scheduler.register_bg_worker(worker, run_batch_function);
-
-function remove_master_workers() {
-    MASTER_BG_WORKERS.forEach(worker_name => {
-        background_scheduler.remove_background_worker(worker_name);
-    });
-
-}
+    (worker, run_batch_function, pre_batch_fn) =>
+    background_scheduler.register_bg_worker(worker, run_batch_function, pre_batch_fn);
 
 function run_master_workers() {
     register_bg_worker({
@@ -164,6 +154,14 @@ function run_master_workers() {
         dbg.warn('OBJECT_RECLAIMER NOT ENABLED');
     }
 
+    if (config.LIFECYCLE_RECLAIMER_ENABLED) {
+        register_bg_worker(new LifecycleReclaimer({
+            name: 'lifecycle_reclaimer',
+        }));
+    } else {
+        dbg.warn('LIFECYCLE_RECLAIMER NOT ENABLED');
+    }
+
     if (config.TIER_TTF_WORKER_ENABLED) {
         register_bg_worker(new TieringTTFWorker({
             name: 'tier_ttf_worker',
@@ -214,7 +212,11 @@ function run_master_workers() {
         register_bg_worker({
             name: 'lifecycle',
             delay: config.LIFECYCLE_INTERVAL,
-        }, lifecycle.background_worker);
+            run_immediate: true,
+        },
+            lifecycle.background_worker,
+            lifecycle.cleanup,
+        );
     }
 
     if (config.STATISTICS_COLLECTOR_ENABLED) {
@@ -236,26 +238,59 @@ function run_master_workers() {
             client: server_rpc.client
         }));
     }
+
+    if (config.NOTIFICATION_LOG_DIR) {
+        register_bg_worker(new Notificator({
+            name: 'Notificator',
+            client: server_rpc.client,
+        }));
+    } else {
+        dbg.warn('NOTIFICATIONS NOT ENABLED');
+    }
+
+    if (config.RESTORE_WORKER_ENABLED) {
+        register_bg_worker(new RestoreWorker({
+            name: 'restore_worker',
+        }));
+    } else {
+        dbg.warn('RESTORE_WORKER NOT ENABLED');
+    }
 }
 
+/**
+ * Uses BG_WORKERS_MODE, or default when that env var is unset.
+ * @returns {Promise<void>}
+ */
 async function main() {
+    const mode = get_bg_workers_mode();
+    dbg.log0(`BGWorkers mode=${mode}`);
+    if (mode === BG_WORKERS_MODES.EXECUTOR) {
+        // Install before any await so a SIGTERM during startup still exits.
+        install_executor_sigterm_handler();
+    }
+
     if (process.env.NOOBAA_LOG_LEVEL) {
         const dbg_conf = debug_config.get_debug_config(process.env.NOOBAA_LOG_LEVEL);
         dbg_conf.core.map(module => dbg.set_module_level(dbg_conf.level, module));
     }
 
-    db_client.instance().connect();
-    register_rpc();
+    // Applies MGMT_ADDR / MD_ADDR / BG_ADDR / HOSTED_AGENTS_ADDR to the process RPC router.
+    server_rpc.rpc.router = api.new_router_from_env(process.env);
+
+    await Promise.all([
+        db_client.instance().connect(),
+        register_rpc(),
+    ]);
 
     //Set KeepAlive to all http/https agents in bg_workers
     http_utils.update_http_agents({ keepAlive: true });
     http_utils.update_https_agents({ keepAlive: true });
 
-    register_bg_worker({
-        name: 'cluster_master_publish',
-        delay: config.CLUSTER_MASTER_INTERVAL,
-        run_immediate: true
-    }, cluster_master.background_worker);
+    if (mode === BG_WORKERS_MODES.EXECUTOR) {
+        await setup_bg_workers_executor();
+        return;
+    }
+
 
     register_bg_worker({
         name: 'cluster_heartbeat_writer',
@@ -263,14 +298,80 @@ async function main() {
         run_immediate: true
     }, cluster_hb.do_heartbeat);
 
-    // Try to start the bg workers metrics server
-    await prom_reporting.start_server(config.BG_METRICS_SERVER_PORT);
+    if (config.MESSAGE_QUEUE_CLEANER_ENABLED) {
+        register_bg_worker({
+            name: 'message_queue_cleaner',
+            delay: config.MESSAGE_QUEUE_CLEANER_ERROR_DELAY,
+            run_immediate: true,
+        }, message_queue_cleaner.background_worker);
+    } else {
+        dbg.warn('MESSAGE QUEUE CLEANER NOT ENABLED');
+    }
 
-    dbg.log('BG Workers Server started');
+    // HTTPS only. The serving cert is /etc/bg-secret, or a generated cert when that dir is missing.
+    await prom_reporting.start_server(0, config.BG_METRICS_SERVER_SSL_PORT);
+
+    dbg.log0('BGWorkers waiting for SystemStore load...');
+    await system_store.wait_for_load();
+    dbg.log0('BGWorkers SystemStore loaded, starting master workers');
+    run_master_workers();
+}
+
+/**
+ * Connect, load the system store, and drain the task queues.
+ * Returns without workers when there is no queue.
+ * @returns {Promise<void>}
+ */
+async function setup_bg_workers_executor() {
+    dbg.set_process_name('BGWorkersExecutor');
+    // Executor mode with no queue is a misconfiguration: this process only drains queues.
+    if (config.MESSAGE_QUEUE_TYPE === MessageQueueType.NONE) {
+        dbg.warn(`BGWorkers executor mode: MESSAGE_QUEUE_TYPE=${MessageQueueType.NONE} is a misconfiguration, there is no queue to drain`);
+        return;
+    }
+
+    dbg.log0('BGWorkers executor waiting for SystemStore load...');
+    await system_store.wait_for_load();
+
+    dbg.log0('BGWorkers executor mode, starting task executor');
+    await bg_task_executor.get_instance(server_rpc.client).init();
+}
+
+/**
+ * default runs the scanners and the other background workers.
+ * executor only drains the queues, so more of these processes can share the work without scanning.
+ * An omitted mode uses BG_WORKERS_MODE, or default when that env var is unset.
+ * @param {string} [mode]
+ * @returns {string}
+ */
+function get_bg_workers_mode(mode = process.env.BG_WORKERS_MODE || BG_WORKERS_MODES.DEFAULT) {
+    if (Object.values(BG_WORKERS_MODES).includes(mode)) return mode;
+    const str = `invalid BG_WORKERS_MODE: ${mode}`;
+    dbg.error(str);
+    throw new Error(str);
+}
+
+/** @type {(() => void)|undefined} */
+let executor_sigterm_handler;
+
+/**
+ * Installs a SIGTERM handler so executor pods exit promptly.
+ * When Node is PID 1, Linux ignores the default SIGTERM disposition until a handler is installed.
+ * @returns {void}
+ */
+function install_executor_sigterm_handler() {
+    if (executor_sigterm_handler) return;
+    executor_sigterm_handler = () => {
+        dbg.log0('executor mode: got SIGTERM, exiting');
+        process.exit(0);
+    };
+    process.once('SIGTERM', executor_sigterm_handler);
 }
 
 exports.main = main;
 exports.run_master_workers = run_master_workers;
-exports.remove_master_workers = remove_master_workers;
+exports.BG_WORKERS_MODES = BG_WORKERS_MODES;
+exports.get_bg_workers_mode = get_bg_workers_mode;
+exports.install_executor_sigterm_handler = install_executor_sigterm_handler;
 
 if (require.main === module) main();

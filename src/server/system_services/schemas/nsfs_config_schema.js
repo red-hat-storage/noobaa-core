@@ -62,10 +62,6 @@ const nsfs_node_config_schema = {
             type: 'number',
             doc: 'number of nsfs buffer pool memory limit, suggested values 1-4GB, service restart required'
         },
-        NSFS_BUF_SIZE: {
-            type: 'number',
-            doc: 'number of nsfs buffer size, service restart required'
-        },
         NSFS_OPEN_READ_MODE: {
             type: 'string',
             doc: `describes the mode of open for read, use 'rd' for direct-io reads, hot reload`
@@ -146,6 +142,35 @@ const nsfs_node_config_schema = {
             type: 'boolean',
             doc: 'This flag will decide whether need to push logs to the console or not.'
         },
+        NOTIFICATION_REQ_PER_SPACE_CHECK: {
+            type: 'number',
+            doc: 'Number of pending notifications per node in between of free space check. 0 to disable.'
+        },
+        NOTIFICATION_SPACE_CHECK_THRESHOLD: {
+            type: 'number',
+            doc: 'Fraction (more than 0, less than 1) of free blocks in, below which free space check creates an event.'
+        },
+        NC_LIFECYCLE_TIMEOUT_MS: {
+            type: 'number',
+            doc: 'The timeout of NC lifecycle worker in milliseconds.'
+        },
+        NC_LIFECYCLE_LOGS_DIR: {
+            type: 'string',
+            doc: 'The directory in which NC lifecycle worker writes logs'
+        },
+        NC_LIFECYCLE_RUN_TIME: {
+            type: 'string',
+            doc: 'NC lifecycle worker run time, worker running on different time will not be able to start, format "HH:MM"'
+        },
+        NC_LIFECYCLE_RUN_DELAY_LIMIT_MINS: {
+            type: 'number',
+            doc: 'Configures the delay tolerance in minutes. Default is 2 minutes.'
+        },
+        NC_LIFECYCLE_TZ: {
+            type: 'string',
+            enum: ['UTC', 'LOCAL'],
+            doc: 'The timezone used for calculating NC lifecycle worker run time. Default is LOCAL.'
+        }
     }
 };
 
