@@ -18,11 +18,14 @@ config-local.js
 /storage/
 
 ## DEVELOPER
+.cursor
 .vscode
 .idea
 *.sublime*
 .DS_Store
 heapdump-*
+.cache
+.clangd
 
 ## PRIVATE
 *.pem

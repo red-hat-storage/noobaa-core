@@ -19,7 +19,23 @@ const RPC_ERRORS_TO_IAM = Object.freeze({
     INVALID_ACCESS_KEY_ID: IamError.InvalidClientTokenId,
     DEACTIVATED_ACCESS_KEY_ID: IamError.InvalidClientTokenIdInactiveAccessKey,
     NO_SUCH_ACCOUNT: IamError.AccessDeniedException,
-    NO_SUCH_ROLE: IamError.AccessDeniedException
+    NO_SUCH_ROLE: IamError.AccessDeniedException,
+    VALIDATION_ERROR: IamError.ValidationError,
+    INVALID_INPUT: IamError.InvalidInput,
+    MALFORMED_POLICY_DOCUMENT: IamError.MalformedPolicyDocument,
+    ENTITY_ALREADY_EXISTS: IamError.EntityAlreadyExists,
+    CONFLICT: IamError.ConcurrentModification,
+    NO_SUCH_ENTITY: IamError.NoSuchEntity,
+    CONCURRENT_MODIFICATION: IamError.ConcurrentModification,
+    LIMIT_EXCEEDED: IamError.LimitExceeded,
+    SERVICE_FAILURE: IamError.ServiceFailure,
+    DELETE_CONFLICT: IamError.DeleteConflict,
+    ENTITY_TEMPORARILY_UNMODIFIABLE: IamError.EntityTemporarilyUnmodifiable,
+    INVALID_PARAMETER_VALUE: IamError.InvalidParameterValue,
+    EXPIRED_TOKEN: IamError.ExpiredToken,
+    ACCESS_DENIED_EXCEPTION: IamError.AccessDeniedException,
+    NOT_AUTHORIZED: IamError.NotAuthorized,
+    INTERNAL_FAILURE: IamError.InternalFailure,
 });
 
 const ACTIONS = Object.freeze({
@@ -33,6 +49,49 @@ const ACTIONS = Object.freeze({
     'UpdateAccessKey': 'update_access_key',
     'DeleteAccessKey': 'delete_access_key',
     'ListAccessKeys': 'list_access_keys',
+    'TagUser': 'tag_user',
+    'UntagUser': 'untag_user',
+    'ListUserTags': 'list_user_tags',
+    'PutUserPolicy': 'put_user_policy',
+    'GetUserPolicy': 'get_user_policy',
+    'DeleteUserPolicy': 'delete_user_policy',
+    'ListUserPolicies': 'list_user_policies',
+    'ListGroupsForUser': 'list_groups_for_user',
+    'ListAccountAliases': 'list_account_aliases',
+    'ListAttachedGroupPolicies': 'list_attached_group_policies',
+    'ListAttachedRolePolicies': 'list_attached_role_policies',
+    'ListAttachedUserPolicies': 'list_attached_user_policies',
+    'ListEntitiesForPolicy': 'list_entities_for_policy',
+    'ListGroupPolicies': 'list_group_policies',
+    'ListGroups': 'list_groups',
+    'ListInstanceProfiles': 'list_instance_profiles',
+    'ListInstanceProfilesForRole': 'list_instance_profiles_for_role',
+    'ListInstanceProfileTags': 'list_instance_profile_tags',
+    'ListMFADevices': 'list_mfa_devices',
+    'ListMFADeviceTags': 'list_mfa_device_tags',
+    'ListOpenIDConnectProviders': 'list_open_id_connect_providers',
+    'ListOpenIDConnectProviderTags': 'list_open_id_connect_provider_tags',
+    'ListPolicies': 'list_policies',
+    'ListPolicyTags': 'list_policy_tags',
+    'ListPolicyVersions': 'list_policy_versions',
+    'CreateRole': 'create_role',
+    'GetRole': 'get_role',
+    'UpdateRole': 'update_role',
+    'DeleteRole': 'delete_role',
+    'ListRoles': 'list_roles',
+    'PutRolePolicy': 'put_role_policy',
+    'GetRolePolicy': 'get_role_policy',
+    'DeleteRolePolicy': 'delete_role_policy',
+    'ListRolePolicies': 'list_role_policies',
+    'UpdateAssumeRolePolicy': 'update_assume_role_policy',
+    'ListRoleTags': 'list_role_tags',
+    'ListSAMLProviders': 'list_saml_providers',
+    'ListServerCertificates': 'list_server_certificates',
+    'ListServerCertificateTags': 'list_server_certificate_tags',
+    'ListServiceSpecificCredentials': 'list_service_specific_credentials',
+    'ListSigningCertificates': 'list_signing_certificates',
+    'ListSSHPublicKeys': 'list_ssh_public_keys',
+    'ListVirtualMFADevices': 'list_virtual_mfa_devices',
 });
 
 // notice: shows all methods as method post
@@ -49,6 +108,54 @@ const IAM_OPS = js_utils.deep_freeze({
     post_update_access_key: require('./ops/iam_update_access_key'),
     post_delete_access_key: require('./ops/iam_delete_access_key'),
     post_list_access_keys: require('./ops/iam_list_access_keys'),
+    // user tagging
+    post_tag_user: require('./ops/iam_tag_user'),
+    post_untag_user: require('./ops/iam_untag_user'),
+    post_list_user_tags: require('./ops/iam_list_user_tags'),
+    // user policy
+    post_put_user_policy: require('./ops/iam_put_user_policy'),
+    post_get_user_policy: require('./ops/iam_get_user_policy'),
+    post_delete_user_policy: require('./ops/iam_delete_user_policy'),
+    post_list_user_policies: require('./ops/iam_list_user_policies'),
+    // role CRUD
+    post_create_role: require('./ops/iam_create_role'),
+    post_get_role: require('./ops/iam_get_role'),
+    post_update_role: require('./ops/iam_update_role'),
+    post_delete_role: require('./ops/iam_delete_role'),
+    post_list_roles: require('./ops/iam_list_roles'),
+    // role policy
+    post_put_role_policy: require('./ops/iam_put_role_policy'),
+    post_get_role_policy: require('./ops/iam_get_role_policy'),
+    post_delete_role_policy: require('./ops/iam_delete_role_policy'),
+    post_list_role_policies: require('./ops/iam_list_role_policies'),
+    post_update_assume_role_policy: require('./ops/iam_update_assume_role_policy'),
+    // other (currently ops that return empty or NoSuchEntity error - just not to fail them)
+    post_list_groups_for_user: require('./ops/iam_list_groups_for_user'),
+    post_list_account_aliases: require('./ops/iam_list_account_aliases'),
+    post_list_attached_group_policies: require('./ops/iam_list_attached_group_policies'),
+    post_list_attached_role_policies: require('./ops/iam_list_attached_role_policies'),
+    post_list_attached_user_policies: require('./ops/iam_list_attached_user_policies'),
+    post_list_entities_for_policy: require('./ops/iam_list_entities_for_policy'),
+    post_list_group_policies: require('./ops/iam_list_group_policies'),
+    post_list_groups: require('./ops/iam_list_groups'),
+    post_list_instance_profiles: require('./ops/iam_list_instance_profiles'),
+    post_list_instance_profiles_for_role: require('./ops/iam_list_instance_profiles_for_role'),
+    post_list_instance_profile_tags: require('./ops/iam_list_instance_profile_tags'),
+    post_list_mfa_devices: require('./ops/iam_list_mfa_devices'),
+    post_list_mfa_device_tags: require('./ops/iam_list_mfa_device_tags'),
+    post_list_open_id_connect_providers: require('./ops/iam_list_open_id_connect_providers'),
+    post_list_open_id_connect_provider_tags: require('./ops/iam_list_open_id_connect_provider_tags'),
+    post_list_policies: require('./ops/iam_list_policies'),
+    post_list_policy_tags: require('./ops/iam_list_policy_tags'),
+    post_list_policy_versions: require('./ops/iam_list_policy_versions'),
+    post_list_role_tags: require('./ops/iam_list_role_tags'),
+    post_list_saml_providers: require('./ops/iam_list_saml_providers'),
+    post_list_server_certificates: require('./ops/iam_list_server_certificates'),
+    post_list_server_certificate_tags: require('./ops/iam_list_server_certificate_tags'),
+    post_list_service_specific_credentials: require('./ops/iam_list_service_specific_credentials'),
+    post_list_signing_certificates: require('./ops/iam_list_signing_certificates'),
+    post_list_ssh_public_keys: require('./ops/iam_list_ssh_public_keys'),
+    post_list_virtual_mfa_devices: require('./ops/iam_list_virtual_mfa_devices'),
 });
 
 async function iam_rest(req, res) {
@@ -137,6 +244,12 @@ function authenticate_request(req) {
 async function authorize_request(req) {
     await req.account_sdk.load_requesting_account(req);
     req.account_sdk.authorize_request_account(req);
+    // we want to block OBC accounts from IAM API related to user management
+    // bucket_claim_owner is a property that we have only in OBC account in containerized deployments
+    if (req.account_sdk.requesting_account.bucket_claim_owner) {
+        dbg.error('OBC accounts are not allowed to perform IAM API actions');
+        throw new IamError(IamError.AccessDeniedException);
+    }
 }
 
 function parse_op_name(req, action) {
@@ -144,6 +257,7 @@ function parse_op_name(req, action) {
     if (ACTIONS[action]) {
         return `${method}_${ACTIONS[action]}`;
     }
+    dbg.error('IAM parse_op_name - NotImplemented', action, method, req.originalUrl);
     throw new IamError(IamError.NotImplemented);
 }
 
@@ -151,7 +265,10 @@ function handle_error(req, res, err) {
     const iam_err =
         ((err instanceof IamError) && err) ||
         new IamError(RPC_ERRORS_TO_IAM[err.rpc_code] || IamError.InternalFailure);
-
+    // Contanarized IAM always send RPC error.
+    if (!req.object_sdk.nsfs_config_root) {
+        iam_err.message = err.message;
+    }
     const reply = iam_err.reply(req.request_id);
     dbg.error('IAM ERROR', reply,
         req.method, req.originalUrl,

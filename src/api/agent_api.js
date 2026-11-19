@@ -195,11 +195,8 @@ module.exports = {
             method: 'POST',
             params: {
                 type: 'object',
-                required: ['enabled', 'location_info'],
+                required: ['location_info'],
                 properties: {
-                    enabled: {
-                        type: 'boolean'
-                    },
                     location_info: {
                         $ref: 'common_api#/definitions/location_info'
                     }
@@ -215,29 +212,6 @@ module.exports = {
             reply: {
                 $ref: 'node_api#/definitions/signal_reply'
             },
-        },
-
-        test_store_perf: {
-            method: 'POST',
-            params: {
-                type: 'object',
-                properties: {
-                    count: {
-                        type: 'integer'
-                    }
-                }
-            },
-            reply: {
-                type: 'object',
-                properties: {
-                    write: {
-                        $ref: 'node_api#/definitions/latency_array'
-                    },
-                    read: {
-                        $ref: 'node_api#/definitions/latency_array'
-                    }
-                }
-            }
         },
 
         test_store_validity: {
@@ -306,9 +280,6 @@ module.exports = {
             }
         },
 
-        uninstall: {
-            method: 'DELETE',
-        },
 
     },
 

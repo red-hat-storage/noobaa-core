@@ -4,6 +4,7 @@
         'target_name': 's3select',
         'type': 'static_library',
         'cflags_cc!': ['-fno-rtti'],
+        'cflags_cc': ['-std=c++17'],
         'include_dirs': [
             '<@(napi_include_dirs)',
             '../../../submodules/s3select/include',
@@ -12,20 +13,20 @@
         'sources': [
             's3select_napi.cpp'
         ],
-	'link_settings': {
-		'libraries': ['/lib64/libboost_thread.so.1.75.0']
+        'link_settings': {
+            'libraries': ['/lib64/libboost_thread.so.1.75.0']
         },
-	'variables': {
-            'BUILD_S3SELECT_PARQUET%':0
+        'variables': {
+            # read BUILD_S3SELECT_PARQUET from env if not provided by GYP_DEFINES
+            'BUILD_S3SELECT_PARQUET%': '<!(echo ${BUILD_S3SELECT_PARQUET:-0})',
         },
-	'conditions': [
+        'conditions': [
             ['BUILD_S3SELECT_PARQUET==1', {
                 'link_settings': {
-			'libraries': ['/lib64/libarrow.so', '/lib64/libparquet.so']
-		},
-                'cflags' : ['-D_ARROW_EXIST']
-	    }]
+                    'libraries': ['/lib64/libarrow.so', '/lib64/libparquet.so']
+                },
+                'defines': ['_ARROW_EXIST']
+            }]
         ],
-
     }]
 }

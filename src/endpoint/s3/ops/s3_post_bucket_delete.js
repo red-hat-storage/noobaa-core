@@ -3,6 +3,7 @@
 
 const dbg = require('../../../util/debug_module')(__filename);
 const S3Error = require('../s3_errors').S3Error;
+const s3_utils = require('../s3_utils');
 
 /**
  * http://docs.aws.amazon.com/AmazonS3/latest/API/multiobjectdeleteapi.html
@@ -30,15 +31,20 @@ async function post_bucket_delete(req) {
     for (const item of delete_list) {
         const key = item.Key?.[0];
         const version_id = item.VersionId?.[0];
-        const key_version = (key || '') + '\0' + (version_id || ''); // using null char (\x00) as separator
-        uniq_map.set(key_version, { key, version_id });
+        const etag = item.ETag?.[0];
+        const md_conditions = etag ? { if_match_etag: etag } : undefined;
+        const key_version = (key || '') + '\0' + (version_id || '') + '\0' + (etag || ''); // using null char (\x00) as separator
+        const obj = { key, version_id };
+        if (md_conditions) obj.md_conditions = md_conditions;
+        uniq_map.set(key_version, obj);
     }
     const objects = Array.from(uniq_map.values());
     dbg.log3('post_bucket_delete: objects without duplications', objects);
 
     const reply = await req.object_sdk.delete_multiple_objects({
         bucket: req.params.bucket,
-        objects
+        objects,
+        bypass_governance: s3_utils.is_bypass_governance_requested(req),
     });
 
     const results = [];
@@ -47,11 +53,12 @@ async function post_bucket_delete(req) {
         const req_obj = objects[i];
         const res_obj = reply[i];
         if (res_obj.err_code && !quiet) {
+            const mapped = S3Error.RPC_ERRORS_TO_S3[res_obj.err_code];
             results[i] = {
                 Error: {
                     Key: req_obj.key,
                     VersionId: req_obj.version_id,
-                    Code: res_obj.err_code,
+                    Code: mapped ? mapped.code : res_obj.err_code,
                     Message: res_obj.err_message,
                 }
             };

@@ -112,7 +112,7 @@ The following list consists of supported optional developer customization -
 ### 7. GPFS library path -
 * <u>Key</u>: `GPFS_DL_PATH`  
 * <u>Type</u>: String  
-* <u>Default</u>: ''   
+* <u>Default</u>: '/usr/lpp/mmfs/lib/libgpfs.so'  
 * <u>Description</u>: Set GPFS library path location.  
 * <u>Steps</u>:  
     ```
@@ -137,21 +137,7 @@ The following list consists of supported optional developer customization -
     3. systemctl restart noobaa
     ```
 
-### 9. Buffer size -
-* <u>Key</u>: `NSFS_BUF_SIZE`  
-* <u>Type</u>: Number  
-* <u>Default</u>: 8MB = 8388608 bytes = 8 * 1024 * 1024  
-* <u>Description</u>: Set Buffer size in order to increase performance of small/large objects requests, service restart required.  
-* <u>Steps</u>:  
-    ```
-    1. Open /path/to/config_dir/config.json file.
-    2. Set the config key in bytes-
-    Example:
-    "NSFS_BUF_SIZE": 10485760
-    3. systemctl restart noobaa
-    ```
-
-### 10. Open read mode -
+### 9. Open read mode -
 * <u>Key</u>: `NSFS_OPEN_READ_MODE`  
 * <u>Type</u>: String   
 * <u>Default</u>: 'r'   
@@ -164,7 +150,7 @@ The following list consists of supported optional developer customization -
     "NSFS_OPEN_READ_MODE": "rd"
     ```
 
-### 11. Trigger Check bucket boundaries -
+### 10. Trigger Check bucket boundaries -
 * <u>Key</u>: `NSFS_CHECK_BUCKET_BOUNDARIES`    
 * <u>Type</u>: Boolean   
 * <u>Default</u>: true  
@@ -177,7 +163,7 @@ The following list consists of supported optional developer customization -
     "NSFS_CHECK_BUCKET_BOUNDARIES": false
     ```
 
-### 12. Trigger Fsync -
+### 11. Trigger Fsync -
 * <u>Key</u>: `NSFS_TRIGGER_FSYNC`  
 * <u>Type</u>: Boolean   
 * <u>Default</u>: true    
@@ -190,7 +176,7 @@ The following list consists of supported optional developer customization -
     "NSFS_TRIGGER_FSYNC": false
     ```
 
-### 13. Whitelist IPs -
+### 12. Whitelist IPs -
 * <u>Key</u>: `S3_SERVER_IP_WHITELIST`  
 * <u>Type</u>:* Array  
 * <u>Default</u>: false  
@@ -201,7 +187,7 @@ The following list consists of supported optional developer customization -
     sudo noobaa-cli whitelist --ips '["127.0.0.1", "192.000.10.000", "3002:0bd6:0000:0000:0000:ee00:0033:000"]'  2>/dev/null
     ```
 
-### 14. Config directory backend -
+### 13. Config directory backend -
 * <u>Key</u>: `NSFS_NC_CONFIG_DIR_BACKEND`  
 * <u>Type</u>: String  
 * <u>Default</u>: ''  
@@ -214,7 +200,7 @@ The following list consists of supported optional developer customization -
     "NSFS_NC_CONFIG_DIR_BACKEND": "GPFS"
     ```
 
-### 15. Storage Backend -
+### 14. Storage Backend -
 * <u>Key</u>: `NSFS_NC_STORAGE_BACKEND`  
 * <u>Type</u>: String  
 * <u>Default</u>: ''  
@@ -228,7 +214,7 @@ The following list consists of supported optional developer customization -
     3. systemctl restart noobaa
     ```
 
-### 16. Directories cache max directory size -
+### 15. Directories cache max directory size -
 * <u>Key</u>: `NSFS_DIR_CACHE_MAX_DIR_SIZE`  
 * <u>Type</u>: Number  
 * <u>Default</u>: 67108864 // 64MB = 64 * 1024 * 1024  
@@ -242,7 +228,7 @@ The following list consists of supported optional developer customization -
     3. systemctl restart noobaa
     ```
 
-### 17. Directories cache max total usage size -
+### 16. Directories cache max total usage size -
 * <u>Key</u>: `NSFS_DIR_CACHE_MAX_TOTAL_SIZE`  
 * <u>Type</u>: Number  
 * <u>Default</u>: 268435456 // 256MB = 4 * config.NSFS_DIR_CACHE_MAX_DIR_SIZE = 4 * 1024 * 1024  
@@ -257,7 +243,7 @@ The following list consists of supported optional developer customization -
     ```
 
 
-### 18. Disable random seeding -
+### 17. Disable random seeding -
 * <u>Key</u>: `ENABLE_DEV_RANDOM_SEED`  
 * <u>Type</u>: Boolean  
 * <u>Default</u>: false  
@@ -271,7 +257,7 @@ The following list consists of supported optional developer customization -
     3. systemctl restart noobaa
     ```
 
-### 19. Set Master Keys Store type-
+### 18. Set Master Keys Store type-
 * <u>Key</u>: `NC_MASTER_KEYS_STORE_TYPE`  
 * <u>Type</u>: String  
 * <u>Default</u>: 'file'  
@@ -285,7 +271,7 @@ The following list consists of supported optional developer customization -
     3. systemctl restart noobaa
     ```
 
-### 20. Set Master Keys File Location -
+### 19. Set Master Keys File Location -
 * <u>Key</u>: `NC_MASTER_KEYS_FILE_LOCATION`    
 * <u>Type</u>: String  
 * <u>Default</u>: '/etc/noobaa.conf.d/master_keys.json'  
@@ -299,7 +285,7 @@ The following list consists of supported optional developer customization -
     3. systemctl restart noobaa
     ```
 
-### 21. Set Master Keys GET executable script -
+### 20. Set Master Keys GET executable script -
 * <u>Key</u>: `NC_MASTER_KEYS_GET_EXECUTABLE`  
 * <u>Type</u>: String  
 * <u>Default</u>: undefined  
@@ -313,7 +299,7 @@ The following list consists of supported optional developer customization -
     3. systemctl restart noobaa
     ```
 
-### 22. Set Master Keys PUT executable script -
+### 21. Set Master Keys PUT executable script -
 * <u>Key</u>: `NC_MASTER_KEYS_PUT_EXECUTABLE`  
 * <u>Type</u>: String  
 * <u>Default</u>: undefined  
@@ -327,7 +313,7 @@ The following list consists of supported optional developer customization -
     3. systemctl restart noobaa
     ```
 
-### 23. Set Virtual hosts -
+### 22. Set Virtual hosts -
 * <u>Key</u>: `VIRTUAL_HOSTS`   
 * <u>Type</u>: String  
 * <u>Default</u>: ''  
@@ -341,7 +327,7 @@ The following list consists of supported optional developer customization -
     3. systemctl restart noobaa_nsfs
     ```
 
-### 24. Disable schema check -
+### 23. Disable schema check -
 * <u>Key</u>: `NC_DISABLE_SCHEMA_CHECK`  
 * <u>Type</u>: Boolean  
 * <u>Default</u>: false  
@@ -356,7 +342,7 @@ Warning: After setting this configuration, NooBaa will skip schema validations a
     ```
 
 
-### 25. Disable Read accessibility check -
+### 24. Disable Read accessibility check -
 * <u>Key</u>: `NC_DISABLE_ACCESS_CHECK`  
 * <u>Type</u>: Boolean  
 * <u>Default</u>: false  
@@ -374,7 +360,7 @@ Warning: After setting this configuration, NooBaa will skip schema validations a
     "NC_DISABLE_ACCESS_CHECK": true
     ```
 
-### 26. Disable Read accessibility check on the Health CLI -
+### 25. Disable Read accessibility check on the Health CLI -
 * <u>Key</u>: `NC_DISABLE_HEALTH_ACCESS_CHECK`  
 * <u>Type</u>: Boolean  
 * <u>Default</u>: false  
@@ -388,7 +374,7 @@ Warning: After setting this configuration, NooBaa will skip schema validations a
     "NC_DISABLE_HEALTH_ACCESS_CHECK": true
     ```
 
-### 27. Disable Read/Write POSIX mode bits check -
+### 26. Disable Read/Write POSIX mode bits check -
 * <u>Key</u>: `NC_DISABLE_POSIX_MODE_ACCESS_CHECK`  
 * <u>Type</u>: Boolean  
 * <u>Default</u>: true  
@@ -407,7 +393,7 @@ Warning: After setting this configuration, NooBaa will skip schema validations a
     ```
 
 
-### 26. Set Endpoint process title -
+### 27. Set Endpoint process title -
 * <u>Key</u>: `ENDPOINT_PROCESS_TITLE`  
 * <u>Type</u>: String  
 * <u>Default</u>: 'noobaa'  
@@ -422,7 +408,7 @@ Warning: After setting this configuration, NooBaa will skip schema validations a
     ## Config.json example 
     ```
 
-### 27. GPFS down delay -
+### 28. GPFS down delay -
 * <u>Key</u>: `GPFS_DOWN_DELAY`  
 * <u>Type</u>: Number  
 * <u>Default</u>: 1000  
@@ -436,7 +422,7 @@ Warning: After setting this configuration, NooBaa will skip schema validations a
     3. systemctl restart noobaa
     ```
 
-### 28. Syslog enable flag -
+### 29. Syslog enable flag -
 * <u>Key</u>: `LOG_TO_SYSLOG_ENABLED`  
 * <u>Type</u>: Boolean  
 * <u>Default</u>: true  
@@ -450,7 +436,7 @@ Warning: After setting this configuration, NooBaa will skip schema validations a
     3. systemctl restart noobaa
     ```
 
-### 29. Stderr enable flag -
+### 30. Stderr enable flag -
 * <u>Key</u>: `LOG_TO_STDERR_ENABLED`  
 * <u>Type</u>: Boolean  
 * <u>Default</u>: false  
@@ -463,6 +449,228 @@ Warning: After setting this configuration, NooBaa will skip schema validations a
     "LOG_TO_STDERR_ENABLED": false
     3. systemctl restart noobaa
     ```
+### 31. Notification log directory
+* <u>Key</u> `NOTIFICATION_LOG_DIR`
+* <u>Type</u> String
+* <u>Default</u> empty
+* <u>Description</u> Path to directory that will hold pending notifications to be sent,
+* <u>Steps</u>
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "NOTIFICATION_LOG_DIR": "/etc/notif"
+    3. systemctl restart noobaa
+
+### 32. Prometheus HTTP enable flag -
+* <u>Key</u>: `ALLOW_HTTP_METRICS`  
+* <u>Type</u>: Boolean  
+* <u>Default</u>: true  
+* <u>Description</u>: This flag will decide whether to enable HTTP service for Prometheus metrics.
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "ALLOW_HTTP_METRICS": true
+    3. systemctl restart noobaa
+    ```
+
+### 33. Prometheus HTTPS enable flag -
+* <u>Key</u>: `ALLOW_HTTPS_METRICS`  
+* <u>Type</u>: Boolean  
+* <u>Default</u>: true  
+* <u>Description</u>: This flag will decide whether to enable HTTPS service for Prometheus metrics.
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "ALLOW_HTTPS_METRICS": true
+    3. systemctl restart noobaa
+    ```
+
+### 34. Notification space monitor frequency flag -
+* <u>Key</u>: `NOTIFICATION_REQ_PER_SPACE_CHECK`
+* <u>Type</u>: Positive integer
+* <u>Default</u>: 0
+* <u>Description</u>: Free space check will run per this many notifications (per node). 0 to disable.
+* <u>Steps</u>:
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key to run free space check each 1000 notifications -
+    Example:
+    "NOTIFICATION_REQ_PER_SPACE_CHECK": 1000
+    3. systemctl restart noobaa
+    ```
+
+### 35. Notification space monitor threshold flag -
+* <u>Key</u>: `NOTIFICATION_SPACE_CHECK_THRESHOLD`
+* <u>Type</u>: Number
+* <u>Default</u>: 0.1
+* <u>Description</u>: Fraction (more than zero, less than 1) of availble block, below which event is logged.
+* <u>Steps</u>:
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "NOTIFICATION_SPACE_CHECK_THRESHOLD": 0.1
+    3. systemctl restart noobaa
+    ```
+
+### 36. Dynamic supplemental groups allocation flag -
+* <u>Key</u>: `NSFS_ENABLE_DYNAMIC_SUPPLEMENTAL_GROUPS`
+* <u>Type</u>: boolean
+* <u>Default</u>: true
+* <u>Description</u>: whether to fetch supplemental groups dynamicly from FS user record.
+* <u>Steps</u>:
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "NSFS_ENABLE_DYNAMIC_SUPPLEMENTAL_GROUPS": false
+    3. systemctl restart noobaa
+    ```
+
+### 37. Trigger Check bucket path exists -
+* <u>Key</u>: `NSFS_CHECK_BUCKET_PATH_EXISTS`    
+* <u>Type</u>: Boolean   
+* <u>Default</u>: true  
+* <u>Description</u>: Enable/Disable bucket path existance checks. This is EXPERIMENTAL and NOT recommended for production! When disabled, will reduce some latency on object operations, but calls to non existing bucket paths will result with unexpected behavior (e.g. could return NO_SUCH_OBJECT instead of NO_SUCH_BUCKET).
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "NSFS_CHECK_BUCKET_PATH_EXISTS": false
+    ```
+
+### 38. RDMA enable flag -
+* <u>Key</u>: `S3_RDMA_ENABLED`  
+* <u>Type</u>: Boolean  
+* <u>Default</u>: false  
+* <u>Description</u>: Enable RDMA support on the S3 endpoint. When enabled, the server will accept and process `x-amz-rdma-token` headers for RDMA data transfers. Requires RDMA-capable network hardware. See [S3 over RDMA](../design/S3-over-RDMA.md) for details.  
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "S3_RDMA_ENABLED": true
+    3. systemctl restart noobaa
+    ```
+
+### 39. RDMA GPFS zero-copy flag -
+* <u>Key</u>: `S3_RDMA_GPFS_ZERO_COPY_ENABLED`  
+* <u>Type</u>: Boolean  
+* <u>Default</u>: false  
+* <u>Description</u>: Enable direct RDMA-to-GPFS zero-copy data path, bypassing intermediate buffer copies. Requires RDMA to be enabled and a GPFS library version with zero-copy support (auto-detected at runtime).  
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "S3_RDMA_GPFS_ZERO_COPY_ENABLED": true
+    3. systemctl restart noobaa
+    ```
+
+### 40. RDMA server IPs -
+* <u>Key</u>: `S3_RDMA_SERVER_IPS`  
+* <u>Type</u>: Array of strings  
+* <u>Default</u>: []  
+* <u>Description</u>: List of server IP addresses to bind for RDMA transport. These must be IPs on RDMA-capable network interfaces (InfiniBand or RoCE). Env variable `S3_RDMA_SERVER_IP` takes precedence over this config key. When empty, NooBaa will attempt to use the server IPs that received the S3 request.
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "S3_RDMA_SERVER_IPS": ["172.16.0.61", "172.16.0.62"]
+    3. systemctl restart noobaa
+    ```
+
+### 41. RDMA log level -
+* <u>Key</u>: `S3_RDMA_LOG_LEVEL`  
+* <u>Type</u>: String  
+* <u>Default</u>: 'INFO'  
+* <u>Description</u>: Log level for the RDMA subsystem. Supported values: `ERROR`, `INFO`, `DEBUG`.  
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "S3_RDMA_LOG_LEVEL": "DEBUG"
+    3. systemctl restart noobaa
+    ```
+
+### 42. RDMA telemetry flag -
+* <u>Key</u>: `S3_RDMA_USE_TELEMETRY`  
+* <u>Type</u>: Boolean  
+* <u>Default</u>: true  
+* <u>Description</u>: Enable telemetry and metrics collection for RDMA transfers.  
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "S3_RDMA_USE_TELEMETRY": false
+    3. systemctl restart noobaa
+    ```
+
+### 43. RDMA DC key -
+* <u>Key</u>: `S3_RDMA_DC_KEY`  
+* <u>Type</u>: Number  
+* <u>Default</u>: 0xffeeddcc  
+* <u>Description</u>: Dynamic Connection (DC) key value used for RDMA secure communication. Must match between client and server.  
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "S3_RDMA_DC_KEY": 4293844428
+    3. systemctl restart noobaa
+    ```
+
+### 44. RDMA number of DCIs -
+* <u>Key</u>: `S3_RDMA_NUM_DCIS`  
+* <u>Type</u>: Number  
+* <u>Default</u>: 128  
+* <u>Description</u>: Number of Dynamic Connection Interfaces (DCIs). Controls the maximum number of concurrent RDMA connections. Increase for higher concurrency workloads.  
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "S3_RDMA_NUM_DCIS": 256
+    3. systemctl restart noobaa
+    ```
+
+### 45. RDMA async events flag -
+* <u>Key</u>: `S3_RDMA_USE_ASYNC_EVENTS`  
+* <u>Type</u>: Boolean  
+* <u>Default</u>: false  
+* <u>Description</u>: Use async events instead of thread pool for RDMA operations. Default is false because thread pool provides better performance in most workloads.  
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "S3_RDMA_USE_ASYNC_EVENTS": true
+    3. systemctl restart noobaa
+    ```
+
+### 46. RDMA token validation flag -
+* <u>Key</u>: `S3_RDMA_VALIDATE_TOKEN_HDR`  
+* <u>Type</u>: Boolean  
+* <u>Default</u>: true  
+* <u>Description</u>: Enable validation of the `x-amz-rdma-token` header contents before processing RDMA requests. Disabling is not recommended.  
+* <u>Steps</u>:  
+    ```
+    1. Open /path/to/config_dir/config.json file.
+    2. Set the config key -
+    Example:
+    "S3_RDMA_VALIDATE_TOKEN_HDR": true
+    3. systemctl restart noobaa
+    ```
+
 
 ## Config.json File Examples
 The following is an example of a config.json file - 
@@ -476,11 +684,26 @@ The following is an example of a config.json file -
     "UV_THREADPOOL_SIZE": 256,
     "GPFS_DL_PATH": "/usr/lpp/mmfs/lib/libgpfs.so",
     "NSFS_BUF_POOL_MEM_LIMIT": 4294967296,
-    "NSFS_BUF_SIZE": 16777216,
     "NSFS_OPEN_READ_MODE": "rd",
     "NSFS_CHECK_BUCKET_BOUNDARIES": false,
     "ALLOW_HTTP": true,
     "S3_SERVER_IP_WHITELIST":["127.0.0.1","192.000.10.000","3002:0bd6:0000:0000:0000:ee00:0033:000"]
+}
+
+```
+
+The following is an example of a config.json file with RDMA enabled -
+
+```sh
+> cat /path/to/config_dir/config.json
+{
+    "ENDPOINT_FORKS": 16,
+    "UV_THREADPOOL_SIZE": 256,
+    "ALLOW_HTTP": true,
+    "S3_RDMA_ENABLED": true,
+    "S3_RDMA_SERVER_IPS": ["172.16.0.61"],
+    "S3_RDMA_NUM_DCIS": 256,
+    "S3_RDMA_LOG_LEVEL": "INFO"
 }
 
 ```

@@ -1,9 +1,15 @@
 #!/bin/bash
 
-# Add a cron job to run script to segreagate bucket logs into individual bucket logs files.
-echo "*/5 * * * * /root/node_modules/noobaa-core/src/deploy/NVA_build/noobaa_log_segregate.sh" | crontab -
+# Forward termination to background sleep/segregate loops so parent wait can finish.
+trap 'kill $(jobs -p) 2>/dev/null; wait; exit 0' TERM INT
 
-# script to run logrotate every minute
+# Run log segregation every 5 minutes in the background.
+# Using a loop instead of crontab because the container runs as a non-root user
+# with all capabilities dropped, which prevents writing to /var/spool/cron/.
+while true; do
+    /root/node_modules/noobaa-core/src/deploy/NVA_build/noobaa_log_segregate.sh
+    sleep 300
+done &
 
 while true; do
 

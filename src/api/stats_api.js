@@ -160,6 +160,9 @@ module.exports = {
                             op_stats: {
                                 $ref: 'common_api#/definitions/op_stats'
                             },
+                            iam_stats: {
+                                $ref: 'common_api#/definitions/iam_stats'
+                            },
                             fs_workers_stats: {
                                 $ref: 'common_api#/definitions/fs_workers_stats'
                             }
@@ -446,6 +449,9 @@ module.exports = {
                                 type: 'string'
                             },
                             is_healthy: {
+                                type: 'boolean'
+                            },
+                            is_low_capacity: {
                                 type: 'boolean'
                             }
                         }
@@ -758,24 +764,36 @@ module.exports = {
                     type: 'array',
                     items: {
                         type: 'object',
-                        required: ['bucket_name', 'quota_size_precent', 'quota_quantity_percent', 'capacity_precent', 'is_healthy', 'tagging', 'bucket_used_bytes'],
+                        required: ['bucket_name', 'quota_size_percent', 'quota_quantity_percent', 'capacity_percent', 'is_healthy', 'tagging', 'bucket_used_bytes', 'object_count', 'quota_max_objects', 'quota_max_bytes'],
                         properties: {
                             bucket_name: {
                                 type: 'string'
                             },
-                            quota_size_precent: {
+                            mode: {
+                                $ref: 'common_api#/definitions/bucket_mode'
+                            },
+                            quota_size_percent: {
                                 type: 'number'
                             },
                             quota_quantity_percent: {
                                 type: 'number'
                             },
-                            capacity_precent: {
+                            capacity_percent: {
                                 type: 'number'
                             },
                             is_healthy: {
                                 type: 'boolean'
                             },
                             bucket_used_bytes: {
+                                type: 'number'
+                            },
+                            object_count: {
+                                type: 'number'
+                            },
+                            quota_max_objects: {
+                                type: 'number'
+                            },
+                            quota_max_bytes: {
                                 type: 'number'
                             },
                             tagging: {
@@ -805,6 +823,9 @@ module.exports = {
                         properties: {
                             bucket_name: {
                                 type: 'string'
+                            },
+                            mode: {
+                                $ref: 'common_api#/definitions/bucket_mode'
                             },
                             is_healthy: {
                                 type: 'boolean'

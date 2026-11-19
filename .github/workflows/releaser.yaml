@@ -16,18 +16,18 @@ permissions:
 
 jobs:
   releaser:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Set branch
         run: echo "BRANCH=${{ github.event.inputs.base_branch }}" >> $GITHUB_ENV
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.BRANCH }}
       - name: Fetch all tags
         run: git fetch --force --tags
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v6
         with:
           node-version-file: .nvmrc
       - name: Release NooBaa Core Image

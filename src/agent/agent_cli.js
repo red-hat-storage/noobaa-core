@@ -10,7 +10,7 @@ const os = require('os');
 const path = require('path');
 const util = require('util');
 const repl = require('repl');
-const { v4: uuid } = require('uuid');
+const crypto = require('crypto');
 const argv = require('minimist')(process.argv);
 const S3Auth = require('aws-sdk/lib/signers/s3');
 
@@ -20,7 +20,7 @@ const dbg = require('../util/debug_module')(__filename);
 const Agent = require('./agent');
 const fs_utils = require('../util/fs_utils');
 const os_utils = require('../util/os_utils');
-const Semaphore = require('../util/semaphore');
+const semaphore = require('../util/semaphore');
 const json_utils = require('../util/json_utils');
 const addr_utils = require('../util/addr_utils');
 const debug_config = require('../util/debug_config');
@@ -114,7 +114,7 @@ class AgentCLI {
                     self.client.options.address = self.params.address;
                 }
                 if (!self.params.host_id) {
-                    self.params.host_id = uuid();
+                    self.params.host_id = crypto.randomUUID();
                     return self.agent_conf.update({
                         host_id: self.params.host_id
                     });
@@ -494,7 +494,7 @@ class AgentCLI {
         if (n === 0) {
             return self.create(0, paths_to_work_on);
         } else {
-            const sem = new Semaphore(5);
+            const sem = new semaphore.Semaphore(5);
             return P.all(_.times(n, function() {
                 return sem.surround(function() {
                     return self.create(n, paths_to_work_on);

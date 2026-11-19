@@ -2,22 +2,8 @@
 'use strict';
 
 const api = require('../../api');
-const Report = require('../framework/report');
 const P = require('../../util/promise');
-
-const report = new Report();
-
-//Enable reporter and set parameters
-function init_reporter(report_params) {
-    const suite_name = report_params.suite_name || 'UNKNW_server_func';
-    report.init_reporter({
-        suite: suite_name,
-        conf: {},
-        mongo_report: true,
-        cases: report_params.cases,
-        prefix: report_params.cases_prefix
-    });
-}
+const { make_auth_token } = require('../../server/common_services/auth_server');
 
 //will create a system and check that the default account status is true.
 async function create_system(server_ip, port, protocol) {
@@ -47,10 +33,10 @@ async function wait_for_system_ready(server_ip, port, protocol, timeout = 600 * 
             const client = rpc.new_client({});
             const auth_params = {
                 email: 'demo@noobaa.com',
-                password: 'DeMo1',
+                role: 'admin',
                 system: 'demo'
             };
-            await client.create_auth_token(auth_params);
+            client.options.auth_token = make_auth_token(auth_params);
             const account_stat = await client.account.accounts_status({});
             has_account = account_stat.has_accounts;
             if (has_account) break;
@@ -68,10 +54,10 @@ async function get_num_optimal_agents(server_ip, port) {
     const client = rpc.new_client({});
     const auth_params = {
         email: 'demo@noobaa.com',
-        password: 'DeMo1',
+        role: 'admin',
         system: 'demo'
     };
-    await client.create_auth_token(auth_params);
+    client.options.auth_token = make_auth_token(auth_params);
     return (await client.host.list_hosts({
         query: {
             mode: ['OPTIMAL']
@@ -79,7 +65,6 @@ async function get_num_optimal_agents(server_ip, port) {
     })).hosts.length;
 }
 
-exports.init_reporter = init_reporter;
 exports.create_system = create_system;
 exports.wait_for_system_ready = wait_for_system_ready;
 exports.get_num_optimal_agents = get_num_optimal_agents;
